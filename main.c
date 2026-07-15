@@ -570,6 +570,10 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN attach (add-only)\n",
                     trigger_id);
             fflush(stderr);
+            /* #region agent log */
+            fprintf(stderr, "[RELOAD-DBG] C path_add_only trigger=%d\n", trigger_id);
+            fflush(stderr);
+            /* #endregion */
             if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
@@ -580,6 +584,10 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN delta\n",
                     trigger_id);
             fflush(stderr);
+            /* #region agent log */
+            fprintf(stderr, "[RELOAD-DBG] C path_delta trigger=%d\n", trigger_id);
+            fflush(stderr);
+            /* #endregion */
             if (profile_iface_xdp_apply_delta(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
@@ -590,6 +598,10 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN attach\n",
                     trigger_id);
             fflush(stderr);
+            /* #region agent log */
+            fprintf(stderr, "[RELOAD-DBG] C path_add trigger=%d\n", trigger_id);
+            fflush(stderr);
+            /* #endregion */
             if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else
@@ -600,6 +612,10 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
                     "[RELOAD] profile %d — incremental LAN/WAN detach\n",
                     trigger_id);
             fflush(stderr);
+            /* #region agent log */
+            fprintf(stderr, "[RELOAD-DBG] C path_remove trigger=%d\n", trigger_id);
+            fflush(stderr);
+            /* #endregion */
             if (profile_iface_xdp_apply_remove(&rt->fwd, new_cfg, trigger_id) == 0)
                 incremental_ok = 1;
             else

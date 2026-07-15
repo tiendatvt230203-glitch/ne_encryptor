@@ -16,6 +16,15 @@
 #include <string.h>
 #include <unistd.h>
 
+/* #region agent log */
+static void agent_dbg(const char *hid, const char *loc, const char *msg, const char *data_json)
+{
+    (void)loc;
+    fprintf(stderr, "[PROFILE-XDP-DBG] %s %s %s\n", hid, msg, data_json ? data_json : "{}");
+    fflush(stderr);
+}
+/* #endregion */
+
 static int profile_iface_ifname_safe(const char *ifname)
 {
     if (!ifname || !ifname[0])
@@ -30,9 +39,14 @@ static int profile_iface_ifname_safe(const char *ifname)
 static void profile_iface_xdp_link_off(const char *ifname)
 {
     char cmd[128];
+    char js[160];
 
     if (!profile_iface_ifname_safe(ifname))
         return;
+    /* #region agent log */
+    snprintf(js, sizeof(js), "{\"ifname\":\"%s\"}", ifname);
+    agent_dbg("D", "profile_iface_xdp.c:link_off", "ip_link_xdp_off", js);
+    /* #endregion */
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
     if (system(cmd) != 0)
         fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
@@ -595,6 +609,15 @@ static int detach_profile_lan_rows(struct forwarder *fwd, const struct app_confi
         fprintf(stderr,
                 "[PROFILE-XDP] profile %d REMOVE LAN %s — detach xdp/id\n",
                 trigger_profile_id, ifname);
+        /* #region agent log */
+        {
+            char js[192];
+            snprintf(js, sizeof(js),
+                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"still_in_new\":0}",
+                     trigger_profile_id, ifname, li);
+            agent_dbg("A", "profile_iface_xdp.c:detach_lan", "detach_lan_unplumb", js);
+        }
+        /* #endregion */
         ne_pair_unplumb_local(&fwd->pair, li);
     }
     return 0;
@@ -627,6 +650,15 @@ static int detach_profile_wan_rows(struct forwarder *fwd, const struct app_confi
         fprintf(stderr,
                 "[PROFILE-XDP] profile %d REMOVE WAN %s — detach xdp/id\n",
                 trigger_profile_id, ifname);
+        /* #region agent log */
+        {
+            char js[192];
+            snprintf(js, sizeof(js),
+                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d}",
+                     trigger_profile_id, ifname, di);
+            agent_dbg("A", "profile_iface_xdp.c:detach_wan", "detach_wan_unplumb", js);
+        }
+        /* #endregion */
         ne_pair_unplumb_wan_dp(&fwd->pair, di);
         fwd->wan_cfg_idx[di] = -1;
         fwd_wan_mark_stopped(di);
@@ -686,6 +718,18 @@ static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_conf
             continue;
         }
         if (pair_local_slot_live(fwd, ifname) >= 0) {
+            /* #region agent log */
+            {
+                char js[192];
+                int live = pair_local_slot_live(fwd, ifname);
+                snprintf(js, sizeof(js),
+                         "{\"profile\":%d,\"ifname\":\"%s\",\"live_slot\":%d,"
+                         "\"xdp_on\":%u}",
+                         trigger_profile_id, ifname, live,
+                         live >= 0 ? (unsigned)fwd->pair.xdp_local_on[live] : 0u);
+                agent_dbg("B", "profile_iface_xdp.c:attach_lan", "skip_already_live", js);
+            }
+            /* #endregion */
             continue;
         }
 
@@ -711,10 +755,27 @@ static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_conf
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip LAN %s (xdp attach/xsk map failed)\n",
                     trigger_profile_id, ifname);
+            /* #region agent log */
+            {
+                char js[160];
+                snprintf(js, sizeof(js), "{\"profile\":%d,\"ifname\":\"%s\"}",
+                         trigger_profile_id, ifname);
+                agent_dbg("E", "profile_iface_xdp.c:attach_lan", "bind_local_failed", js);
+            }
+            /* #endregion */
             ne_pair_unplumb_local(&fwd->pair, li);
             sess->validate_failed = 1;
             continue;
         }
+        /* #region agent log */
+        {
+            char js[160];
+            snprintf(js, sizeof(js),
+                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"xdp_on\":1}",
+                     trigger_profile_id, ifname, li);
+            agent_dbg("E", "profile_iface_xdp.c:attach_lan", "bind_local_ok", js);
+        }
+        /* #endregion */
         init_fwd_local_meta(fwd, li, new_cfg, ci);
         fwd->local_count = fwd->pair.local_count;
         sess->lan_added[sess->lan_n++] = li;
@@ -760,6 +821,18 @@ static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_conf
             continue;
         }
         if (pair_wan_dp_slot_live(fwd, ifname) >= 0) {
+            /* #region agent log */
+            {
+                char js[192];
+                int live = pair_wan_dp_slot_live(fwd, ifname);
+                snprintf(js, sizeof(js),
+                         "{\"profile\":%d,\"ifname\":\"%s\",\"live_slot\":%d,"
+                         "\"xdp_on\":%u}",
+                         trigger_profile_id, ifname, live,
+                         live >= 0 ? (unsigned)fwd->pair.xdp_wan_on[live] : 0u);
+                agent_dbg("B", "profile_iface_xdp.c:attach_wan", "skip_already_live", js);
+            }
+            /* #endregion */
             continue;
         }
 
@@ -785,10 +858,27 @@ static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_conf
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip WAN %s (xdp attach/xsk map failed)\n",
                     trigger_profile_id, ifname);
+            /* #region agent log */
+            {
+                char js[160];
+                snprintf(js, sizeof(js), "{\"profile\":%d,\"ifname\":\"%s\"}",
+                         trigger_profile_id, ifname);
+                agent_dbg("E", "profile_iface_xdp.c:attach_wan", "bind_wan_failed", js);
+            }
+            /* #endregion */
             ne_pair_unplumb_wan_dp(&fwd->pair, di);
             sess->validate_failed = 1;
             continue;
         }
+        /* #region agent log */
+        {
+            char js[160];
+            snprintf(js, sizeof(js),
+                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"xdp_on\":1}",
+                     trigger_profile_id, ifname, di);
+            agent_dbg("E", "profile_iface_xdp.c:attach_wan", "bind_wan_ok", js);
+        }
+        /* #endregion */
         fwd->pair.xdp_wan_on[di] = 1;
         init_fwd_wan_meta(fwd, di, new_cfg, ci);
         fwd->wan_cfg_idx[di] = ci;
@@ -907,6 +997,18 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
         fprintf(stderr, "[PROFILE-XDP] reload missing trigger profile id\n");
         return -1;
     }
+
+    /* #region agent log */
+    {
+        char js[256];
+        snprintf(js, sizeof(js),
+                 "{\"mode\":%d,\"trigger\":%d,\"old_lan\":%d,\"old_wan\":%d,"
+                 "\"new_lan\":%d,\"new_wan\":%d,\"old_prof\":%d,\"new_prof\":%d}",
+                 (int)mode, trigger_profile_id, old->local_count, old->wan_count,
+                 cfg->local_count, cfg->wan_count, old->profile_count, cfg->profile_count);
+        agent_dbg("C", "profile_iface_xdp.c:reload_impl", "reload_enter", js);
+    }
+    /* #endregion */
 
     switch (mode) {
     case PROFILE_IFACE_XDP_REMOVE:
