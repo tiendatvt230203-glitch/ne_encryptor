@@ -75,6 +75,9 @@ struct ne_pair {
     uint32_t frame_size;
     uint32_t n_frames;
     struct xsk_umem *umem;
+    /* Fill/comp rings owned by xsk_umem__create (do not memset on unplumb). */
+    int umem_fq_li;
+    int umem_fq_q;
     struct ne_iface locals[MAX_INTERFACES];
     int local_count;
     struct ne_iface wans[MAX_INTERFACES];
