@@ -32,8 +32,17 @@ APP_SRC = main.c \
           src/crypto/packet_crypto.c \
           src/crypto/traffic_crypto.c \
           src/crypto/crypto_layer2.c \
+          src/crypto/crypto_layer2_ctr.c \
+          src/crypto/crypto_layer2_gcm.c \
+          src/crypto/crypto_layer2_pqc.c \
           src/crypto/crypto_layer3.c \
+          src/crypto/crypto_layer3_ctr.c \
+          src/crypto/crypto_layer3_gcm.c \
+          src/crypto/crypto_layer3_pqc.c \
           src/crypto/crypto_layer4.c \
+          src/crypto/crypto_layer4_ctr.c \
+          src/crypto/crypto_layer4_gcm.c \
+          src/crypto/crypto_layer4_pqc.c \
           src/crypto/pqc_handshake.c \
           src/crypto/pqc_l2_handshake.c \
           src/crypto/pqc_logger.c \
