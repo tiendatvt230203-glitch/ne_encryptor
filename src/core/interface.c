@@ -491,6 +491,67 @@ static int interface_is_up(const char *ifname)
     return (ifr.ifr_flags & IFF_UP) != 0;
 }
 
+static int interface_is_bridge_slave(const char *ifname)
+{
+    char path[256];
+
+    if (!ifname_is_safe(ifname))
+        return 0;
+    snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname);
+    return access(path, F_OK) == 0;
+}
+
+static int interface_get_mtu(const char *ifname)
+{
+    int fd;
+    struct ifreq ifr;
+
+    if (!ifname_is_safe(ifname))
+        return -1;
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFMTU, &ifr) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return ifr.ifr_mtu;
+}
+
+static void interface_log_xsk_context(const char *ifname, int queue_id, int ret)
+{
+    char master[IF_NAMESIZE];
+    char path[256];
+    int mtu;
+    int nq;
+    int err = ret < 0 ? -ret : ret;
+
+    master[0] = '\0';
+    if (ifname_is_safe(ifname)) {
+        snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname);
+        if (access(path, F_OK) == 0) {
+            char link[256];
+            ssize_t n = readlink(path, link, sizeof(link) - 1);
+            if (n > 0) {
+                link[n] = '\0';
+                const char *base = strrchr(link, '/');
+                snprintf(master, sizeof(master), "%s", base ? base + 1 : link);
+            }
+        }
+    }
+    mtu = interface_get_mtu(ifname);
+    nq = interface_get_queue_count(ifname);
+    fprintf(stderr,
+            "[DP] XSK create failed %s q=%d: %s (%d) — mtu=%d queues=%d frame=%u master=%s%s\n",
+            ifname, queue_id, strerror(err), ret, mtu, nq, NE_FRAME,
+            master[0] ? master : "-",
+            interface_is_bridge_slave(ifname) ? " (bridge-slave, Br kept)" : "");
+    fflush(stderr);
+}
+
 static int interface_preflight(const char *ifname)
 {
     if (!ifname_is_safe(ifname))
@@ -504,6 +565,12 @@ static int interface_preflight(const char *ifname)
         fprintf(stderr, "[DP] %s: link is DOWN\n", ifname);
         fflush(stderr);
         return -1;
+    }
+    /* Br membership is intentional (customer default) — do not reject. */
+    if (interface_is_bridge_slave(ifname)) {
+        fprintf(stderr, "[DP] %s: bridge slave (keeping Br, XSK may use SKB fallback)\n",
+                ifname);
+        fflush(stderr);
     }
     return 0;
 }
@@ -531,34 +598,6 @@ static void zero_queue_rings(struct ne_xsk_queue *slot, int preserve_fq_cq)
 }
 
 static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool);
-
-/* Best-effort: return FQ descriptors still owned by userspace to the pool. */
-static void reclaim_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
-{
-    uint64_t addrs[NE_BATCH_SIZE];
-    uint32_t prod;
-    uint32_t cons;
-
-    if (!slot || !pool || !slot->fq.ring || !slot->fq.producer || !slot->fq.consumer)
-        return;
-
-    prod = *slot->fq.producer;
-    cons = __atomic_load_n(slot->fq.consumer, __ATOMIC_ACQUIRE);
-    while (cons != prod) {
-        uint32_t batch = prod - cons;
-        uint32_t i;
-
-        if (batch > NE_BATCH_SIZE)
-            batch = NE_BATCH_SIZE;
-        for (i = 0; i < batch; i++)
-            addrs[i] = *xsk_ring_prod__fill_addr(&slot->fq, cons + i);
-        (void)pool_push(pool, addrs, batch);
-        cons += batch;
-    }
-    __atomic_store_n(slot->fq.producer, cons, __ATOMIC_RELEASE);
-    slot->fq.cached_prod = cons;
-    slot->fq.cached_cons = cons + slot->fq.size;
-}
 
 static void reclaim_rx_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
 {
@@ -599,18 +638,80 @@ static void reclaim_rx_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
+/*
+ * Do NOT pull outstanding FQ descriptors back into the userspace pool before
+ * xsk_socket__delete(). Rewinding fq.producer while the kernel still owns those
+ * entries desyncs a shared UMEM. Next bind() with XDP_SHARED_UMEM then fails
+ * with EINVAL (-22) on the same ifindex — while a process restart (new UMEM)
+ * works. Let delete/close return fill ownership to the kernel/UMEM.
+ */
 static void reclaim_iface_umem_frames(struct ne_pair *p, struct ne_iface *iface)
 {
     if (!p || !iface)
         return;
     for (int q = 0; q < iface->queue_count; q++) {
         struct ne_xsk_queue *slot = &iface->queues[q];
-        int umem_owner = is_umem_fq_owner_queue(p, iface, q);
 
         drain_cq_queue(slot, &p->pool);
         reclaim_rx_queue(slot, &p->pool);
-        if (!umem_owner)
-            reclaim_fq_queue(slot, &p->pool);
+    }
+}
+
+static int queue_holds_umem_fd(const struct ne_pair *p, const struct ne_xsk_queue *slot)
+{
+    if (!p || !p->umem || !slot || !slot->xsk)
+        return 0;
+    return xsk_socket__fd(slot->xsk) == xsk_umem__fd(p->umem);
+}
+
+static int iface_holds_umem_fd(const struct ne_pair *p, const struct ne_iface *iface, int nq)
+{
+    for (int q = 0; q < nq; q++) {
+        if (queue_holds_umem_fd(p, &iface->queues[q]))
+            return 1;
+    }
+    return 0;
+}
+
+static int ne_pair_other_live_count(const struct ne_pair *p, int skip_local, int skip_wan)
+{
+    int n = 0;
+
+    if (!p)
+        return 0;
+    for (int i = 0; i < p->local_count; i++) {
+        if (i == skip_local)
+            continue;
+        if (p->local_live[i])
+            n++;
+    }
+    for (int i = 0; i < p->wan_count; i++) {
+        if (i == skip_wan)
+            continue;
+        if (p->wan_live[i])
+            n++;
+    }
+    return n;
+}
+
+/* Delete XSK sockets: non-UMEM-fd first, UMEM-fd last (libxdp shares via umem->fd). */
+static void delete_iface_xsks(struct ne_pair *p, struct ne_iface *iface, int nq)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        for (int q = 0; q < nq; q++) {
+            struct ne_xsk_queue *slot = &iface->queues[q];
+            int is_umem_fd;
+
+            if (!slot->xsk)
+                continue;
+            is_umem_fd = queue_holds_umem_fd(p, slot);
+            if (pass == 0 && is_umem_fd)
+                continue;
+            if (pass == 1 && !is_umem_fd)
+                continue;
+            xsk_socket__delete(slot->xsk);
+            slot->xsk = NULL;
+        }
     }
 }
 
@@ -627,18 +728,50 @@ static void clear_iface_queues_after_delete(struct ne_pair *p, struct ne_iface *
     iface->ifindex = 0;
     iface->ifname[0] = '\0';
     iface->queue_count = 0;
+    iface->xdp_flags = 0;
+}
+
+static int xsk_create_queue(struct ne_pair *p, struct ne_iface *iface, const char *ifname,
+                            int q, uint32_t xdp_flags)
+{
+    struct ne_xsk_queue *slot = &iface->queues[q];
+    int preserve = is_umem_fq_owner_queue(p, iface, q);
+    struct xsk_socket_config cfg = {
+        .rx_size = NE_RING,
+        .tx_size = NE_RING,
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .xdp_flags = xdp_flags,
+        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
+    };
+
+    zero_queue_rings(slot, preserve);
+    return xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
+                                     &slot->rx, &slot->tx,
+                                     &slot->fq, &slot->cq, &cfg);
+}
+
+static void open_iface_queues_rollback(struct ne_pair *p, struct ne_iface *iface, int opened)
+{
+    for (int j = 0; j < opened; j++) {
+        if (iface->queues[j].xsk) {
+            xsk_socket__delete(iface->queues[j].xsk);
+            iface->queues[j].xsk = NULL;
+        }
+        zero_queue_rings(&iface->queues[j], is_umem_fq_owner_queue(p, iface, j));
+    }
+    iface->queue_count = 0;
+    iface->ifindex = 0;
+    iface->ifname[0] = '\0';
+    iface->xdp_flags = 0;
 }
 
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
                              const char *ifname, int queue_count)
 {
-    struct xsk_socket_config cfg = {
-        .rx_size = NE_RING,
-        .tx_size = NE_RING,
-        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = p->xdp_flags,
-        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
-    };
+    uint32_t modes[2];
+    int nmodes = 0;
+    uint32_t prefer = p->xdp_flags ? p->xdp_flags : XDP_FLAGS_DRV_MODE;
+    int last_ret = -EINVAL;
 
     iface->ifindex = (int)if_nametoindex(ifname);
     if (!iface->ifindex) {
@@ -649,37 +782,54 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
     iface->queue_count = queue_count;
+    iface->xdp_flags = 0;
 
-    for (int q = 0; q < queue_count; q++) {
-        struct ne_xsk_queue *slot = &iface->queues[q];
-        int preserve = is_umem_fq_owner_queue(p, iface, q);
-        int ret;
+    modes[nmodes++] = prefer;
+    if (prefer != XDP_FLAGS_SKB_MODE)
+        modes[nmodes++] = XDP_FLAGS_SKB_MODE;
 
-        zero_queue_rings(slot, preserve);
-        ret = xsk_socket__create_shared(&slot->xsk, ifname, (uint32_t)q, p->umem,
-                                        &slot->rx, &slot->tx,
-                                        &slot->fq, &slot->cq, &cfg);
-        if (ret) {
-            int err = ret < 0 ? -ret : ret;
+    for (int mi = 0; mi < nmodes; mi++) {
+        uint32_t mode = modes[mi];
+        int q;
+        int ret = 0;
 
-            fprintf(stderr, "[DP] XSK create failed %s q=%d: %s (%d)\n",
-                    ifname, q, strerror(err), ret);
-            fflush(stderr);
-            for (int j = 0; j < q; j++) {
-                if (iface->queues[j].xsk) {
-                    xsk_socket__delete(iface->queues[j].xsk);
-                    iface->queues[j].xsk = NULL;
-                }
-                zero_queue_rings(&iface->queues[j],
-                                 is_umem_fq_owner_queue(p, iface, j));
+        iface->ifindex = (int)if_nametoindex(ifname);
+        strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
+        iface->ifname[sizeof(iface->ifname) - 1] = '\0';
+        iface->queue_count = queue_count;
+
+        for (q = 0; q < queue_count; q++) {
+            ret = xsk_create_queue(p, iface, ifname, q, mode);
+            if (ret) {
+                last_ret = ret;
+                open_iface_queues_rollback(p, iface, q);
+                break;
             }
-            iface->queue_count = 0;
-            iface->ifindex = 0;
-            iface->ifname[0] = '\0';
-            return -1;
+        }
+        if (ret == 0) {
+            iface->xdp_flags = mode;
+            if (mode == XDP_FLAGS_SKB_MODE && prefer != XDP_FLAGS_SKB_MODE) {
+                fprintf(stderr, "[DP] %s: AF_XDP bound with SKB_MODE (DRV failed)\n",
+                        ifname);
+                fflush(stderr);
+            }
+            return 0;
+        }
+        if (ret != -EINVAL && ret != EINVAL)
+            break;
+        if (mi + 1 < nmodes) {
+            fprintf(stderr, "[DP] %s: XSK mode=0x%x failed (%d), retry SKB_MODE\n",
+                    ifname, mode, ret);
+            fflush(stderr);
         }
     }
-    return 0;
+
+    interface_log_xsk_context(ifname, 0, last_ret);
+    iface->queue_count = 0;
+    iface->ifindex = 0;
+    iface->ifname[0] = '\0';
+    iface->xdp_flags = 0;
+    return -1;
 }
 
 static void prefill_queue(struct ne_pair *p, struct ne_xsk_queue *slot, uint32_t want)
@@ -896,6 +1046,9 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
     if (interface_preflight(ifname) != 0)
         return -1;
 
+    /* Ensure leftover XDP modes are cleared; Br membership stays. */
+    profile_iface_xdp_detach_ifname(ifname);
+
     int nq = resolve_iface_queue_count(ifname);
     if (apply_iface_queue_count(ifname, nq) != 0) {
         fprintf(stderr, "[DP] plumb LAN %s: queue_count apply failed (want=%d)\n",
@@ -937,6 +1090,9 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
     if (interface_preflight(ifname) != 0)
         return -1;
 
+    /* Ensure leftover XDP modes are cleared; Br membership stays. */
+    profile_iface_xdp_detach_ifname(ifname);
+
     int nq = resolve_iface_queue_count(ifname);
     if (apply_iface_queue_count(ifname, nq) != 0) {
         fprintf(stderr, "[DP] plumb WAN %s: queue_count apply failed (want=%d)\n",
@@ -968,6 +1124,8 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
 void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
 {
     int nq;
+    int holds_umem_fd;
+    int others;
 
     if (!p || pair_li < 0 || pair_li >= p->local_count || !p->local_live[pair_li])
         return;
@@ -975,13 +1133,20 @@ void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
     profile_iface_xdp_detach_local(p, pair_li);
     p->local_live[pair_li] = 0;
     nq = p->locals[pair_li].queue_count;
-    reclaim_iface_umem_frames(p, &p->locals[pair_li]);
-    for (int q = 0; q < nq; q++) {
-        if (p->locals[pair_li].queues[q].xsk) {
-            xsk_socket__delete(p->locals[pair_li].queues[q].xsk);
-            p->locals[pair_li].queues[q].xsk = NULL;
-        }
+    holds_umem_fd = iface_holds_umem_fd(p, &p->locals[pair_li], nq);
+    others = ne_pair_other_live_count(p, pair_li, -1);
+
+    if (holds_umem_fd && others > 0) {
+        fprintf(stderr,
+                "[DP] WARN: unplumb LAN %s holds umem fd while %d other live iface(s) — "
+                "delete order umem-fd last; prefer not removing UMEM home without rebuild\n",
+                p->locals[pair_li].ifname[0] ? p->locals[pair_li].ifname : "?",
+                others);
+        fflush(stderr);
     }
+
+    reclaim_iface_umem_frames(p, &p->locals[pair_li]);
+    delete_iface_xsks(p, &p->locals[pair_li], nq);
     clear_iface_queues_after_delete(p, &p->locals[pair_li], nq);
     if (p->local_queue_total >= nq)
         p->local_queue_total -= nq;
@@ -992,6 +1157,8 @@ void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
 void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
 {
     int nq;
+    int holds_umem_fd;
+    int others;
 
     if (!p || dp_slot < 0 || dp_slot >= p->wan_count || !p->wan_live[dp_slot])
         return;
@@ -999,13 +1166,19 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     profile_iface_xdp_detach_wan(p, dp_slot);
     p->wan_live[dp_slot] = 0;
     nq = p->wans[dp_slot].queue_count;
-    reclaim_iface_umem_frames(p, &p->wans[dp_slot]);
-    for (int q = 0; q < nq; q++) {
-        if (p->wans[dp_slot].queues[q].xsk) {
-            xsk_socket__delete(p->wans[dp_slot].queues[q].xsk);
-            p->wans[dp_slot].queues[q].xsk = NULL;
-        }
+    holds_umem_fd = iface_holds_umem_fd(p, &p->wans[dp_slot], nq);
+    others = ne_pair_other_live_count(p, -1, dp_slot);
+
+    if (holds_umem_fd && others > 0) {
+        fprintf(stderr,
+                "[DP] WARN: unplumb WAN %s holds umem fd while %d other live iface(s)\n",
+                p->wans[dp_slot].ifname[0] ? p->wans[dp_slot].ifname : "?",
+                others);
+        fflush(stderr);
     }
+
+    reclaim_iface_umem_frames(p, &p->wans[dp_slot]);
+    delete_iface_xsks(p, &p->wans[dp_slot], nq);
     clear_iface_queues_after_delete(p, &p->wans[dp_slot], nq);
     if (p->wan_queue_total >= nq)
         p->wan_queue_total -= nq;

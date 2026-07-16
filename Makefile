@@ -51,12 +51,15 @@ DB_OBJ = $(DB_SRC:.c=.o)
 BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
-.PHONY: all clean dirs
+.PHONY: all clean dirs tools/test_xsk_rebind
 
 all: dirs $(BPF_OBJ) $(TARGET)
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
+
+tools/test_xsk_rebind: tools/test_xsk_rebind.c
+	$(CC) $(CFLAGS) -o $@ $< -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -65,4 +68,4 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ) tools/test_xsk_rebind

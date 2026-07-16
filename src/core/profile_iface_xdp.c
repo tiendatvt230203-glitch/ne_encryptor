@@ -39,8 +39,9 @@ static int profile_iface_ifname_safe(const char *ifname)
 
 static void profile_iface_xdp_link_off(const char *ifname)
 {
-    char cmd[128];
+    char cmd[160];
     char js[160];
+    static const char *const modes[] = { "xdp", "xdpgeneric", "xdpoffload" };
 
     if (!profile_iface_ifname_safe(ifname))
         return;
@@ -48,9 +49,12 @@ static void profile_iface_xdp_link_off(const char *ifname)
     snprintf(js, sizeof(js), "{\"ifname\":\"%s\"}", ifname);
     agent_dbg("D", "profile_iface_xdp.c:link_off", "ip_link_xdp_off", js);
     /* #endregion */
-    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off", ifname);
-    if (system(cmd) != 0)
-        fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
+    /* Clear all attach modes; do not touch bridge/master. */
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s %s off", ifname, modes[i]);
+        if (system(cmd) != 0)
+            fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
+    }
 }
 
 void profile_iface_xdp_detach_ifname(const char *ifname)
@@ -321,19 +325,40 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
 
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
                            const char *ifname, const char *role)
-{   
+{
+    uint32_t try_flags[2];
+    int n = 0;
+    int rc = -1;
 
-    int rc = bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+    try_flags[n++] = flags ? flags : XDP_FLAGS_DRV_MODE;
+    if (try_flags[0] != XDP_FLAGS_SKB_MODE)
+        try_flags[n++] = XDP_FLAGS_SKB_MODE;
 
-    if (rc) {
-        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: %s\n",
-                role, ifname, strerror(-rc));
-        fflush(stderr);
-        return -1;
+    for (int i = 0; i < n; i++) {
+        rc = bpf_xdp_attach(ifindex, prog_fd, try_flags[i], NULL);
+        if (rc == 0) {
+            if (try_flags[i] == XDP_FLAGS_SKB_MODE && try_flags[0] != XDP_FLAGS_SKB_MODE)
+                fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (SKB_MODE)\n",
+                        role, ifname);
+            else
+                fprintf(stderr, "[PROFILE-XDP] attach OK %s %s\n", role, ifname);
+            fflush(stderr);
+            return 0;
+        }
+        if (rc != -EINVAL && rc != -EOPNOTSUPP)
+            break;
+        if (i + 1 < n) {
+            fprintf(stderr,
+                    "[PROFILE-XDP] attach %s %s mode=0x%x failed (%s), retry SKB\n",
+                    role, ifname, try_flags[i], strerror(-rc));
+            fflush(stderr);
+        }
     }
-    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s\n", role, ifname);
+
+    fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: %s\n",
+            role, ifname, strerror(rc < 0 ? -rc : rc));
     fflush(stderr);
-    return 0;
+    return -1;
 }
 
 static const char *resolve_bpf_object_path(const char *path, char resolved[PATH_MAX])
@@ -450,7 +475,9 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         return -1;
     profile_iface_xdp_link_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, ifname, "LAN") != 0) {
+                        p->locals[pair_li].xdp_flags ? p->locals[pair_li].xdp_flags
+                                                     : p->xdp_flags,
+                        ifname, "LAN") != 0) {
         bpf_object__close(p->bpf_locals[pair_li]);
         p->bpf_locals[pair_li] = NULL;
         return -1;
@@ -475,7 +502,9 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
     profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
-                        p->xdp_flags, p->wans[dp_slot].ifname, "WAN") != 0) {
+                        p->wans[dp_slot].xdp_flags ? p->wans[dp_slot].xdp_flags
+                                                   : p->xdp_flags,
+                        p->wans[dp_slot].ifname, "WAN") != 0) {
         bpf_object__close(p->bpf_wans[dp_slot]);
         p->bpf_wans[dp_slot] = NULL;
         return -1;

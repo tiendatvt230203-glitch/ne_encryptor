@@ -67,6 +67,8 @@ struct ne_iface {
     int queue_count;
     struct ne_xsk_queue queues[MAX_QUEUES];
     uint64_t tx_no_free;
+    /* XDP mode used for AF_XDP bind + bpf_xdp_attach (DRV or SKB). */
+    uint32_t xdp_flags;
 };
 
 struct ne_pair {
