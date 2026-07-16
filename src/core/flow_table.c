@@ -54,7 +54,6 @@ static uint32_t flow_hash(uint32_t src_ip, uint32_t dst_ip,
 }
 
 static uint32_t flow_hash_ips(uint32_t src_ip, uint32_t dst_ip) {
-
     uint32_t hash = src_ip ^ dst_ip;
     hash ^= (hash >> 16);
     hash *= 0x85ebca6b;
@@ -67,7 +66,13 @@ static uint32_t flow_hash_ips(uint32_t src_ip, uint32_t dst_ip) {
 static uint64_t get_time_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec;
+    return (uint64_t)ts.tv_sec;
+}
+
+static uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 void flow_table_init(struct flow_table *ft, const uint32_t *wan_window_sizes, int wan_count) {
@@ -111,70 +116,6 @@ static int get_next_wan(int wan_count) {
         wan = -wan;
     wan %= wan_count;
     return wan;
-}
-
-int flow_table_get_wan(struct flow_table *ft,
-                       uint32_t src_ip, uint32_t dst_ip,
-                       uint16_t src_port, uint16_t dst_port,
-                       uint8_t protocol, uint32_t pkt_len) {
-    normalize_flow_ips(&src_ip, &dst_ip);
-    uint32_t idx = flow_hash_ips(src_ip, dst_ip);
-    uint64_t now = get_time_sec();
-    int wan_idx;
-
-    pthread_mutex_lock(&ft->locks[idx]);
-
-    struct flow_entry *entry = ft->buckets[idx];
-
-    while (entry) {
-        if (entry->ip_only_key &&
-            entry->key.src_ip == src_ip &&
-            entry->key.dst_ip == dst_ip) {
-
-            entry->last_seen = now;
-            entry->byte_count += pkt_len;
-
-            uint32_t cur_limit = 0;
-            if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
-                cur_limit = ft->wan_window_sizes[entry->current_wan];
-
-
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                entry->byte_count = 0;
-                entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
-            }
-
-            wan_idx = entry->current_wan;
-            pthread_mutex_unlock(&ft->locks[idx]);
-            return wan_idx;
-        }
-        entry = entry->next;
-    }
-
-    entry = malloc(sizeof(struct flow_entry));
-    if (!entry) {
-        pthread_mutex_unlock(&ft->locks[idx]);
-        return 0;
-    }
-
-    entry->key.src_ip = src_ip;
-    entry->key.dst_ip = dst_ip;
-    entry->key.src_port = src_port;
-    entry->key.dst_port = dst_port;
-    entry->key.protocol = protocol;
-    entry->byte_count = pkt_len;
-    entry->current_wan = get_next_wan(ft->wan_count);
-    entry->wrr_slot = 0;
-    entry->last_seen = now;
-    entry->valid = 1;
-    entry->ip_only_key = 1;
-    entry->profile_wan_pool = 0;
-    entry->next = ft->buckets[idx];
-    ft->buckets[idx] = entry;
-
-    wan_idx = entry->current_wan;
-    pthread_mutex_unlock(&ft->locks[idx]);
-    return wan_idx;
 }
 
 static int wan_allowed_pos(int wan_idx, const int *allowed_wans, int allowed_count) {
@@ -255,6 +196,130 @@ static uint32_t profile_wan_limit(const struct flow_table *ft, int wan_idx,
     return limit > 0 ? (uint32_t)limit : 1;
 }
 
+static void flow_commit_window_switch(struct flow_entry *entry,
+                                      const int *allowed_wans,
+                                      const int *allowed_weights,
+                                      int allowed_count,
+                                      uint32_t first_pkt_len) {
+    int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+    if (pos < 0)
+        pos = 0;
+    entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
+    entry->current_wan = allowed_wans[entry->wrr_slot];
+    entry->byte_count = first_pkt_len;
+    entry->drain_until_ns = 0;
+}
+
+static void flow_window_advance(struct flow_entry *entry, struct flow_table *ft,
+                                uint32_t pkt_len, uint64_t now_ns,
+                                const int *allowed_wans, int allowed_count,
+                                const int *allowed_weights, int sumw) {
+    int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+    if (pos < 0 || (sumw > 0 && allowed_weights && allowed_weights[pos] <= 0)) {
+        pos = (sumw > 0) ? first_positive_pos(allowed_weights, allowed_count) : 0;
+        entry->current_wan = allowed_wans[pos];
+        entry->byte_count = 0;
+        entry->wrr_slot = pos;
+        entry->drain_until_ns = 0;
+    }
+
+    entry->byte_count += pkt_len;
+
+    if (entry->drain_until_ns) {
+        if (now_ns >= entry->drain_until_ns)
+            flow_commit_window_switch(entry, allowed_wans, allowed_weights,
+                                      allowed_count, pkt_len);
+        return;
+    }
+
+    {
+        uint32_t cur_limit = profile_wan_limit(ft, entry->current_wan,
+                                               allowed_wans, allowed_weights,
+                                               allowed_count);
+        if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+            entry->drain_until_ns = now_ns +
+                (uint64_t)FLOW_WAN_SWITCH_DRAIN_MS * 1000000ULL;
+        }
+    }
+}
+
+int flow_table_get_wan(struct flow_table *ft,
+                       uint32_t src_ip, uint32_t dst_ip,
+                       uint16_t src_port, uint16_t dst_port,
+                       uint8_t protocol, uint32_t pkt_len) {
+    normalize_flow_ips(&src_ip, &dst_ip);
+    uint32_t idx = flow_hash_ips(src_ip, dst_ip);
+    uint64_t now = get_time_sec();
+    uint64_t now_ns = get_time_ns();
+    int wan_idx;
+
+    (void)src_port;
+    (void)dst_port;
+    (void)protocol;
+
+    pthread_mutex_lock(&ft->locks[idx]);
+
+    struct flow_entry *entry = ft->buckets[idx];
+
+    while (entry) {
+        if (entry->ip_only_key &&
+            entry->key.src_ip == src_ip &&
+            entry->key.dst_ip == dst_ip) {
+
+            entry->last_seen = now;
+            entry->byte_count += pkt_len;
+
+            if (entry->drain_until_ns) {
+                if (now_ns >= entry->drain_until_ns) {
+                    entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
+                    entry->byte_count = pkt_len;
+                    entry->drain_until_ns = 0;
+                }
+            } else {
+                uint32_t cur_limit = 0;
+                if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
+                    cur_limit = ft->wan_window_sizes[entry->current_wan];
+                if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+                    entry->drain_until_ns = now_ns +
+                        (uint64_t)FLOW_WAN_SWITCH_DRAIN_MS * 1000000ULL;
+                }
+            }
+
+            wan_idx = entry->current_wan;
+            pthread_mutex_unlock(&ft->locks[idx]);
+            return wan_idx;
+        }
+        entry = entry->next;
+    }
+
+    entry = malloc(sizeof(struct flow_entry));
+    if (!entry) {
+        pthread_mutex_unlock(&ft->locks[idx]);
+        return 0;
+    }
+
+    memset(entry, 0, sizeof(*entry));
+    entry->key.src_ip = src_ip;
+    entry->key.dst_ip = dst_ip;
+    entry->key.src_port = src_port;
+    entry->key.dst_port = dst_port;
+    entry->key.protocol = protocol;
+    entry->byte_count = pkt_len;
+    entry->current_wan = get_next_wan(ft->wan_count);
+    entry->wrr_slot = 0;
+    entry->last_seen = now;
+    entry->drain_until_ns = 0;
+    entry->valid = 1;
+    entry->ip_only_key = 1;
+    entry->profile_wan_pool = 0;
+    entry->next = ft->buckets[idx];
+    ft->buckets[idx] = entry;
+
+    wan_idx = entry->current_wan;
+    pthread_mutex_unlock(&ft->locks[idx]);
+    return wan_idx;
+}
+
 int flow_table_pick_wan_per_packet(const int *allowed_wans,
                                    const int *allowed_weights,
                                    int allowed_count) {
@@ -285,6 +350,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
     uint32_t idx = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     uint64_t now = get_time_sec();
+    uint64_t now_ns = get_time_ns();
     int sumw = weights_sum_positive(allowed_weights, allowed_count);
 
     pthread_mutex_lock(&ft->locks[idx]);
@@ -299,33 +365,14 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             entry->key.dst_port == dst_port &&
             entry->key.protocol == protocol) {
 
-            int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
-            if (pos < 0 || (sumw > 0 && allowed_weights && allowed_weights[pos] <= 0)) {
-                pos = (sumw > 0) ? first_positive_pos(allowed_weights, allowed_count) : 0;
-                entry->current_wan = allowed_wans[pos];
-                entry->byte_count = 0;
-                entry->wrr_slot = pos;
-            }
-
             entry->last_seen = now;
-            int wan_idx = entry->current_wan;
-            entry->byte_count += pkt_len;
-
-            uint32_t cur_limit = profile_wan_limit(ft, wan_idx,
-                                                   allowed_wans, allowed_weights,
-                                                   allowed_count);
-
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                entry->byte_count = 0;
-                pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
-                if (pos < 0)
-                    pos = 0;
-                entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
-                entry->current_wan = allowed_wans[entry->wrr_slot];
+            flow_window_advance(entry, ft, pkt_len, now_ns,
+                                allowed_wans, allowed_count, allowed_weights, sumw);
+            {
+                int wan_idx = entry->current_wan;
+                pthread_mutex_unlock(&ft->locks[idx]);
+                return wan_idx;
             }
-
-            pthread_mutex_unlock(&ft->locks[idx]);
-            return wan_idx;
         }
         entry = entry->next;
     }
@@ -336,6 +383,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
         return 0;
     }
 
+    memset(entry, 0, sizeof(*entry));
     entry->key.src_ip = src_ip;
     entry->key.dst_ip = dst_ip;
     entry->key.src_port = src_port;
@@ -343,40 +391,43 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     entry->key.protocol = protocol;
     entry->byte_count = pkt_len;
     entry->last_seen = now;
+    entry->drain_until_ns = 0;
     entry->valid = 1;
     entry->ip_only_key = 0;
     entry->profile_wan_pool = 1;
     entry->next = ft->buckets[idx];
 
-    uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
-    if (sumw > 0 && allowed_weights) {
-        entry->current_wan = wrr_slot_to_wan((int)(h % (uint32_t)sumw),
-                                             allowed_wans, allowed_weights,
-                                             allowed_count, sumw);
-        entry->wrr_slot = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
-        if (entry->wrr_slot < 0)
-            entry->wrr_slot = first_positive_pos(allowed_weights, allowed_count);
-    } else {
-        entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
-        entry->current_wan = allowed_wans[entry->wrr_slot];
+    {
+        uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        if (sumw > 0 && allowed_weights) {
+            entry->current_wan = wrr_slot_to_wan((int)(h % (uint32_t)sumw),
+                                                 allowed_wans, allowed_weights,
+                                                 allowed_count, sumw);
+            entry->wrr_slot = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+            if (entry->wrr_slot < 0)
+                entry->wrr_slot = first_positive_pos(allowed_weights, allowed_count);
+        } else {
+            entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
+            entry->current_wan = allowed_wans[entry->wrr_slot];
+        }
     }
-    int wan_idx = entry->current_wan;
-    uint32_t cur_limit = profile_wan_limit(ft, wan_idx,
-                                           allowed_wans, allowed_weights,
-                                           allowed_count);
-    if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-        int pos = wan_allowed_pos(wan_idx, allowed_wans, allowed_count);
-        if (pos < 0)
-            pos = 0;
-        entry->byte_count = 0;
-        entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
-        entry->current_wan = allowed_wans[entry->wrr_slot];
+
+    {
+        uint32_t cur_limit = profile_wan_limit(ft, entry->current_wan,
+                                               allowed_wans, allowed_weights,
+                                               allowed_count);
+        if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+            entry->drain_until_ns = now_ns +
+                (uint64_t)FLOW_WAN_SWITCH_DRAIN_MS * 1000000ULL;
+        }
     }
 
     ft->buckets[idx] = entry;
-
-    pthread_mutex_unlock(&ft->locks[idx]);
-    return wan_idx;
+    {
+        int wan_idx = entry->current_wan;
+        pthread_mutex_unlock(&ft->locks[idx]);
+        return wan_idx;
+    }
 }
 
 void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)

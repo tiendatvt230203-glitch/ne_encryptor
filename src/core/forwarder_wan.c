@@ -501,5 +501,5 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     if (dp < 0 || dp >= fwd->wan_count || fwd_wan_is_stopped(dp))
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
-    return pick_least_loaded_wan(fwd, profile_idx, dp);
+    return dp;
 }
