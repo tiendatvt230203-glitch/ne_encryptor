@@ -326,39 +326,18 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
 static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
                            const char *ifname, const char *role)
 {
-    uint32_t try_flags[2];
-    int n = 0;
-    int rc = -1;
+    uint32_t mode = flags ? flags : XDP_FLAGS_DRV_MODE;
+    int rc = bpf_xdp_attach(ifindex, prog_fd, mode, NULL);
 
-    try_flags[n++] = flags ? flags : XDP_FLAGS_DRV_MODE;
-    if (try_flags[0] != XDP_FLAGS_SKB_MODE)
-        try_flags[n++] = XDP_FLAGS_SKB_MODE;
-
-    for (int i = 0; i < n; i++) {
-        rc = bpf_xdp_attach(ifindex, prog_fd, try_flags[i], NULL);
-        if (rc == 0) {
-            if (try_flags[i] == XDP_FLAGS_SKB_MODE && try_flags[0] != XDP_FLAGS_SKB_MODE)
-                fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (SKB_MODE)\n",
-                        role, ifname);
-            else
-                fprintf(stderr, "[PROFILE-XDP] attach OK %s %s\n", role, ifname);
-            fflush(stderr);
-            return 0;
-        }
-        if (rc != -EINVAL && rc != -EOPNOTSUPP)
-            break;
-        if (i + 1 < n) {
-            fprintf(stderr,
-                    "[PROFILE-XDP] attach %s %s mode=0x%x failed (%s), retry SKB\n",
-                    role, ifname, try_flags[i], strerror(-rc));
-            fflush(stderr);
-        }
+    if (rc) {
+        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s mode=0x%x: %s\n",
+                role, ifname, mode, strerror(rc < 0 ? -rc : rc));
+        fflush(stderr);
+        return -1;
     }
-
-    fprintf(stderr, "[PROFILE-XDP] attach failed %s %s: %s\n",
-            role, ifname, strerror(rc < 0 ? -rc : rc));
+    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (mode=0x%x)\n", role, ifname, mode);
     fflush(stderr);
-    return -1;
+    return 0;
 }
 
 static const char *resolve_bpf_object_path(const char *path, char resolved[PATH_MAX])

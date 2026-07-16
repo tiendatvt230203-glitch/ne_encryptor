@@ -905,6 +905,8 @@ int main(int argc, char **argv) {
 
     sig_pqc_start_ipc_server();
     libbpf_set_print(libbpf_print_silent);
+    fprintf(stderr, "[NE-BUILD] umem-rehome-v2 DRV-only (journal marker — verify deploy)\n");
+    fflush(stderr);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };
     sigemptyset(&sa.sa_mask);

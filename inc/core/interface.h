@@ -103,6 +103,12 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
                          int dp_slot);
 void ne_pair_unplumb_local(struct ne_pair *p, int pair_li);
 void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot);
+/* If drop_li holds umem->fd and other ifaces stay live: rebuild UMEM on a
+ * surviving LAN, replumb keepers (XDP rebind is caller's job). Returns 1 if
+ * rehome ran, 0 if plain unplumb, -1 on hard failure. */
+int ne_pair_unplumb_local_rehome(struct ne_pair *p, int drop_li,
+                                 const struct app_config *cfg);
+
 
 int ne_ring_init(struct ne_ring *r, uint32_t cap, int mpsc_pop);
 void ne_ring_destroy(struct ne_ring *r);

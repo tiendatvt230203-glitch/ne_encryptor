@@ -159,6 +159,7 @@ void profile_iface_life_reconcile_counts(struct forwarder *fwd)
 int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int profile_id)
 {
     int li;
+    int rc;
 
     if (!fwd || !ifname)
         return -1;
@@ -169,7 +170,48 @@ int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int
             "[PROFILE-LIFE] profile %d REMOVE LAN %s — detach xdp/xsk (slot %d)\n",
             profile_id, ifname, li);
     fflush(stderr);
-    ne_pair_unplumb_local(&fwd->pair, li);
+
+    fprintf(stderr, "[PROFILE-LIFE] umem-rehome path for %s slot %d\n", ifname, li);
+    fflush(stderr);
+    rc = ne_pair_unplumb_local_rehome(&fwd->pair, li, fwd->cfg);
+    if (rc < 0)
+        return -1;
+    if (rc == 1) {
+        /* UMEM was rebuilt onto a surviving LAN — re-attach XDP on keepers. */
+        fprintf(stderr,
+                "[PROFILE-LIFE] profile %d: UMEM rehomed after drop %s — rebind XDP keepers\n",
+                profile_id, ifname);
+        fflush(stderr);
+        for (int i = 0; i < fwd->pair.local_count; i++) {
+            if (!ne_pair_local_live(&fwd->pair, i))
+                continue;
+            if (profile_iface_xdp_bind_local(&fwd->pair, fwd->cfg, i) != 0) {
+                fprintf(stderr, "[PROFILE-LIFE] rebind LAN %s failed\n",
+                        fwd->pair.locals[i].ifname);
+                return -1;
+            }
+            fwd->pair.xdp_local_on[i] = 1;
+            strncpy(fwd->locals[i].ifname, fwd->pair.locals[i].ifname,
+                    sizeof(fwd->locals[i].ifname) - 1);
+            fwd->locals[i].ifindex = fwd->pair.locals[i].ifindex;
+        }
+        for (int i = 0; i < fwd->pair.wan_count; i++) {
+            if (!ne_pair_wan_live(&fwd->pair, i))
+                continue;
+            if (profile_iface_xdp_bind_wan(&fwd->pair, fwd->cfg, i,
+                                          fwd->cfg->fake_ethertype_ipv4) != 0) {
+                fprintf(stderr, "[PROFILE-LIFE] rebind WAN %s failed\n",
+                        fwd->pair.wans[i].ifname);
+                return -1;
+            }
+            fwd->pair.xdp_wan_on[i] = 1;
+            strncpy(fwd->wans[i].ifname, fwd->pair.wans[i].ifname,
+                    sizeof(fwd->wans[i].ifname) - 1);
+            fwd->wans[i].ifindex = fwd->pair.wans[i].ifindex;
+        }
+        fwd->local_count = fwd->pair.local_count;
+        fwd->wan_count = fwd->pair.wan_count;
+    }
     return 0;
 }
 
