@@ -20,6 +20,7 @@
 #include "main_diag.h"
 #include "profile_iface_xdp.h"
 #include "pqc_handshake.h"
+#include "pqc_ipc.h"
 #include "traffic_crypto.h"
 #define NOTIFY_CHANNEL "xdp_start"
 #define MAX_ACTIVE_PROFILE_IDS 32

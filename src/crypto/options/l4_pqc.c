@@ -7,6 +7,7 @@
 #include "../../../inc/crypto/crypto_pqc_layer.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
@@ -37,7 +38,7 @@ struct opt_table {
     struct opt_entry entries[OPT_FRAG_TABLE_SIZE];
 };
 
-static struct opt_table g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS];
+static struct opt_table *g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS];
 
 static uint64_t opt_time_ns(void)
 {
@@ -175,11 +176,20 @@ static void opt_frag_gc_table(struct opt_table *ft, uint64_t now_ns)
 
 static struct opt_table *opt_table(int profile_slot, int worker_idx)
 {
+    struct opt_table *t;
+
     if (profile_slot < 0 || profile_slot >= MAX_PROFILES)
         profile_slot = 0;
     if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
         worker_idx = 0;
-    return &g_tables[profile_slot][worker_idx];
+    t = g_tables[profile_slot][worker_idx];
+    if (!t) {
+        t = calloc(1, sizeof(*t));
+        if (!t)
+            return NULL;
+        g_tables[profile_slot][worker_idx] = t;
+    }
+    return t;
 }
 
 static int opt_policy_match(const struct app_config *cfg, int action, int mode,
@@ -721,7 +731,10 @@ int crypto_opt_l4_pqc_reasm(int profile_slot, int worker_idx, struct packet_cryp
     if (nd < 0)
         return -1;
     *pkt_len = (uint32_t)nd;
-    rr = l4_reassemble(opt_table(profile_slot, worker_idx), pkt_data, *pkt_len,
+    struct opt_table *ft = opt_table(profile_slot, worker_idx);
+    if (!ft)
+        return -1;
+    rr = l4_reassemble(ft, pkt_data, *pkt_len,
                      opid, ofidx, out_buf, out_len);
     if (rr == 1)
         *pkt_len = *out_len;
@@ -730,5 +743,7 @@ int crypto_opt_l4_pqc_reasm(int profile_slot, int worker_idx, struct packet_cryp
 
 void crypto_opt_l4_pqc_frag_gc(int profile_slot, int worker_idx, uint64_t now_ns)
 {
-    opt_frag_gc_table(opt_table(profile_slot, worker_idx), now_ns);
+    struct opt_table *ft = opt_table(profile_slot, worker_idx);
+    if (ft)
+        opt_frag_gc_table(ft, now_ns);
 }
