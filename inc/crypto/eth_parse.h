@@ -5,6 +5,14 @@
 #include <stdint.h>
 
 #define ETH_L2_HDR_MAX  18
+#define ETH_HEADER_SIZE 14
+#define NE_L2_FAKE_ETHERTYPE  0x88B5u
+
+#define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
+#define CRYPTO_L2_POLICY_LEN     1
+#define CRYPTO_L2_CORE_ID_OFF    (CRYPTO_L2_POLICY_OFF + CRYPTO_L2_POLICY_LEN)
+#define CRYPTO_L2_CORE_ID_LEN    1
+#define CRYPTO_L2_NONCE_OFF      (CRYPTO_L2_CORE_ID_OFF + CRYPTO_L2_CORE_ID_LEN)
 
 /** Vị trí byte bắt đầu của IPv4 (0x45): Trả về vị trí (ví dụ: 14, 18), -1 = Lỗi */
 int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len);
@@ -16,5 +24,14 @@ int crypto_eth_l2_prefix_len(const uint8_t *pkt, size_t pkt_len);
 int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len);
 /** Ghi đè mã EtherType chuẩn của IPv4 (0x0800) vào vị trí chỉ định sau khi giải mã xong*/
 void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off);
+
+int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len);
+int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len);
+int crypto_eth_l2_read_policy_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *policy_id_out);
+int crypto_eth_l2_core_id_off(const uint8_t *packet, size_t pkt_len);
+int crypto_eth_l2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
+int crypto_eth_l2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out);
+
+void crypto_ipv4_checksum_replace_word(uint8_t *ip_hdr, uint16_t old_word, uint16_t new_word);
 
 #endif

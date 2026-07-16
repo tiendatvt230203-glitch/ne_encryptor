@@ -3,11 +3,7 @@
     #include "../../inc/core/forwarder_wan.h"
     #include "../../inc/core/forwarder_crypto_runtime.h"
 
-#include "../../inc/crypto/crypto_layer2.h"
-#include "../../inc/crypto/crypto_layer3.h"
-#include "../../inc/crypto/crypto_layer4.h"
-#include "../../inc/crypto/crypto_policy_utils.h"
-#include "../../inc/core/fragment.h"
+#include "../../inc/crypto/crypto_option.h"
 #include "../../inc/core/crypto_route.h"
     #include "../../inc/core/mac_learn.h"
     #include "../../inc/core/dataplane_stats.h"
@@ -83,45 +79,21 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         uint8_t *tail_buf = NULL;
         uint32_t len = job->len;
         uint32_t l1 = 0, l2 = 0;
+        crypto_option_id opt_id = crypto_option_from_policy(cp);
 
-        if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(len)) {
+        if (crypto_option_need_split(opt_id, len)) {
         if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
                 return -1;
             tail_buf = ne_packet_data(&fwd->pair, tail.addr);
-            if (frag_split_and_encrypt_l2(pctx, pkt, len, fwd->pair.frame_size, &l1,
-                                        tail_buf, fwd->pair.frame_size, &l2) != 0) {
-                ne_frame_free(&fwd->pair, tail.addr);
-                return -1;
-            }
-        } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(len)) {
-        if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
-                return -1;
-            tail_buf = ne_packet_data(&fwd->pair, tail.addr);
-            if (frag_split_and_encrypt(pctx, pkt, len, fwd->pair.frame_size, &l1,
+            if (crypto_option_split(opt_id, pctx, pkt, len, fwd->pair.frame_size, &l1,
                                     tail_buf, fwd->pair.frame_size, &l2) != 0) {
                 ne_frame_free(&fwd->pair, tail.addr);
                 return -1;
             }
-        } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(len)) {
-        if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
-                return -1;
-            tail_buf = ne_packet_data(&fwd->pair, tail.addr);
-            if (frag_split_and_encrypt_l4(pctx, pkt, len, fwd->pair.frame_size, &l1,
-                                        tail_buf, fwd->pair.frame_size, &l2) != 0) {
-                ne_frame_free(&fwd->pair, tail.addr);
-                return -1;
-            }
         } else {
-            int n = -1;
-            if (cp->action == POLICY_ACTION_ENCRYPT_L2)
-                n = crypto_layer2_encrypt(pctx, pkt, len);
-            else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
-                n = crypto_layer3_encrypt(pctx, pkt, len);
-            else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
-                n = crypto_layer4_encrypt(pctx, pkt, len);
-            if (n < 0)
+            if (crypto_option_encrypt(opt_id, pctx, pkt, &len) != 0)
                 return -1;
-            job->len = (uint32_t)n;
+            job->len = len;
             return 0;
         }
         if (push_split_to_wan(fwd, job, l1, &tail, l2, wan_dp) != 0)
@@ -209,8 +181,8 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         if (!pctx)
             goto drop;
         pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
+        pctx->wire_id = (uint8_t)cp->id;
         pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
-        crypto_apply_from_policy(cp);
         enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                             src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
         if (enc < 0)

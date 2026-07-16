@@ -2,8 +2,8 @@
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/crypto_route.h"
 
-#include "../../inc/crypto/crypto_layer2.h"
-#include "../../inc/crypto/crypto_policy_utils.h"
+#include "../../inc/crypto/eth_parse.h"
+#include "../../inc/crypto/crypto_option.h"
 #include "../../inc/crypto/traffic_crypto.h"
 
 #include <sched.h>
@@ -32,9 +32,6 @@ static struct crypto_policy prev_active_policies[MAX_CRYPTO_POLICIES];
 static int prev_active_policy_count;
 static int prev_grace_active;
 static uint64_t prev_grace_until_ms;
-static struct frag_table profile_frag_l2[MAX_PROFILES][NE_CRYPTO_WORKERS];
-static struct frag_table profile_frag_l3[MAX_PROFILES][NE_CRYPTO_WORKERS];
-static struct frag_table profile_frag_l4[MAX_PROFILES][NE_CRYPTO_WORKERS];
 static struct flow_table profile_flow_tables[MAX_PROFILES];
 static int profile_flow_table_ready[MAX_PROFILES];
 static int profile_flow_profile_id[MAX_PROFILES];
@@ -78,11 +75,6 @@ int fwd_crypto_ensure_profile_slots(struct app_config *cfg)
                 windows[wi] = cfg->wans[wi].window_size;
             flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
             profile_flow_table_ready[slot] = 1;
-            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
-                frag_table_init(&profile_frag_l2[slot][w]);
-                frag_table_init(&profile_frag_l3[slot][w]);
-                frag_table_init(&profile_frag_l4[slot][w]);
-            }
         }
     }
     return 0;
@@ -136,9 +128,6 @@ void fwd_crypto_cleanup_stale_profile_slots(const struct app_config *cfg)
         flow_table_cleanup(&profile_flow_tables[s]);
         profile_flow_table_ready[s] = 0;
         profile_flow_profile_id[s] = 0;
-        memset(&profile_frag_l2[s], 0, sizeof(profile_frag_l2[s]));
-        memset(&profile_frag_l3[s], 0, sizeof(profile_frag_l3[s]));
-        memset(&profile_frag_l4[s], 0, sizeof(profile_frag_l4[s]));
     }
 }
 
@@ -227,10 +216,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     if (cfg->fake_protocol == 0)
         cfg->fake_protocol = 99;
 
-    packet_crypto_set_fake_ethertype(cfg->fake_ethertype_ipv4);
-    packet_crypto_set_fake_protocol(cfg->fake_protocol);
-    crypto_apply_default_from_cfg(cfg);
-    if (packet_crypto_init(&base_crypto_ctx, cfg->crypto_key) != 0)
+    if (packet_crypto_init(&base_crypto_ctx, cfg->crypto_key, cfg->aes_bits) != 0)
         return -1;
 
     active_policy_count = cfg->policy_count;
@@ -269,14 +255,18 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_crypto_ctx[i].initialized = true;
             policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
             policy_crypto_ctx[i].policy_id = cp->db_id;
+            policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
             policy_crypto_ready[i] = 1;
             continue;
         }
         if (!key_nonzero(cp->key, AES_KEY_LEN))
             continue;
-        crypto_apply_from_policy(cp);
-        if (packet_crypto_init(&policy_crypto_ctx[i], cp->key) == 0)
+        if (packet_crypto_init(&policy_crypto_ctx[i], cp->key, cp->aes_bits) == 0) {
+            policy_crypto_ctx[i].policy_id = cp->id;
+            policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
+            policy_crypto_ctx[i].crypto_mode = cp->crypto_mode;
             policy_crypto_ready[i] = 1;
+        }
     }
 
     for (int pidx = 0; pidx < cfg->profile_count && pidx < MAX_PROFILES; pidx++) {
@@ -304,44 +294,19 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         }
     }
 
-    crypto_apply_default_from_cfg(cfg);
     return 0;
-}
-
-struct crypto_dispatch_ctx fwd_crypto_make_dispatch_ctx(void)
-{
-    struct crypto_dispatch_ctx dctx;
-    memset(&dctx, 0, sizeof(dctx));
-    fwd_crypto_maybe_expire_prev_grace();
-    dctx.base_ctx = &base_crypto_ctx;
-    dctx.per_policy_ctx = policy_crypto_ctx;
-    dctx.per_policy_ready = policy_crypto_ready;
-    dctx.policies = active_policies;
-    dctx.policy_count = active_policy_count;
-    dctx.policy_index_by_wire_id = policy_index_by_wire_id;
-    dctx.prev_per_policy_ctx = prev_policy_crypto_ctx;
-    dctx.prev_per_policy_ready = prev_policy_crypto_ready;
-    dctx.prev_policies = prev_active_policies;
-    dctx.prev_policy_count = prev_active_policy_count;
-    dctx.prev_policy_index_by_wire_id = prev_policy_index_by_wire_id;
-    dctx.prev_grace_active = prev_grace_active;
-    return dctx;
 }
 
 struct packet_crypto_ctx *fwd_crypto_ctx_for_wire_id(uint8_t wire_id)
 {
     fwd_crypto_maybe_expire_prev_grace();
     int pi = policy_index_by_wire_id[wire_id];
-    if (pi >= 0 && pi < active_policy_count && policy_crypto_ready[pi]) {
-        crypto_apply_from_policy(&active_policies[pi]);
+    if (pi >= 0 && pi < active_policy_count && policy_crypto_ready[pi])
         return &policy_crypto_ctx[pi];
-    }
     if (prev_grace_active) {
         int ppi = prev_policy_index_by_wire_id[wire_id];
-        if (ppi >= 0 && ppi < prev_active_policy_count && prev_policy_crypto_ready[ppi]) {
-            crypto_apply_from_policy(&prev_active_policies[ppi]);
+        if (ppi >= 0 && ppi < prev_active_policy_count && prev_policy_crypto_ready[ppi])
             return &prev_policy_crypto_ctx[ppi];
-        }
     }
     return NULL;
 }
@@ -395,9 +360,7 @@ void fwd_crypto_frag_gc_worker_tick(int worker_idx)
         if (worker_idx == 0)
             flow_table_gc_slice(&profile_flow_tables[s], &profile_flow_gc_cursor[s],
                                 FLOW_GC_BUCKETS_PER_TICK);
-        frag_table_gc_at(&profile_frag_l2[s][worker_idx], now_ns);
-        frag_table_gc_at(&profile_frag_l3[s][worker_idx], now_ns);
-        frag_table_gc_at(&profile_frag_l4[s][worker_idx], now_ns);
+        crypto_option_frag_gc(s, worker_idx, now_ns);
     }
 }
 
@@ -417,38 +380,11 @@ int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)
 {
     uint8_t wire_pol = 0;
 
-    if (!pkt || !crypto_layer2_has_fake_ethertype(pkt, pkt_len))
+    if (!pkt || !crypto_eth_l2_has_marker(pkt, pkt_len))
         return 0;
-    if (crypto_layer2_read_policy_id(pkt, pkt_len, &wire_pol) != 0)
+    if (crypto_eth_l2_read_policy_id(pkt, pkt_len, &wire_pol) != 0)
         return 0;
     return policy_index_by_wire_id[wire_pol] >= 0;
-}
-
-struct frag_table *fwd_crypto_frag_l2(int slot, int worker_idx)
-{
-    if (slot < 0 || slot >= MAX_PROFILES)
-        return NULL;
-    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return NULL;
-    return &profile_frag_l2[slot][worker_idx];
-}
-
-struct frag_table *fwd_crypto_frag_l3(int slot, int worker_idx)
-{
-    if (slot < 0 || slot >= MAX_PROFILES)
-        return NULL;
-    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return NULL;
-    return &profile_frag_l3[slot][worker_idx];
-}
-
-struct frag_table *fwd_crypto_frag_l4(int slot, int worker_idx)
-{
-    if (slot < 0 || slot >= MAX_PROFILES)
-        return NULL;
-    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
-        return NULL;
-    return &profile_frag_l4[slot][worker_idx];
 }
 
 void fwd_crypto_reset_on_init(void)
@@ -472,8 +408,5 @@ void fwd_crypto_cleanup_all_profile_slots(void)
         flow_table_cleanup(&profile_flow_tables[i]);
         profile_flow_table_ready[i] = 0;
         profile_flow_profile_id[i] = 0;
-        memset(&profile_frag_l2[i], 0, sizeof(profile_frag_l2[i]));
-        memset(&profile_frag_l3[i], 0, sizeof(profile_frag_l3[i]));
-        memset(&profile_frag_l4[i], 0, sizeof(profile_frag_l4[i]));
     }
 }

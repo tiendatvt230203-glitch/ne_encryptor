@@ -2,6 +2,7 @@
 #include "../../inc/core/forwarder_wan.h"
 #include "../../inc/core/forwarder_reload.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
+#include "../../inc/crypto/crypto_option.h"
 #include "../../inc/core/dataplane.h"
 #include "../../inc/core/crypto_route.h"
 
@@ -122,7 +123,7 @@ static void init_iface_meta(struct fwd_iface *iface, const char *ifname)
 static uint32_t resolve_runtime_frag_mtu(const struct app_config *cfg)
 {
     int sockfd;
-    uint32_t min_mtu = FRAG_MTU;
+    uint32_t min_mtu = CRYPTO_OPT_FRAG_MTU_DEFAULT;
 
     if (!cfg)
         return min_mtu;
@@ -307,7 +308,7 @@ static void *crypto_worker_thread(void *arg)
 
     pin_cpu(ctx->cpu_id);
     dp_crypto_worker_bind(ctx->worker_idx);
-    crypto_layer2_bind_worker_idx((uint8_t)ctx->worker_idx);
+    crypto_option_bind_worker_idx((uint8_t)ctx->worker_idx);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
@@ -387,8 +388,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     if (fwd->wan_count > MAX_INTERFACES)
         fwd->wan_count = MAX_INTERFACES;
 
-    frag_set_mtu(resolve_runtime_frag_mtu(cfg));
-    fprintf(stderr, "[FRAG] runtime MTU set to %u\n", frag_get_mtu());
+    crypto_option_set_mtu(resolve_runtime_frag_mtu(cfg));
+    fprintf(stderr, "[FRAG] runtime MTU set to %u\n", crypto_option_get_mtu());
     ne_dp_stats_init();
 
     for (int i = 0; i < fwd->local_count; i++)

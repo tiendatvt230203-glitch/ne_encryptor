@@ -2,8 +2,8 @@
 #include "../../inc/core/interface.h"
 #include "../../inc/core/dataplane_util.h"
 #include "../../inc/core/forwarder_crypto_runtime.h"
-#include "../../inc/core/fragment.h"
-#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/eth_parse.h"
+#include "../../inc/crypto/crypto_option.h"
 
 #include <arpa/inet.h>
 #include <stddef.h>
@@ -93,11 +93,11 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
         return 0;
 
     if (!fwd_crypto_has_l2_marker(pkt, len)) {
-        if (!frag_is_fragment_l2(fwd->cfg, pkt, len, &pid, &fidx))
+        if (!crypto_option_is_any_fragment(fwd->cfg, pkt, len, &pid, &fidx))
             return 0;
     }
 
-    if (crypto_layer2_read_worker_idx(pkt, len, &wire_id) != 0)
+    if (crypto_eth_l2_read_worker_idx(pkt, len, &wire_id) != 0)
         return -1;
 
     if (wire_id < NE_CRYPTO_WORKERS)

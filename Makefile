@@ -26,29 +26,32 @@ APP_SRC = main.c \
           src/core/dataplane_local.c \
           src/core/dataplane_wan.c \
           src/core/mac_learn.c \
-          src/crypto/crypto_policy_utils.c \
           src/crypto/eth_parse.c \
-          src/crypto/crypto_dispatch.c \
           src/crypto/packet_crypto.c \
+          src/crypto/aes_crypto.c \
           src/crypto/traffic_crypto.c \
-          src/crypto/crypto_layer2.c \
-          src/crypto/crypto_layer2_ctr.c \
-          src/crypto/crypto_layer2_gcm.c \
-          src/crypto/crypto_layer2_pqc.c \
-          src/crypto/crypto_layer3.c \
-          src/crypto/crypto_layer3_ctr.c \
-          src/crypto/crypto_layer3_gcm.c \
-          src/crypto/crypto_layer3_pqc.c \
-          src/crypto/crypto_layer4.c \
-          src/crypto/crypto_layer4_ctr.c \
-          src/crypto/crypto_layer4_gcm.c \
-          src/crypto/crypto_layer4_pqc.c \
+          src/crypto/crypto_option_router.c \
+          src/crypto/options/l2_ctr_128.c \
+          src/crypto/options/l2_ctr_256.c \
+          src/crypto/options/l2_gcm_128.c \
+          src/crypto/options/l2_gcm_256.c \
+          src/crypto/options/l2_pqc.c \
+          src/crypto/options/l3_ctr_128.c \
+          src/crypto/options/l3_ctr_256.c \
+          src/crypto/options/l3_gcm_128.c \
+          src/crypto/options/l3_gcm_256.c \
+          src/crypto/options/l3_pqc.c \
+          src/crypto/options/l4_ctr_128.c \
+          src/crypto/options/l4_ctr_256.c \
+          src/crypto/options/l4_gcm_128.c \
+          src/crypto/options/l4_gcm_256.c \
+          src/crypto/options/l4_pqc.c \
+          src/crypto/options/bypass.c \
           src/crypto/pqc_handshake.c \
           src/crypto/pqc_l2_handshake.c \
           src/crypto/pqc_logger.c \
           src/crypto/pqc_ipc.c \
           src/core/flow_table.c \
-          src/core/fragment.c \
           src/core/dataplane_stats.c
 APP_OBJ = $(APP_SRC:.c=.o)
 
@@ -61,15 +64,12 @@ DB_OBJ = $(DB_SRC:.c=.o)
 BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
-.PHONY: all clean dirs tools/test_xsk_rebind
+.PHONY: all clean dirs
 
 all: dirs $(BPF_OBJ) $(TARGET)
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
-
-tools/test_xsk_rebind: tools/test_xsk_rebind.c
-	$(CC) $(CFLAGS) -o $@ $< -L./lib -Wl,-rpath,'$$ORIGIN/../lib' -lxdp -lbpf -lelf -lz
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -78,4 +78,4 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ) tools/test_xsk_rebind
+	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/crypto/options/*.o src/db/*.o *.o $(BPF_OBJ)
