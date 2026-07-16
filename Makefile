@@ -21,6 +21,7 @@ APP_SRC = main.c \
           src/core/forwarder_reload.c \
           src/core/forwarder_crypto_runtime.c \
           src/core/profile_iface_xdp.c \
+          src/core/profile_iface_lifecycle.c \
           src/core/dataplane_util.c \
           src/core/dataplane_local.c \
           src/core/dataplane_wan.c \

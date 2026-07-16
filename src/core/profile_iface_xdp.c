@@ -1,4 +1,5 @@
 #include "../../inc/core/profile_iface_xdp.h"
+#include "../../inc/core/profile_iface_lifecycle.h"
 
 #include "../../inc/core/forwarder_crypto_runtime.h"
 #include "../../inc/core/forwarder_reload.h"
@@ -220,18 +221,6 @@ static const struct profile_config *profile_by_id(const struct app_config *cfg, 
     return NULL;
 }
 
-static int pair_local_slot_live(const struct forwarder *fwd, const char *ifname)
-{
-    if (!fwd || !ifname)
-        return -1;
-    for (int li = 0; li < fwd->pair.local_count; li++) {
-        if (!ne_pair_local_live(&fwd->pair, li))
-            continue;
-        if (strcmp(fwd->pair.locals[li].ifname, ifname) == 0)
-            return li;
-    }
-    return -1;
-}
 
 static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname)
 {
@@ -243,39 +232,6 @@ static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname
         if (strcmp(fwd->pair.wans[di].ifname, ifname) == 0)
             return di;
     }
-    return -1;
-}
-
-/* Prefer free slots after delete/edit so ADD reuses holes instead of growing. */
-static int fwd_alloc_local_slot(struct forwarder *fwd)
-{
-    int n;
-
-    if (!fwd)
-        return -1;
-    n = fwd->pair.local_count;
-    for (int i = 0; i < n; i++) {
-        if (!ne_pair_local_live(&fwd->pair, i))
-            return i;
-    }
-    if (n < MAX_INTERFACES)
-        return n;
-    return -1;
-}
-
-static int fwd_alloc_wan_slot(struct forwarder *fwd)
-{
-    int n;
-
-    if (!fwd)
-        return -1;
-    n = fwd->pair.wan_count;
-    for (int i = 0; i < n; i++) {
-        if (!ne_pair_wan_live(&fwd->pair, i))
-            return i;
-    }
-    if (n < MAX_INTERFACES)
-        return n;
     return -1;
 }
 
@@ -558,353 +514,6 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
 
 /* --- forwarder slot helpers --- */
 
-static void init_fwd_local_meta(struct forwarder *fwd, int li,
-                                const struct app_config *cfg, int cfg_local_idx)
-{
-    memset(&fwd->locals[li], 0, sizeof(fwd->locals[li]));
-    fwd->locals[li].ifindex = (int)if_nametoindex(cfg->locals[cfg_local_idx].ifname);
-    strncpy(fwd->locals[li].ifname, cfg->locals[cfg_local_idx].ifname,
-            sizeof(fwd->locals[li].ifname) - 1);
-}
-
-static void init_fwd_wan_meta(struct forwarder *fwd, int di,
-                              const struct app_config *cfg, int cfg_wan_idx)
-{
-    memset(&fwd->wans[di], 0, sizeof(fwd->wans[di]));
-    fwd->wans[di].ifindex = (int)if_nametoindex(cfg->wans[cfg_wan_idx].ifname);
-    strncpy(fwd->wans[di].ifname, cfg->wans[cfg_wan_idx].ifname, sizeof(fwd->wans[di].ifname) - 1);
-}
-
-struct profile_attach_sess {
-    int validate_failed;
-    int lan_added[MAX_INTERFACES];
-    int lan_n;
-    int wan_added[MAX_INTERFACES];
-    int wan_n;
-};
-
-static void fwd_reconcile_iface_counts(struct forwarder *fwd);
-
-static int detach_profile_lan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
-                                   const struct app_config *old_cfg, int trigger_profile_id)
-{
-    const struct profile_config *old_prof = profile_by_id(old_cfg, trigger_profile_id);
-
-    if (!old_prof)
-        return 0;
-
-    for (int pi = 0; pi < old_prof->local_count; pi++) {
-        int oci = old_prof->local_indices[pi];
-        const char *ifname;
-        int li;
-
-        if (oci < 0 || oci >= old_cfg->local_count)
-            continue;
-        ifname = old_cfg->locals[oci].ifname;
-        if (config_local_ifname_in_cfg(new_cfg, ifname))
-            continue;
-        li = pair_local_slot_live(fwd, ifname);
-        if (li < 0)
-            continue;
-        fprintf(stderr,
-                "[PROFILE-XDP] profile %d REMOVE LAN %s — detach xdp/id\n",
-                trigger_profile_id, ifname);
-        /* #region agent log */
-        {
-            char js[192];
-            snprintf(js, sizeof(js),
-                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"still_in_new\":0}",
-                     trigger_profile_id, ifname, li);
-            agent_dbg("A", "profile_iface_xdp.c:detach_lan", "detach_lan_unplumb", js);
-        }
-        /* #endregion */
-        ne_pair_unplumb_local(&fwd->pair, li);
-    }
-    return 0;
-}
-
-static int detach_profile_wan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
-                                   const struct app_config *old_cfg, int trigger_profile_id)
-{
-    const struct profile_config *old_prof = profile_by_id(old_cfg, trigger_profile_id);
-
-    if (!old_prof)
-        return 0;
-
-    for (int pi = 0; pi < old_prof->wan_count; pi++) {
-        int oci = old_prof->wan_indices[pi];
-        const char *ifname;
-        int di;
-
-        if (oci < 0 || oci >= old_cfg->wan_count)
-            continue;
-        if (!old_cfg->wans[oci].dataplane)
-            continue;
-        ifname = old_cfg->wans[oci].ifname;
-        if (fwd_wan_ifname_dataplane_in_cfg(new_cfg, ifname))
-            continue;
-        di = pair_wan_dp_slot_live(fwd, ifname);
-        if (di < 0)
-            continue;
-        (void)fwd_wan_flush_queue(fwd, di);
-        fprintf(stderr,
-                "[PROFILE-XDP] profile %d REMOVE WAN %s — detach xdp/id\n",
-                trigger_profile_id, ifname);
-        /* #region agent log */
-        {
-            char js[192];
-            snprintf(js, sizeof(js),
-                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d}",
-                     trigger_profile_id, ifname, di);
-            agent_dbg("A", "profile_iface_xdp.c:detach_wan", "detach_wan_unplumb", js);
-        }
-        /* #endregion */
-        ne_pair_unplumb_wan_dp(&fwd->pair, di);
-        fwd->wan_cfg_idx[di] = -1;
-        fwd_wan_mark_stopped(di);
-    }
-    return 0;
-}
-
-static void profile_attach_sess_rollback(struct forwarder *fwd, struct profile_attach_sess *sess)
-{
-    if (!fwd || !sess)
-        return;
-    for (int i = sess->lan_n - 1; i >= 0; i--)
-        ne_pair_unplumb_local(&fwd->pair, sess->lan_added[i]);
-    for (int i = sess->wan_n - 1; i >= 0; i--) {
-        ne_pair_unplumb_wan_dp(&fwd->pair, sess->wan_added[i]);
-        fwd->wan_cfg_idx[sess->wan_added[i]] = -1;
-        fwd_wan_mark_stopped(sess->wan_added[i]);
-    }
-    sess->lan_n = 0;
-    sess->wan_n = 0;
-    fwd_reconcile_iface_counts(fwd);
-}
-
-/* ADD: LAN rows from trigger profile only (one profile per interface). */
-static void attach_profile_lan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
-                                    int trigger_profile_id, struct profile_attach_sess *sess)
-{
-    const struct profile_config *prof = profile_by_id(new_cfg, trigger_profile_id);
-
-    if (!prof || !sess)
-        return;
-
-    for (int pi = 0; pi < prof->local_count; pi++) {
-        int ci = prof->local_indices[pi];
-        const char *ifname;
-        int li;
-        int owner;
-
-        if (sess->validate_failed)
-            break;
-        if (ci < 0 || ci >= new_cfg->local_count)
-            continue;
-        ifname = new_cfg->locals[ci].ifname;
-        if (if_nametoindex(ifname) == 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip LAN %s (interface not found)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        owner = config_local_owner_profile(new_cfg, ci, trigger_profile_id);
-        if (owner > 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip LAN %s (already used by profile %d)\n",
-                    trigger_profile_id, ifname, owner);
-            sess->validate_failed = 1;
-            continue;
-        }
-        if (pair_local_slot_live(fwd, ifname) >= 0) {
-            /* #region agent log */
-            {
-                char js[192];
-                int live = pair_local_slot_live(fwd, ifname);
-                snprintf(js, sizeof(js),
-                         "{\"profile\":%d,\"ifname\":\"%s\",\"live_slot\":%d,"
-                         "\"xdp_on\":%u}",
-                         trigger_profile_id, ifname, live,
-                         live >= 0 ? (unsigned)fwd->pair.xdp_local_on[live] : 0u);
-                agent_dbg("B", "profile_iface_xdp.c:attach_lan", "skip_already_live", js);
-            }
-            /* #endregion */
-            continue;
-        }
-
-        li = fwd_alloc_local_slot(fwd);
-        if (li < 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip LAN %s (MAX_INTERFACES)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        fprintf(stderr, "[PROFILE-XDP] profile %d ADD LAN %s (slot %d)\n",
-                trigger_profile_id, ifname, li);
-        fflush(stderr);
-        if (ne_pair_plumb_local(&fwd->pair, new_cfg, ci, li) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip LAN %s (plumb/XSK failed)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        if (profile_iface_xdp_bind_local(&fwd->pair, new_cfg, li) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip LAN %s (xdp attach/xsk map failed)\n",
-                    trigger_profile_id, ifname);
-            /* #region agent log */
-            {
-                char js[160];
-                snprintf(js, sizeof(js), "{\"profile\":%d,\"ifname\":\"%s\"}",
-                         trigger_profile_id, ifname);
-                agent_dbg("E", "profile_iface_xdp.c:attach_lan", "bind_local_failed", js);
-            }
-            /* #endregion */
-            ne_pair_unplumb_local(&fwd->pair, li);
-            sess->validate_failed = 1;
-            continue;
-        }
-        /* #region agent log */
-        {
-            char js[160];
-            snprintf(js, sizeof(js),
-                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"xdp_on\":1}",
-                     trigger_profile_id, ifname, li);
-            agent_dbg("E", "profile_iface_xdp.c:attach_lan", "bind_local_ok", js);
-        }
-        /* #endregion */
-        init_fwd_local_meta(fwd, li, new_cfg, ci);
-        fwd->local_count = fwd->pair.local_count;
-        sess->lan_added[sess->lan_n++] = li;
-    }
-}
-
-/* ADD: dataplane WAN rows from trigger profile only. */
-static void attach_profile_wan_rows(struct forwarder *fwd, const struct app_config *new_cfg,
-                                    int trigger_profile_id, struct profile_attach_sess *sess)
-{
-    const struct profile_config *prof = profile_by_id(new_cfg, trigger_profile_id);
-
-    if (!prof || !sess)
-        return;
-
-    for (int pi = 0; pi < prof->wan_count; pi++) {
-        int ci = prof->wan_indices[pi];
-        const char *ifname;
-        int di;
-        int owner;
-
-        if (sess->validate_failed)
-            break;
-        if (ci < 0 || ci >= new_cfg->wan_count)
-            continue;
-        if (!config_wan_live(new_cfg, ci)) {
-            continue;
-        }
-        ifname = new_cfg->wans[ci].ifname;
-        if (if_nametoindex(ifname) == 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (interface not found)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        owner = config_wan_owner_profile(new_cfg, ci, trigger_profile_id);
-        if (owner > 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (already used by profile %d)\n",
-                    trigger_profile_id, ifname, owner);
-            sess->validate_failed = 1;
-            continue;
-        }
-        if (pair_wan_dp_slot_live(fwd, ifname) >= 0) {
-            /* #region agent log */
-            {
-                char js[192];
-                int live = pair_wan_dp_slot_live(fwd, ifname);
-                snprintf(js, sizeof(js),
-                         "{\"profile\":%d,\"ifname\":\"%s\",\"live_slot\":%d,"
-                         "\"xdp_on\":%u}",
-                         trigger_profile_id, ifname, live,
-                         live >= 0 ? (unsigned)fwd->pair.xdp_wan_on[live] : 0u);
-                agent_dbg("B", "profile_iface_xdp.c:attach_wan", "skip_already_live", js);
-            }
-            /* #endregion */
-            continue;
-        }
-
-        di = fwd_alloc_wan_slot(fwd);
-        if (di < 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (MAX_INTERFACES)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        fprintf(stderr, "[PROFILE-XDP] profile %d ADD WAN %s (dp slot %d)\n",
-                trigger_profile_id, ifname, di);
-        fflush(stderr);
-        if (ne_pair_plumb_wan_dp(&fwd->pair, new_cfg, ci, di) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (plumb/XSK failed)\n",
-                    trigger_profile_id, ifname);
-            sess->validate_failed = 1;
-            continue;
-        }
-        if (profile_iface_xdp_bind_wan(&fwd->pair, new_cfg, di, new_cfg->fake_ethertype_ipv4) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (xdp attach/xsk map failed)\n",
-                    trigger_profile_id, ifname);
-            /* #region agent log */
-            {
-                char js[160];
-                snprintf(js, sizeof(js), "{\"profile\":%d,\"ifname\":\"%s\"}",
-                         trigger_profile_id, ifname);
-                agent_dbg("E", "profile_iface_xdp.c:attach_wan", "bind_wan_failed", js);
-            }
-            /* #endregion */
-            ne_pair_unplumb_wan_dp(&fwd->pair, di);
-            sess->validate_failed = 1;
-            continue;
-        }
-        /* #region agent log */
-        {
-            char js[160];
-            snprintf(js, sizeof(js),
-                     "{\"profile\":%d,\"ifname\":\"%s\",\"slot\":%d,\"xdp_on\":1}",
-                     trigger_profile_id, ifname, di);
-            agent_dbg("E", "profile_iface_xdp.c:attach_wan", "bind_wan_ok", js);
-        }
-        /* #endregion */
-        fwd->pair.xdp_wan_on[di] = 1;
-        init_fwd_wan_meta(fwd, di, new_cfg, ci);
-        fwd->wan_cfg_idx[di] = ci;
-        fwd->wan_count = fwd->pair.wan_count;
-        sess->wan_added[sess->wan_n++] = di;
-    }
-}
-
-static int attach_profile_iface_rows(struct forwarder *fwd, const struct app_config *new_cfg,
-                                     int trigger_profile_id)
-{
-    struct profile_attach_sess sess;
-
-    memset(&sess, 0, sizeof(sess));
-    attach_profile_lan_rows(fwd, new_cfg, trigger_profile_id, &sess);
-    attach_profile_wan_rows(fwd, new_cfg, trigger_profile_id, &sess);
-    if (!sess.validate_failed)
-        return 0;
-
-    profile_attach_sess_rollback(fwd, &sess);
-    fprintf(stderr,
-            "[VALIDATE] profile %d: skip all policies (LAN/WAN validation failed)\n",
-            trigger_profile_id);
-    return -1;
-}
-
 static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
                                 const struct app_config *old)
 {
@@ -923,25 +532,6 @@ static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
     fwd_crypto_cleanup_stale_profile_slots(cfg);
     fwd_wan_reset_on_init(fwd);
     return forwarder_should_stop() ? -1 : rc;
-}
-
-static void fwd_reconcile_iface_counts(struct forwarder *fwd)
-{
-    int max_li = 0;
-    int max_di = 0;
-
-    if (!fwd)
-        return;
-    for (int i = 0; i < MAX_INTERFACES; i++) {
-        if (ne_pair_local_live(&fwd->pair, i) && i + 1 > max_li)
-            max_li = i + 1;
-        if (ne_pair_wan_live(&fwd->pair, i) && i + 1 > max_di)
-            max_di = i + 1;
-    }
-    fwd->local_count = max_li;
-    fwd->pair.local_count = max_li;
-    fwd->wan_count = max_di;
-    fwd->pair.wan_count = max_di;
 }
 
 int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
@@ -971,16 +561,16 @@ int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_conf
             continue;
 
         memset(&sess, 0, sizeof(sess));
-        attach_profile_wan_rows(fwd, new_cfg, prof->id, &sess);
+        profile_iface_life_attach_wan_rows(fwd, new_cfg, prof->id, &sess);
         if (sess.validate_failed) {
-            profile_attach_sess_rollback(fwd, &sess);
+            profile_iface_life_attach_rollback(fwd, &sess);
             fprintf(stderr,
                     "[PROFILE-XDP] profile %d: WAN live attach failed\n",
                     prof->id);
             return -1;
         }
         if (sess.wan_n > 0)
-            fwd_reconcile_iface_counts(fwd);
+            profile_iface_life_reconcile_counts(fwd);
     }
     return 0;
 }
@@ -1014,28 +604,26 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
     case PROFILE_IFACE_XDP_REMOVE:
         if (!profile_iface_xdp_can_remove(old, cfg))
             return -1;
-        detach_profile_lan_rows(fwd, cfg, old, trigger_profile_id);
-        detach_profile_wan_rows(fwd, cfg, old, trigger_profile_id);
+        (void)profile_iface_life_detach_profile_rows(fwd, cfg, old, trigger_profile_id);
         break;
     case PROFILE_IFACE_XDP_ADD:
         if (!profile_iface_xdp_can_add(old, cfg))
             return -1;
-        if (attach_profile_iface_rows(fwd, cfg, trigger_profile_id) != 0)
+        if (profile_iface_life_attach_profile_rows(fwd, cfg, trigger_profile_id) != 0)
             return -1;
         break;
     case PROFILE_IFACE_XDP_DELTA:
         if (!profile_iface_xdp_can_delta(old, cfg))
             return -1;
-        detach_profile_lan_rows(fwd, cfg, old, trigger_profile_id);
-        detach_profile_wan_rows(fwd, cfg, old, trigger_profile_id);
-        if (attach_profile_iface_rows(fwd, cfg, trigger_profile_id) != 0)
+        (void)profile_iface_life_detach_profile_rows(fwd, cfg, old, trigger_profile_id);
+        if (profile_iface_life_attach_profile_rows(fwd, cfg, trigger_profile_id) != 0)
             return -1;
         break;
     default:
         return -1;
     }
 
-    fwd_reconcile_iface_counts(fwd);
+    profile_iface_life_reconcile_counts(fwd);
     fwd->cfg = cfg;
     return crypto_finish_reload(fwd, cfg, old);
 }

@@ -470,16 +470,6 @@ void *ne_packet_data(struct ne_pair *p, uint64_t addr)
     return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int interface_is_bridge_slave(const char *ifname)
-{
-    char path[256];
-
-    if (!ifname_is_safe(ifname))
-        return 0;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname);
-    return access(path, F_OK) == 0;
-}
-
 static int interface_is_up(const char *ifname)
 {
     int fd;
@@ -507,11 +497,6 @@ static int interface_preflight(const char *ifname)
         return -1;
     if (if_nametoindex(ifname) == 0) {
         fprintf(stderr, "[DP] %s: interface not found\n", ifname);
-        fflush(stderr);
-        return -1;
-    }
-    if (interface_is_bridge_slave(ifname)) {
-        fprintf(stderr, "[DP] %s: still enslaved to bridge (master exists)\n", ifname);
         fflush(stderr);
         return -1;
     }
@@ -620,10 +605,12 @@ static void reclaim_iface_umem_frames(struct ne_pair *p, struct ne_iface *iface)
         return;
     for (int q = 0; q < iface->queue_count; q++) {
         struct ne_xsk_queue *slot = &iface->queues[q];
+        int umem_owner = is_umem_fq_owner_queue(p, iface, q);
 
         drain_cq_queue(slot, &p->pool);
         reclaim_rx_queue(slot, &p->pool);
-        reclaim_fq_queue(slot, &p->pool);
+        if (!umem_owner)
+            reclaim_fq_queue(slot, &p->pool);
     }
 }
 
