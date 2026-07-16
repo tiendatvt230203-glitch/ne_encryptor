@@ -9,6 +9,7 @@
 #include "../../inc/core/interface.h"
 #include "../../inc/core/profile_iface_xdp.h"
 #include "../../inc/core/mac_learn.h"
+#include "../../inc/core/dataplane_stats.h"
 #include "../../inc/crypto/pqc_l2_handshake.h"
 
 #include <net/if.h>
@@ -165,12 +166,20 @@ static void *local_rx_thread(void *arg)
             continue;
         }
 
+        {
+            uint64_t rx_bytes = 0;
+            for (int i = 0; i < rcvd; i++)
+                rx_bytes += batch[i].len;
+            ne_dp_stats_rx_lan(ctx->rx_slot, (uint32_t)rcvd, rx_bytes);
+        }
+
         for (int i = 0; i < rcvd; i++) {
             int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
                                                  batch[i].len);
             if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
                 ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->local_to_mid[wi]));
+                ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -215,6 +224,13 @@ static void *wan_rx_thread(void *arg)
             continue;
         }
 
+        {
+            uint64_t rx_bytes = 0;
+            for (int i = 0; i < rcvd; i++)
+                rx_bytes += batch[i].len;
+            ne_dp_stats_rx_wan(ctx->rx_slot, (uint32_t)rcvd, rx_bytes);
+        }
+
         for (int i = 0; i < rcvd; i++) {
             int wi;
             const uint8_t *pkt;
@@ -232,6 +248,7 @@ static void *wan_rx_thread(void *arg)
             if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
                 ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
                                    ne_ring_count(&fwd->wan_to_mid[wi]));
+                ne_dp_stats_rx_ring_drop_wan(ctx->rx_slot, 1);
                 ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
@@ -276,6 +293,7 @@ static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
     mac_learn_tick(fwd);
+    ne_dp_stats_tick(fwd);
 }
 
 static void *crypto_worker_thread(void *arg)
@@ -371,6 +389,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     frag_set_mtu(resolve_runtime_frag_mtu(cfg));
     fprintf(stderr, "[FRAG] runtime MTU set to %u\n", frag_get_mtu());
+    ne_dp_stats_init();
 
     for (int i = 0; i < fwd->local_count; i++)
         init_iface_meta(&fwd->locals[i], cfg->locals[i].ifname);

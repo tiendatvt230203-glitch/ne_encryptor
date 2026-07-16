@@ -1,5 +1,6 @@
 #include "../../inc/core/interface.h"
 #include "../../inc/core/profile_iface_xdp.h"
+#include "../../inc/core/dataplane_stats.h"
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <net/if.h>
@@ -45,12 +46,13 @@ static void agent_dbg_ndjson(const char *hypothesisId, const char *location,
 #define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
 #define NE_DP_WARN_CLEAR    8192u
 
+static __thread const char *tls_dp_tx_dir;
+static __thread int tls_dp_tx_slot = -1;
+
 #if NE_DP_WARN_LOG_ENABLE
 static int dp_warn_on[NE_DP_WARN_SLOTS];
 static uint32_t dp_warn_clear_streak[NE_DP_WARN_SLOTS];
 static pthread_mutex_t dp_warn_lock = PTHREAD_MUTEX_INITIALIZER;
-static __thread const char *tls_dp_tx_dir;
-static __thread int tls_dp_tx_slot = -1;
 #endif
 
 static void dp_warn_once(int id, int active, const char *fmt, ...)
@@ -89,13 +91,8 @@ static void dp_warn_once(int id, int active, const char *fmt, ...)
 
 void ne_dp_tx_ctx(const char *dir, int tx_slot)
 {
-#if NE_DP_WARN_LOG_ENABLE
     tls_dp_tx_dir = dir;
     tls_dp_tx_slot = tx_slot;
-#else
-    (void)dir;
-    (void)tx_slot;
-#endif
 }
 
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
@@ -1765,6 +1762,12 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     if (!free_slots) {
         if (tx_no_free)
             (*tx_no_free)++;
+        if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
+            if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
+                ne_dp_stats_tx_full_lan(tls_dp_tx_slot, 1);
+            else
+                ne_dp_stats_tx_full_wan(tls_dp_tx_slot, 1);
+        }
         ne_dp_warn_tx(cpu, 1, pending);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
@@ -1796,6 +1799,15 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     xsk_ring_prod__submit(&slot->tx, popped);
     if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
         (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    }
+    if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
+        uint64_t tx_bytes = 0;
+        for (uint32_t i = 0; i < popped; i++)
+            tx_bytes += jobs[i].len;
+        if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
+            ne_dp_stats_tx_lan(tls_dp_tx_slot, popped, tx_bytes);
+        else
+            ne_dp_stats_tx_wan(tls_dp_tx_slot, popped, tx_bytes);
     }
     return (int)popped;
 }

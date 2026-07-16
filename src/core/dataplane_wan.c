@@ -13,6 +13,7 @@
 #include "../../inc/core/crypto_route.h"
 #include "../../inc/core/interface.h"
 #include "../../inc/core/mac_learn.h"
+#include "../../inc/core/dataplane_stats.h"
 
 #include <string.h>
 
@@ -481,8 +482,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
         goto drop;
+    ne_dp_stats_wan_fwd(1);
     return;
 
 drop:
+    ne_dp_stats_wan_drop(1);
     ne_frame_free(&fwd->pair, job.addr);
 }

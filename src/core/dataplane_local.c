@@ -9,7 +9,8 @@
 #include "../../inc/crypto/crypto_policy_utils.h"
 #include "../../inc/core/fragment.h"
 #include "../../inc/core/crypto_route.h"
-#include "../../inc/core/mac_learn.h"
+    #include "../../inc/core/mac_learn.h"
+    #include "../../inc/core/dataplane_stats.h"
 
     #include <string.h>
 
@@ -194,6 +195,7 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
             goto drop;
 
         if (cp->action == POLICY_ACTION_BYPASS) {
+            ne_dp_stats_local_bypass(1);
             (void)push_to_wan(fwd, &job, wan_dp);
             return;
         }
@@ -219,5 +221,6 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
         return;
 
     drop:
+        ne_dp_stats_local_drop(1);
         ne_frame_free(&fwd->pair, job.addr);
     }

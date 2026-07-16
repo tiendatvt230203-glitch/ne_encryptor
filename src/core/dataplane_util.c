@@ -1,5 +1,6 @@
 #include "../../inc/core/dataplane_util.h"
 
+#include "../../inc/core/dataplane_stats.h"
 #include "../../inc/crypto/eth_parse.h"
 
 #include <arpa/inet.h>
@@ -100,6 +101,7 @@ int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {
+        ne_dp_stats_mid_ring_drop(1);
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
     }

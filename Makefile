@@ -48,7 +48,8 @@ APP_SRC = main.c \
           src/crypto/pqc_logger.c \
           src/crypto/pqc_ipc.c \
           src/core/flow_table.c \
-          src/core/fragment.c
+          src/core/fragment.c \
+          src/core/dataplane_stats.c
 APP_OBJ = $(APP_SRC:.c=.o)
 
 DB_SRC = src/db/config.c \
