@@ -61,6 +61,8 @@ typedef enum {
 crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp);
 crypto_option_id crypto_option_from_action_mode_bits(int action, int mode, int aes_bits);
 
+uint32_t crypto_option_wire_overhead(crypto_option_id id);
+
 int crypto_option_need_split(crypto_option_id id, uint32_t pkt_len);
 int crypto_option_split(crypto_option_id id, struct packet_crypto_ctx *ctx,
                         uint8_t *pkt_data, uint32_t pkt_len,

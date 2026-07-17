@@ -34,4 +34,8 @@ int crypto_eth_l2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8
 
 void crypto_ipv4_checksum_replace_word(uint8_t *ip_hdr, uint16_t old_word, uint16_t new_word);
 
+/* Clamp TCP MSS on SYN/SYN-ACK for path_mtu and crypto wire overhead.
+ * Only lowers an existing MSS option; returns 1 if changed, 0 if unchanged, -1 on parse skip. */
+int crypto_tcp_clamp_mss(uint8_t *pkt, uint32_t pkt_len, uint32_t path_mtu, uint32_t wire_overhead);
+
 #endif

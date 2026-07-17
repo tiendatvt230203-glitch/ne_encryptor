@@ -6,8 +6,10 @@
 #include "../../inc/db/db_env.h"
 
 #include <libpq-fe.h>
+#include <limits.h>
 #include <net/if.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -37,6 +39,58 @@ int ne_profile_id_exists(int profile_id) {
     PQclear(res);
     PQfinish(conn);
     return ok ? 0 : -1;
+}
+
+int ne_list_profile_ids(int *ids, int max_ids, int *out_count) {
+    if (!ids || !out_count || max_ids <= 0)
+        return -1;
+
+    *out_count = 0;
+
+    struct ne_postgres_conn pg;
+    if (ne_postgres_conn_fill(&pg) != 0)
+        return -1;
+
+    PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "[DB] connection failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return -1;
+    }
+
+    PGresult *res = PQexec(conn, "SELECT id FROM ne_profiles ORDER BY id");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "[DB] list ne_profiles failed: %s", PQresultErrorMessage(res));
+        PQclear(res);
+        PQfinish(conn);
+        return -1;
+    }
+
+    int rows = PQntuples(res);
+    int n = 0;
+    for (int i = 0; i < rows; i++) {
+        if (n >= max_ids) {
+            fprintf(stderr,
+                    "[WARN] ne_profiles has %d rows, loading only first %d\n",
+                    rows, max_ids);
+            break;
+        }
+        const char *val = PQgetvalue(res, i, 0);
+        if (!val || !*val)
+            continue;
+        char *end = NULL;
+        long v = strtol(val, &end, 10);
+        if (!end || *end != '\0' || v <= 0 || v > INT_MAX) {
+            fprintf(stderr, "[WARN] skipping invalid ne_profiles.id: \"%s\"\n", val);
+            continue;
+        }
+        ids[n++] = (int)v;
+    }
+
+    PQclear(res);
+    PQfinish(conn);
+    *out_count = n;
+    return 0;
 }
 
 int run_db_check(const char *const *keywords, const char *const *values, int only_id) {

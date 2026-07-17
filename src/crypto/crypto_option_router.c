@@ -193,6 +193,36 @@ crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp)
     return crypto_option_from_action_mode_bits(cp->action, cp->crypto_mode, cp->aes_bits);
 }
 
+uint32_t crypto_option_wire_overhead(crypto_option_id id)
+{
+    switch (id) {
+    case CRYPTO_OPT_L2_CTR128:
+    case CRYPTO_OPT_L2_CTR256:
+        return 14u;
+    case CRYPTO_OPT_L2_GCM128:
+    case CRYPTO_OPT_L2_GCM256:
+    case CRYPTO_OPT_L2_PQC:
+        return 30u;
+    case CRYPTO_OPT_L3_CTR128:
+    case CRYPTO_OPT_L3_CTR256:
+        return 14u;
+    case CRYPTO_OPT_L3_GCM128:
+    case CRYPTO_OPT_L3_GCM256:
+    case CRYPTO_OPT_L3_PQC:
+        return 30u;
+    case CRYPTO_OPT_L4_CTR128:
+    case CRYPTO_OPT_L4_CTR256:
+        return 22u;
+    case CRYPTO_OPT_L4_GCM128:
+    case CRYPTO_OPT_L4_GCM256:
+    case CRYPTO_OPT_L4_PQC:
+        return 38u;
+    case CRYPTO_OPT_BYPASS:
+    default:
+        return 0u;
+    }
+}
+
 #define ROUTE_NEED(id, fn, ...) \
     switch (id) { \
     case CRYPTO_OPT_L2_CTR128: return crypto_opt_l2_ctr128_##fn(__VA_ARGS__); \

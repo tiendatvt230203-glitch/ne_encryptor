@@ -563,15 +563,13 @@ static int l3_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t p
     ip_proto = ip_hdr[9];
     ip_payload = pkt_data + l3_off + ip_hdr_len;
     ip_payload_len = pkt_len - (uint32_t)l3_off - (uint32_t)ip_hdr_len;
-    if (ip_proto == 6 || ip_proto == 17) {
-        transport_hdr_len = opt_transport_hdr_size(ip_payload, ip_proto, ip_payload_len);
-        if (transport_hdr_len < 0)
-            return -1;
-        app_off = (uint32_t)transport_hdr_len;
-        app_len = ip_payload_len - app_off;
-    } else {
-        app_len = ip_payload_len;
-    }
+    if (ip_proto != 17)
+        return -1;
+    if (ip_payload_len < 8)
+        return -1;
+    transport_hdr_len = 8;
+    app_off = 8;
+    app_len = ip_payload_len - 8;
     if (app_len == 0)
         return -1;
     frag_overhead = (uint32_t)l3_off + (uint32_t)ip_hdr_len + (uint32_t)OPT_FRAG_META_LEN;

@@ -11,6 +11,7 @@
 #include "../../inc/core/mac_learn.h"
 #include "../../inc/core/dataplane_stats.h"
 
+#include <netinet/in.h>
 #include <string.h>
 
 static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id)
@@ -400,6 +401,45 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
     return best_pi;
 }
 
+static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+    const struct crypto_policy *best = NULL;
+    int best_pri = 0x7fffffff;
+    int best_id = 0x7fffffff;
+
+    if (!fwd || !pkt || !fwd->cfg)
+        return;
+    if (dp_parse_flow(pkt, len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
+        return;
+    if (proto != IPPROTO_TCP)
+        return;
+
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *prof = &fwd->cfg->profiles[pi];
+        const struct crypto_policy *cp;
+
+        if (!prof->enabled)
+            continue;
+        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
+                                         src_port, dst_port, proto);
+        if (!cp || cp->action == POLICY_ACTION_BYPASS)
+            continue;
+        if (!best || cp->priority < best_pri ||
+            (cp->priority == best_pri && cp->id < best_id)) {
+            best = cp;
+            best_pri = cp->priority;
+            best_id = cp->id;
+        }
+    }
+    if (!best)
+        return;
+    (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
+                               crypto_option_wire_overhead(crypto_option_from_policy(best)));
+}
+
 static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
     uint8_t pol = 0;
@@ -476,6 +516,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec != 0)
             goto drop;
+        wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
         /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */
         if (!wan_l2_plain_ipv4(pkt, job.len))

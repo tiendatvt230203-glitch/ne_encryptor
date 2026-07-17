@@ -528,7 +528,7 @@ static int l4_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t p
         return -1;
     if ((((uint16_t)pkt_data[12] << 8) | pkt_data[13]) != 0x0800)
         return -1;
-    if (pkt_data[14 + 9] != 6 && pkt_data[14 + 9] != 17)
+    if (pkt_data[14 + 9] != 17)
         return -1;
     ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20)
@@ -536,10 +536,7 @@ static int l4_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t p
     transport_off = 14 + ip_hdr_len;
     if (pkt_len < (uint32_t)transport_off)
         return -1;
-    transport_hdr_len = opt_transport_hdr_size(pkt_data + transport_off, pkt_data[14 + 9],
-                                               pkt_len - transport_off);
-    if (transport_hdr_len < 0)
-        return -1;
+    transport_hdr_len = 8;
     app_off = transport_off + transport_hdr_len;
     app_len = pkt_len - app_off;
     if (app_len == 0)
@@ -602,7 +599,7 @@ static int l4_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t
             if (inner_ip_hdr_len < 20 || plain_len < (uint32_t)(inner_ip_hdr_len + 8))
                 return -1;
         }
-        if (plain[9] != 6 && plain[9] != 17)
+        if (plain[9] != 17)
             return -1;
         if (opt_store_first(entry, pkt_id, pkt_data, ETH_HEADER_SIZE, plain, plain_len, now) != 0)
             return -1;
@@ -728,7 +725,7 @@ int crypto_opt_l4_gcm128_is_fragment(const struct app_config *cfg, const uint8_t
         return 0;
     if ((((uint16_t)pkt_data[12] << 8) | pkt_data[13]) != 0x0800)
         return 0;
-    if (pkt_data[14 + 9] != 6 && pkt_data[14 + 9] != 17)
+    if (pkt_data[14 + 9] != 17)
         return 0;
     ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     if (ip_hdr_len < 20)

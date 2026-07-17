@@ -938,6 +938,29 @@ int main(int argc, char **argv) {
     int active_ids[MAX_ACTIVE_PROFILE_IDS];
     int active_id_count = 0;
 
+    if (ne_list_profile_ids(active_ids, MAX_ACTIVE_PROFILE_IDS, &active_id_count) != 0) {
+        fprintf(stderr,
+                "[WARN] failed to list ne_profiles on startup — waiting for NOTIFY\n");
+        active_id_count = 0;
+    } else if (active_id_count > 0) {
+        fprintf(stderr, "[STARTUP] loading %d profile(s) from DB:", active_id_count);
+        for (int i = 0; i < active_id_count; i++)
+            fprintf(stderr, " %d", active_ids[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        if (apply_active_configs(rt, active_ids, active_id_count, active_ids[0]) != 0) {
+            fprintf(stderr,
+                    "[ERR] startup load failed — waiting for NOTIFY to retry\n");
+            active_id_count = 0;
+            if (rt->has_thread)
+                runtime_stop_forwarder(rt);
+        }
+    } else {
+        fprintf(stderr,
+                "[DAEMON] no ne_profiles rows — waiting for first profile via %s / %s -id <id>\n",
+                NOTIFY_CHANNEL, argv[0]);
+    }
+
     while (!g_stop_requested) {
         int pq_fd = PQsocket(listen_conn);
         if (pq_fd < 0) {
