@@ -1,7 +1,7 @@
 CC     = gcc
 CLANG  = clang
 
-CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
+CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Isrc/crypto/pqc/include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 # LDFLAGS = -L./lib -Wl,-rpath,'lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
 
@@ -11,48 +11,29 @@ KERNEL_HEADERS = /usr/include
 LIB_DIR = lib
 TARGET  = network-encryptor
 
+OPT_SRCS = $(wildcard src/crypto/options/common/*.c) \
+           $(wildcard src/crypto/options/l2/*/*.c) \
+           $(wildcard src/crypto/options/l3/*/*.c) \
+           $(wildcard src/crypto/options/l4/*/*.c) \
+           src/crypto/options/bypass.c
+
+PQC_SRCS = $(wildcard src/crypto/pqc/*.c)
+
+CORE_SRCS = $(wildcard src/core/forwarder/*.c) \
+            $(wildcard src/core/dataplane/*.c) \
+            $(wildcard src/core/iface/*.c) \
+            $(wildcard src/core/flow/*.c) \
+            $(wildcard src/core/util/*.c)
+
 APP_SRC = main.c \
-          src/core/main_diag.c \
-          src/core/cpu_map.c \
-          src/core/interface.c \
-          src/core/forwarder.c \
-          src/core/crypto_route.c \
-          src/core/forwarder_wan.c \
-          src/core/forwarder_reload.c \
-          src/core/forwarder_crypto_runtime.c \
-          src/core/profile_iface_xdp.c \
-          src/core/profile_iface_lifecycle.c \
-          src/core/dataplane_util.c \
-          src/core/dataplane_local.c \
-          src/core/dataplane_wan.c \
-          src/core/mac_learn.c \
+          $(CORE_SRCS) \
           src/crypto/eth_parse.c \
           src/crypto/packet_crypto.c \
           src/crypto/aes_crypto.c \
-          src/crypto/traffic_crypto.c \
           src/crypto/crypto_option_router.c \
-          src/crypto/options/l2_ctr_128.c \
-          src/crypto/options/l2_ctr_256.c \
-          src/crypto/options/l2_gcm_128.c \
-          src/crypto/options/l2_gcm_256.c \
-          src/crypto/options/l2_pqc.c \
-          src/crypto/options/l3_ctr_128.c \
-          src/crypto/options/l3_ctr_256.c \
-          src/crypto/options/l3_gcm_128.c \
-          src/crypto/options/l3_gcm_256.c \
-          src/crypto/options/l3_pqc.c \
-          src/crypto/options/l4_ctr_128.c \
-          src/crypto/options/l4_ctr_256.c \
-          src/crypto/options/l4_gcm_128.c \
-          src/crypto/options/l4_gcm_256.c \
-          src/crypto/options/l4_pqc.c \
-          src/crypto/options/bypass.c \
-          src/crypto/pqc_handshake.c \
-          src/crypto/pqc_l2_handshake.c \
-          src/crypto/pqc_logger.c \
-          src/crypto/pqc_ipc.c \
-          src/core/flow_table.c \
-          src/core/dataplane_stats.c
+          src/crypto/crypto_option_registry.c \
+          $(OPT_SRCS) \
+          $(PQC_SRCS)
 APP_OBJ = $(APP_SRC:.c=.o)
 
 DB_SRC = src/db/config.c \
@@ -78,4 +59,7 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*.o src/crypto/*.o src/crypto/options/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/*.o \
+		src/crypto/options/*.o src/crypto/options/common/*.o \
+		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
+		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)
