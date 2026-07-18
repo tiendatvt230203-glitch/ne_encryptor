@@ -32,7 +32,6 @@ static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
     return 1;
 }
 
-
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int plain_off, size_t plain_len)
 {
@@ -47,13 +46,16 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     uint8_t tag[AES_GCM_TAG_SIZE];
     int total_overhead;
 
+    total_overhead = L4_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
+    if (pkt_len + (size_t)total_overhead > NE_FRAME)
+        return -1;
+
     crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);
     memmove(packet + enc_off, packet + plain_off, plain_len);
     l4_write_tunnel_header(packet + tunnel_off, nonce, PACKET_CRYPTO_NONCE_BYTES, ctx->wire_id);
     if (crypto_aes_gcm_encrypt(key, nonce, nonce_len, packet + enc_off, (int)plain_len, tag, OPT_256) != 0)
         return -1;
     memcpy(packet + enc_off + plain_len, tag, AES_GCM_TAG_SIZE);
-    total_overhead = L4_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
     return (int)(pkt_len + (size_t)total_overhead);
 }
 
