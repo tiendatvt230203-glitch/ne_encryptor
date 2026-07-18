@@ -246,46 +246,34 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
 #define L4_FRAG_MAGIC           0x5A
 #define L4_TUNNEL_MAGIC         0xA5
 #define L4_FRAG_TAG_SIZE        4
-#define L4_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 2)
+/* nonce | core_id | policy_id | marker */
+#define L4_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 3)
 
 static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce_size,
                                    uint8_t policy_id)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = policy_id;
-    buf[nonce_size + 1] = L4_TUNNEL_MAGIC;
+    buf[nonce_size] = crypto_option_worker_idx();
+    buf[nonce_size + 1] = policy_id;
+    buf[nonce_size + 2] = L4_TUNNEL_MAGIC;
 }
 
 static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce, int nonce_size,
                                         uint8_t policy_id)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = policy_id;
-    buf[nonce_size + 1] = L4_FRAG_MAGIC;
+    buf[nonce_size] = crypto_option_worker_idx();
+    buf[nonce_size + 1] = policy_id;
+    buf[nonce_size + 2] = L4_FRAG_MAGIC;
 }
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 {
-    if (buf[nonce_size + 1] != L4_TUNNEL_MAGIC)
-        return 0;
-    if (OPT_IS_PQC == 0 && (buf[0] & 0x80) != 0)
+    if (buf[nonce_size + 2] != L4_TUNNEL_MAGIC)
         return 0;
     return 1;
 }
 
-static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr_len,
-                                         size_t ip_payload_len)
-{
-    uint8_t *ip = packet + l3_off;
-    uint16_t old_totlen = ((uint16_t)ip[2] << 8) | ip[3];
-    uint16_t new_totlen = (uint16_t)(ip_hdr_len + ip_payload_len);
-    (void)ip_hdr_len;
-    if (old_totlen == new_totlen)
-        return;
-    ip[2] = (uint8_t)(new_totlen >> 8);
-    ip[3] = (uint8_t)(new_totlen & 0xFF);
-    crypto_ipv4_checksum_replace_word(ip, old_totlen, new_totlen);
-}
 
 #define OPT_FRAG_META_LEN       38
 
@@ -293,13 +281,14 @@ static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int plain_off, size_t plain_len)
 {
+    (void)l3_off;
+    (void)ip_hdr_len;
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
     int tunnel_off = plain_off;
     int enc_off = tunnel_off + L4_TUNNEL_HDR_SIZE;
     int new_len = 0;
     int total_overhead;
-    size_t ip_payload_len;
 
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
@@ -310,8 +299,6 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)plain_len, &new_len) != 0)
         return -1;
     total_overhead = L4_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
-    ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + plain_len;
-    l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, ip_payload_len);
     return (int)(pkt_len + (size_t)total_overhead);
 
 }
@@ -320,13 +307,14 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
 static int l4_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int transport_off, int tunnel_off)
 {
+    (void)l3_off;
+    (void)ip_hdr_len;
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
     int enc_off = tunnel_off + L4_TUNNEL_HDR_SIZE;
     int dec_len = 0;
     int total_overhead = L4_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
     int new_len;
-    size_t ip_payload_len;
 
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
@@ -336,8 +324,6 @@ static int l4_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
         return -1;
     memmove(packet + transport_off + L4_WIRE_PORT_LEN, packet + enc_off, (size_t)dec_len);
     new_len = (int)(pkt_len - (size_t)total_overhead);
-    ip_payload_len = (size_t)(new_len - l3_off - ip_hdr_len);
-    l4_fix_ipv4_totlen_and_cksum(packet, l3_off, ip_hdr_len, ip_payload_len);
     return new_len;
 
 }
@@ -358,7 +344,6 @@ static int l4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     int tunnel_off;
     int enc_off;
     int new_len = 0;
-    size_t ip_payload_len;
 
     if (need > out_max)
         return -1;
@@ -379,8 +364,6 @@ static int l4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     opt_write_frag_tag(out_buf + tunnel_off + L4_TUNNEL_HDR_SIZE, pkt_id, frag_index);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off, (int)enc_plain_len, &new_len) != 0)
         return -1;
-    ip_payload_len = L4_WIRE_PORT_LEN + (size_t)total_overhead + new_len;
-    l4_fix_ipv4_totlen_and_cksum(out_buf, 14, ip_hdr_len, ip_payload_len);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
 }
@@ -398,7 +381,6 @@ static int l4_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
 
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
-    int total_overhead = L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE + AES_GCM_TAG_SIZE;
     int new_len = 0;
     size_t need = (size_t)enc_off + frag0_plain_len + AES_GCM_TAG_SIZE;
 
@@ -414,8 +396,6 @@ static int l4_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     opt_write_frag_tag(packet + tunnel_off + L4_TUNNEL_HDR_SIZE, pkt_id, 0);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)frag0_plain_len, &new_len) != 0)
         return -1;
-    l4_fix_ipv4_totlen_and_cksum(packet, 14, ip_hdr_len,
-                                 L4_WIRE_PORT_LEN + (size_t)total_overhead + new_len);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
 }
@@ -756,8 +736,6 @@ static int l4_tcp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     uint8_t ip_proto;
     int ip_hdr_len;
     int transport_off;
-    size_t remaining;
-    int transport_hdr_size;
     int plain_off;
     size_t plain_len;
     int n;
@@ -770,16 +748,14 @@ static int l4_tcp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     if (*pkt_len < (uint32_t)l3_off + 20)
         return -1;
     ip_proto = pkt[l3_off + 9];
+    if (ip_proto != 6)
+        return 0;
     ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
     transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
+    if (*pkt_len < (uint32_t)(transport_off + L4_WIRE_PORT_LEN))
         return -1;
-    remaining = *pkt_len - (size_t)transport_off;
-    transport_hdr_size = opt_transport_hdr_size(pkt + transport_off, ip_proto, remaining);
-    if (transport_hdr_size < 0)
-        return 0;
     plain_off = transport_off + L4_WIRE_PORT_LEN;
     plain_len = *pkt_len - (size_t)plain_off;
     if (plain_len == 0)
@@ -808,14 +784,12 @@ static int l4_tcp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     if (*pkt_len < (uint32_t)l3_off + 20)
         return -1;
     ip_proto = pkt[l3_off + 9];
+    if (ip_proto != 6)
+        return 0;
     ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
     if (ip_hdr_len < 20)
         return -1;
     transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
-        return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return 0;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
         !l4_is_tunnel_header(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))

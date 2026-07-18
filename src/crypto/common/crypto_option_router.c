@@ -106,20 +106,28 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
     if (tunnel_off >= (int)pkt_len)
         return -1;
 
+    /* New: nonce|core|policy|marker ; Old: nonce|policy|magic (UDP/ICMP chưa đổi) */
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4)
             continue;
         const int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 1 >= (int)pkt_len)
-            continue;
-        uint8_t magic = pkt[tunnel_off + ns + 1];
-        if (magic != 0xA5 && magic != 0x5A)
-            continue;
-        if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
-            continue;
-        *policy_id_out = (uint8_t)cp->id;
-        return 0;
+        if (tunnel_off + ns + 2 < (int)pkt_len) {
+            uint8_t marker = pkt[tunnel_off + ns + 2];
+            if ((marker == 0xA5 || marker == 0x5A) &&
+                pkt[tunnel_off + ns + 1] == (uint8_t)cp->id) {
+                *policy_id_out = (uint8_t)cp->id;
+                return 0;
+            }
+        }
+        if (tunnel_off + ns + 1 < (int)pkt_len) {
+            uint8_t magic = pkt[tunnel_off + ns + 1];
+            if ((magic == 0xA5 || magic == 0x5A) &&
+                pkt[tunnel_off + ns] == (uint8_t)cp->id) {
+                *policy_id_out = (uint8_t)cp->id;
+                return 0;
+            }
+        }
     }
 
     return -1;
@@ -200,11 +208,11 @@ uint32_t crypto_option_wire_overhead(crypto_option_id id)
         return 30u;
     case CRYPTO_OPT_L4_CTR128:
     case CRYPTO_OPT_L4_CTR256:
-        return 22u;
+        return 15u; /* nonce12 + core + policy + marker */
     case CRYPTO_OPT_L4_GCM128:
     case CRYPTO_OPT_L4_GCM256:
     case CRYPTO_OPT_L4_PQC:
-        return 38u;
+        return 31u; /* 15 + GCM tag 16 */
     case CRYPTO_OPT_BYPASS:
     default:
         return 0u;
