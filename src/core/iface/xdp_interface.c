@@ -434,7 +434,12 @@ static void interface_log_xsk_context(const char *ifname, int queue_id, int ret)
             if (n > 0) {
                 link[n] = '\0';
                 const char *base = strrchr(link, '/');
-                snprintf(master, sizeof(master), "%s", base ? base + 1 : link);
+                const char *name = base ? base + 1 : link;
+                size_t nlen = strlen(name);
+                if (nlen >= sizeof(master))
+                    nlen = sizeof(master) - 1;
+                memcpy(master, name, nlen);
+                master[nlen] = '\0';
             }
         }
     }

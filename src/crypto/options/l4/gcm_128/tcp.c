@@ -1,14 +1,9 @@
-#define _POSIX_C_SOURCE 199309L
-
 #include "../../../../../inc/crypto/crypto_option.h"
 #include "../../../../../inc/crypto/eth_parse.h"
 #include "../../../../../inc/core/interface.h"
-#include "../../../../../inc/core/cpu_map.h"
 #include "../../common/opt_no_frag_ops.h"
 
 #include <string.h>
-#include <stdlib.h>
-#include <time.h>
 
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
 #define likely(x)               __builtin_expect(!!(x), 1)
@@ -17,26 +12,6 @@
 /* wire — local to this option */
 #define OPT_IS_PQC          0
 #define OPT_AES_BITS        128
-#define OPT_NONCE_SIZE      PACKET_CRYPTO_NONCE_BYTES
-
-static int opt_policy_match(const struct app_config *cfg, int action, int mode,
-                            int aes_bits, uint8_t wire_id)
-{
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
-        const struct crypto_policy *cp = &cfg->policies[i];
-        if (!cp || cp->action != action)
-            continue;
-        if (cp->crypto_mode != mode)
-            continue;
-        if (cp->aes_bits != aes_bits)
-            continue;
-        if ((uint8_t)cp->id == wire_id)
-            return 1;
-    }
-    return 0;
-}
 
 static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto,
                                   size_t remaining)
@@ -65,7 +40,6 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
 #define L4_WIRE_PORT_LEN        4
 #define L4_FRAG_MAGIC           0x5A
 #define L4_TUNNEL_MAGIC         0xA5
-#define L4_FRAG_TAG_SIZE        4
 #define L4_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 2)
 
 static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce_size,

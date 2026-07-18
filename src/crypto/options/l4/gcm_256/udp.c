@@ -16,9 +16,6 @@
 /* wire — local to this option */
 #define OPT_IS_PQC          0
 #define OPT_AES_BITS        256
-#define OPT_NONCE_SIZE      PACKET_CRYPTO_NONCE_BYTES
-
-
 
 struct opt_entry {
     uint16_t pkt_id;
@@ -45,7 +42,6 @@ static uint64_t opt_time_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
-
 
 static void opt_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag_index)
 {
@@ -234,8 +230,6 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
     return -1;
 }
 
-
-
 #define L4_WIRE_PORT_LEN        4
 #define L4_FRAG_MAGIC           0x5A
 #define L4_TUNNEL_MAGIC         0xA5
@@ -283,7 +277,6 @@ static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr
 
 #define OPT_FRAG_META_LEN       38
 
-
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int plain_off, size_t plain_len)
 {
@@ -309,7 +302,6 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     return (int)(pkt_len + (size_t)total_overhead);
 
 }
-
 
 static int l4_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int transport_off, int tunnel_off)
@@ -341,7 +333,6 @@ static int l4_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     return new_len;
 
 }
-
 
 static int l4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *eth_hdr, const uint8_t *ip_hdr, int ip_hdr_len,
@@ -390,7 +381,6 @@ static int l4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     return 0;
 }
 
-
 static int l4_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     uint8_t *packet, int ip_hdr_len, uint32_t frag0_plain_len,
     uint16_t pkt_id, size_t out_max, uint32_t *out_len)
@@ -430,7 +420,6 @@ static int l4_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     return 0;
 }
 
-
 static int l4_decrypt_fragment_body(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                                     int transport_off, int tunnel_off)
 {
@@ -467,7 +456,6 @@ static int l4_decrypt_fragment_body(struct packet_crypto_ctx *ctx, uint8_t *pack
 
 }
 
-
 static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                                uint16_t *out_pkt_id, uint8_t *out_frag_index)
 {
@@ -501,7 +489,6 @@ static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     opt_read_frag_tag(packet + tunnel_off + L4_TUNNEL_HDR_SIZE, out_pkt_id, out_frag_index);
     return l4_decrypt_fragment_body(ctx, packet, pkt_len, transport_off, tunnel_off);
 }
-
 
 static int l4_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t pkt_len,
                     size_t frag0_max, uint32_t *frag0_len,
@@ -567,7 +554,6 @@ static int l4_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t p
     return 0;
 }
 
-
 static int l4_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t pkt_len,
                          uint16_t pkt_id, uint8_t frag_index,
                          uint8_t *out_buf, uint32_t *out_len)
@@ -619,7 +605,6 @@ static int l4_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t
     return -1;
 }
 
-
 static int udp_need_split(uint32_t pkt_len)
 {
     return (pkt_len + OPT_FRAG_META_LEN) > crypto_option_get_mtu();
@@ -631,7 +616,6 @@ static int udp_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t 
 {
     return l4_split(ctx, pkt_data, pkt_len, frag0_max, frag0_len, frag1, frag1_max, frag1_len);
 }
-
 
 static int udp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
@@ -674,7 +658,6 @@ static int udp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
     return 0;
 }
 
-
 static int udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
     int l3_off;
@@ -711,7 +694,6 @@ static int udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
     return 0;
 }
 
-
 static int udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_data,
                                  uint32_t pkt_len, uint16_t *pkt_id, uint8_t *frag_index)
 {
@@ -743,7 +725,6 @@ static int udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_data
     opt_read_frag_tag(pkt_data + tunnel_off + L4_TUNNEL_HDR_SIZE, pkt_id, frag_index);
     return (*frag_index <= 1) ? 1 : 0;
 }
-
 
 static int udp_reasm(int profile_slot, int worker_idx, struct packet_crypto_ctx *ctx,
                            uint8_t *pkt_data, uint32_t *pkt_len,

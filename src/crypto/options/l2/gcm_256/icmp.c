@@ -1,14 +1,9 @@
-#define _POSIX_C_SOURCE 199309L
-
 #include "../../../../../inc/crypto/crypto_option.h"
 #include "../../../../../inc/crypto/eth_parse.h"
 #include "../../../../../inc/core/interface.h"
-#include "../../../../../inc/core/cpu_map.h"
 #include "../../common/opt_no_frag_ops.h"
 
 #include <string.h>
-#include <stdlib.h>
-#include <time.h>
 
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
 #define likely(x)               __builtin_expect(!!(x), 1)
@@ -17,55 +12,9 @@
 /* wire — local to this option */
 #define OPT_FAKE_ETHERTYPE  0x88B5u
 #define OPT_AES_BITS        256
-#define OPT_NONCE_SIZE      PACKET_CRYPTO_NONCE_BYTES
-
-static int opt_policy_match(const struct app_config *cfg, int action, int mode,
-                            int aes_bits, uint8_t wire_id)
-{
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
-        const struct crypto_policy *cp = &cfg->policies[i];
-        if (!cp || cp->action != action)
-            continue;
-        if (cp->crypto_mode != mode)
-            continue;
-        if (cp->aes_bits != aes_bits)
-            continue;
-        if ((uint8_t)cp->id == wire_id)
-            return 1;
-    }
-    return 0;
-}
-
-static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto,
-                                  size_t remaining)
-{
-    if (ip_proto == 6) {
-        if (remaining < 20)
-            return -1;
-        int data_off = ((transport_hdr[12] >> 4) & 0x0F) * 4;
-        if (data_off < 20 || (size_t)data_off > remaining)
-            return -1;
-        return data_off;
-    }
-    if (ip_proto == 17) {
-        if (remaining < 8)
-            return -1;
-        return 8;
-    }
-    if (ip_proto == 1) {
-        if (remaining < 4)
-            return -1;
-        return 4;
-    }
-    return -1;
-}
 
 #define L2_POLICY_LEN           1
 #define L2_CORE_ID_LEN          1
-#define L2_FRAG_TAG_SIZE        4
-#define L2_FRAG_MAGIC           0x5B
 #define L2_NONCE_SIZE           PACKET_CRYPTO_NONCE_BYTES
 static int l2_policy_off(const uint8_t *packet, size_t pkt_len)
 {
@@ -96,11 +45,6 @@ static int l2_enc_start_off(const uint8_t *packet, size_t pkt_len)
     return off + L2_NONCE_SIZE;
 }
 
-static int l2_frag_magic_off(const uint8_t *packet, size_t pkt_len)
-{
-    return l2_enc_start_off(packet, pkt_len);
-}
-
 static void l2_write_wire_header(uint8_t *packet, int et_off, uint8_t policy_id,
                                  const uint8_t *nonce, int nonce_size)
 {
@@ -128,14 +72,6 @@ static int l2_restore_plain_packet(uint8_t *packet, size_t pkt_len,
     crypto_eth_set_ipv4_et(packet, et_off);
     memmove(packet + l3_off, payload, payload_len);
     return l3_off + (int)payload_len;
-}
-
-static int l2_wire_prefix_len(const uint8_t *packet, size_t pkt_len)
-{
-    int et_off = crypto_eth_l2_prefix_len(packet, pkt_len);
-    if (et_off < 0)
-        return -1;
-    return et_off + 2;
 }
 
 static int l2_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)

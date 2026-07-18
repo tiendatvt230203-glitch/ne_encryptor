@@ -16,9 +16,6 @@
 /* wire — local to this option */
 #define OPT_FAKE_ETHERTYPE  0x88B5u
 #define OPT_AES_BITS        256
-#define OPT_NONCE_SIZE      PACKET_CRYPTO_NONCE_BYTES
-
-
 
 struct opt_entry {
     uint16_t pkt_id;
@@ -45,7 +42,6 @@ static uint64_t opt_time_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
-
 
 static void opt_read_frag_tag(const uint8_t *buf, uint16_t *pkt_id, uint8_t *frag_index)
 {
@@ -209,32 +205,6 @@ static int opt_policy_match(const struct app_config *cfg, int action, int mode,
     }
     return 0;
 }
-
-static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto,
-                                  size_t remaining)
-{
-    if (ip_proto == 6) {
-        if (remaining < 20)
-            return -1;
-        int data_off = ((transport_hdr[12] >> 4) & 0x0F) * 4;
-        if (data_off < 20 || (size_t)data_off > remaining)
-            return -1;
-        return data_off;
-    }
-    if (ip_proto == 17) {
-        if (remaining < 8)
-            return -1;
-        return 8;
-    }
-    if (ip_proto == 1) {
-        if (remaining < 4)
-            return -1;
-        return 4;
-    }
-    return -1;
-}
-
-
 
 #define L2_POLICY_LEN           1
 #define L2_CORE_ID_LEN          1
