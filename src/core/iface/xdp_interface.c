@@ -6,9 +6,7 @@
 #include <net/if.h>
 #include <errno.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
@@ -18,76 +16,8 @@
 #include <dirent.h>
 #include <unistd.h>
 
-#ifndef NE_DP_WARN_LOG_ENABLE
-#define NE_DP_WARN_LOG_ENABLE 0
-#endif
-
-/* #region agent log */
-static void agent_dbg_ndjson(const char *hypothesisId, const char *location,
-                             const char *message, const char *data_json)
-{
-    /* stderr → journalctl; no debug file. */
-    fprintf(stderr, "[DBG] hid=%s loc=%s msg=%s data=%s\n",
-            hypothesisId ? hypothesisId : "?",
-            location ? location : "?",
-            message ? message : "?",
-            data_json && data_json[0] ? data_json : "{}");
-    fflush(stderr);
-}
-/* #endregion */
-
-#define NE_DP_WARN_RX_LAN   0
-#define NE_DP_WARN_RX_WAN   1
-#define NE_DP_WARN_TX_LAN0  2
-#define NE_DP_WARN_TX_LAN1  3
-#define NE_DP_WARN_TX_WAN0  4
-#define NE_DP_WARN_TX_WAN1  5
-#define NE_DP_WARN_CRYPTO0  6
-#define NE_DP_WARN_SLOTS    (NE_DP_WARN_CRYPTO0 + NE_CRYPTO_WORKERS)
-#define NE_DP_WARN_CLEAR    8192u
-
 static __thread const char *tls_dp_tx_dir;
 static __thread int tls_dp_tx_slot = -1;
-
-#if NE_DP_WARN_LOG_ENABLE
-static int dp_warn_on[NE_DP_WARN_SLOTS];
-static uint32_t dp_warn_clear_streak[NE_DP_WARN_SLOTS];
-static pthread_mutex_t dp_warn_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
-static void dp_warn_once(int id, int active, const char *fmt, ...)
-{
-#if NE_DP_WARN_LOG_ENABLE
-    va_list ap;
-
-    if (id < 0 || id >= NE_DP_WARN_SLOTS)
-        return;
-    pthread_mutex_lock(&dp_warn_lock);
-    if (active) {
-        dp_warn_clear_streak[id] = 0;
-        if (!dp_warn_on[id]) {
-            fprintf(stderr, "[DP-WARN] ");
-            va_start(ap, fmt);
-            vfprintf(stderr, fmt, ap);
-            va_end(ap);
-            fprintf(stderr, "\n");
-            fflush(stderr);
-            dp_warn_on[id] = 1;
-        }
-    } else if (dp_warn_on[id]) {
-        dp_warn_clear_streak[id]++;
-        if (dp_warn_clear_streak[id] >= NE_DP_WARN_CLEAR) {
-            dp_warn_on[id] = 0;
-            dp_warn_clear_streak[id] = 0;
-        }
-    }
-    pthread_mutex_unlock(&dp_warn_lock);
-#else
-    (void)id;
-    (void)active;
-    (void)fmt;
-#endif
-}
 
 void ne_dp_tx_ctx(const char *dir, int tx_slot)
 {
@@ -97,53 +27,32 @@ void ne_dp_tx_ctx(const char *dir, int tx_slot)
 
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
 {
-    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
-
-    if (batch_rcvd <= 0)
-        dp_warn_once(id, 0, "");
+    (void)dir;
+    (void)cpu;
+    (void)batch_rcvd;
 }
 
 void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
 {
-    int id = (dir && (dir[0] == 'W' || dir[0] == 'w')) ? NE_DP_WARN_RX_WAN : NE_DP_WARN_RX_LAN;
-
-    dp_warn_once(id, 1,
-                 "core=%d RX %s saturated worker=%d q_depth=%u (crypto queue full)",
-                 cpu, dir ? dir : "?", worker, q_depth);
+    (void)dir;
+    (void)cpu;
+    (void)worker;
+    (void)q_depth;
 }
 
 void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
 {
-#if NE_DP_WARN_LOG_ENABLE
-    int id;
-    int active;
-
-    if (!tls_dp_tx_dir || tls_dp_tx_slot < 0 || tls_dp_tx_slot >= (int)NE_TX_SLOTS)
-        return;
-    if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
-        id = NE_DP_WARN_TX_LAN0 + tls_dp_tx_slot;
-    else
-        id = NE_DP_WARN_TX_WAN0 + tls_dp_tx_slot;
-    active = tx_full && pending > 0;
-    dp_warn_once(id, active,
-                 "core=%d TX %s slot=%d saturated pending=%u (TX ring full)",
-                 cpu, tls_dp_tx_dir, tls_dp_tx_slot, pending);
-#else
     (void)cpu;
     (void)tx_full;
     (void)pending;
-#endif
 }
 
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
 {
-    uint32_t hi = (NE_RING * 7u) / 8u;
-
-    if (worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
-        return;
-    dp_warn_once(NE_DP_WARN_CRYPTO0 + worker, lan_q >= hi || wan_q >= hi,
-                 "core=%d crypto saturated worker=%d lan_q=%u wan_q=%u",
-                 cpu, worker, lan_q, wan_q);
+    (void)cpu;
+    (void)worker;
+    (void)lan_q;
+    (void)wan_q;
 }
 
 static int ne_rx_slots_for_queues(int queue_total, uint32_t slots_max)
@@ -167,32 +76,8 @@ int ne_rx_wan_slots_for(int wan_queue_total)
 
 void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total)
 {
-    fprintf(stderr,
-            "[DP-CONF] HW scale: queues(lan=%d wan=%d total=%d) "
-            "RX threads(lan=%d/%u wan=%d/%u)\n",
-            local_queue_total, wan_queue_total,
-            local_queue_total + wan_queue_total,
-            ne_rx_lan_slots_for(local_queue_total), (unsigned)NE_RX_LAN_SLOTS,
-            ne_rx_wan_slots_for(wan_queue_total), (unsigned)NE_RX_WAN_SLOTS);
-    fflush(stderr);
-}
-
-static uint32_t pool_free_count(struct ne_pool *p)
-{
-    if (!p || !p->buf)
-        return 0;
-    return p->cap - (p->head - p->tail);
-}
-
-static void ne_dp_warn_pool_empty(void)
-{
-    static int warned;
-
-    if (warned)
-        return;
-    warned = 1;
-    fprintf(stderr, "[DP-WARN] UMEM pool empty (frame alloc/refill failed)\n");
-    fflush(stderr);
+    (void)local_queue_total;
+    (void)wan_queue_total;
 }
 
 static int ifname_is_safe(const char *ifname)
@@ -459,7 +344,6 @@ int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
 {
     if (p && addr_out && pool_pop(&p->pool, addr_out, 1) == 1)
         return 0;
-    ne_dp_warn_pool_empty();
     return -1;
 }
 
@@ -578,10 +462,7 @@ static int interface_preflight(const char *ifname)
         return -1;
     }
     /* Br membership is intentional (customer default) — do not reject. */
-    if (interface_is_bridge_slave(ifname)) {
-        fprintf(stderr, "[DP] %s: bridge slave (keeping Br)\n", ifname);
-        fflush(stderr);
-    }
+    (void)interface_is_bridge_slave(ifname);
     return 0;
 }
 
@@ -877,17 +758,6 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
         if (ret) {
             open_iface_queues_rollback(p, iface, q);
             interface_log_xsk_context(ifname, q, ret);
-            /* #region agent log */
-            {
-                char js[256];
-                snprintf(js, sizeof(js),
-                         "{\"ifname\":\"%s\",\"q\":%d,\"ret\":%d,\"mode\":%u,"
-                         "\"umem_fd\":%d,\"umem_fq_li\":%d}",
-                         ifname, q, ret, mode,
-                         p->umem ? xsk_umem__fd(p->umem) : -1, p->umem_fq_li);
-                agent_dbg_ndjson("B", "interface.c:open_iface_queues", "xsk_create_failed", js);
-            }
-            /* #endregion */
             iface->queue_count = 0;
             iface->ifindex = 0;
             iface->ifname[0] = '\0';
@@ -943,10 +813,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->wan_count = config_count_dataplane_wans(cfg);
     if (p->wan_count > MAX_INTERFACES)
         p->wan_count = MAX_INTERFACES;
-    if (p->wan_count == 0) {
-        fprintf(stderr, "[DP-CONF] no dataplane WAN rows — LAN-only dataplane\n");
-        fflush(stderr);
-    }
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
     (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
@@ -961,8 +827,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(apply_iface_queue_count(cfg->locals[i].ifname, nq));
         p->locals[i].queue_count = nq;
         p->local_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s LAN queues=%d%s\n", cfg->locals[i].ifname, nq,
-                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
     }
     for (int di = 0; di < p->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
@@ -972,8 +836,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(apply_iface_queue_count(cfg->wans[ci].ifname, nq));
         p->wans[di].queue_count = nq;
         p->wan_queue_total += nq;
-        fprintf(stderr, "[DP-CONF] %s WAN queues=%d%s\n", cfg->wans[ci].ifname, nq,
-                NE_QUEUE_OVERRIDE > 0 ? " (override)" : " (nic)");
     }
 
     p->n_frames = NE_N_FRAMES;
@@ -1025,24 +887,11 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     }
 
     uint32_t prefill = NE_FQ_PREFILL;
-    uint32_t fq_total = prefill * (uint32_t)(p->local_queue_total + p->wan_queue_total);
-
-    fprintf(stderr,
-            "[DP-CONF] UMEM frames=%u (~%zu MB) queues=%d fq_prefill/queue=%u (~%u in FQ, ~%u free)\n",
-            p->n_frames, p->bufsize / (1024u * 1024u),
-            p->local_queue_total + p->wan_queue_total, prefill, fq_total,
-            pool_free_count(&p->pool));
-    fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++)
         prefill_iface(p, &p->locals[i], prefill);
     for (int i = 0; i < p->wan_count; i++)
         prefill_iface(p, &p->wans[i], prefill);
-
-    fprintf(stderr, "[DP-CONF] UMEM pool after FQ prefill: ~%u frames free\n",
-            pool_free_count(&p->pool));
-    ne_dp_log_hw_scale(p->local_queue_total, p->wan_queue_total);
-    fflush(stderr);
 
     for (int i = 0; i < p->local_count; i++)
         p->local_live[i] = 1;
@@ -1191,9 +1040,6 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
 void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
 {
     int nq;
-    int holds_umem_fd;
-    int others;
-    char js[256];
 
     if (!p || pair_li < 0 || pair_li >= p->local_count || !p->local_live[pair_li])
         return;
@@ -1201,26 +1047,6 @@ void ne_pair_unplumb_local(struct ne_pair *p, int pair_li)
     profile_iface_xdp_detach_local(p, pair_li);
     p->local_live[pair_li] = 0;
     nq = p->locals[pair_li].queue_count;
-    holds_umem_fd = iface_holds_umem_fd(p, &p->locals[pair_li], nq);
-    others = ne_pair_other_live_count(p, pair_li, -1);
-
-    /* #region agent log */
-    snprintf(js, sizeof(js),
-             "{\"ifname\":\"%s\",\"slot\":%d,\"holds_umem_fd\":%d,\"others\":%d,"
-             "\"umem_fd\":%d,\"umem_fq_li\":%d}",
-             p->locals[pair_li].ifname, pair_li, holds_umem_fd, others,
-             p->umem ? xsk_umem__fd(p->umem) : -1, p->umem_fq_li);
-    agent_dbg_ndjson("A", "interface.c:unplumb_local", "unplumb_local", js);
-    /* #endregion */
-
-    if (holds_umem_fd && others > 0) {
-        fprintf(stderr,
-                "[DP] WARN: unplumb LAN %s holds umem fd while %d other live iface(s) — "
-                "use ne_pair_unplumb_local_rehome\n",
-                p->locals[pair_li].ifname[0] ? p->locals[pair_li].ifname : "?",
-                others);
-        fflush(stderr);
-    }
 
     reclaim_iface_umem_frames(p, &p->locals[pair_li]);
     delete_iface_xsks(p, &p->locals[pair_li], nq);
@@ -1251,7 +1077,6 @@ int ne_pair_unplumb_local_rehome(struct ne_pair *p, int drop_li,
     int holds;
     int others;
     int nq_drop;
-    char js[320];
     struct xsk_umem_config ucfg = {
         .fill_size = NE_RING,
         .comp_size = NE_RING,
@@ -1266,13 +1091,6 @@ int ne_pair_unplumb_local_rehome(struct ne_pair *p, int drop_li,
     nq_drop = p->locals[drop_li].queue_count;
     holds = iface_holds_umem_fd(p, &p->locals[drop_li], nq_drop);
     others = ne_pair_other_live_count(p, drop_li, -1);
-
-    /* #region agent log */
-    snprintf(js, sizeof(js),
-             "{\"ifname\":\"%s\",\"slot\":%d,\"holds_umem_fd\":%d,\"others\":%d}",
-             p->locals[drop_li].ifname, drop_li, holds, others);
-    agent_dbg_ndjson("A", "interface.c:unplumb_local_rehome", "rehome_enter", js);
-    /* #endregion */
 
     if (!holds || others <= 0) {
         ne_pair_unplumb_local(p, drop_li);
@@ -1305,28 +1123,9 @@ int ne_pair_unplumb_local_rehome(struct ne_pair *p, int drop_li,
     }
 
     if (new_home < 0) {
-        fprintf(stderr,
-                "[DP] rehome: no surviving LAN to host UMEM — plain unplumb %s\n",
-                p->locals[drop_li].ifname);
-        fflush(stderr);
         ne_pair_unplumb_local(p, drop_li);
         return 0;
     }
-
-    fprintf(stderr,
-            "[DP] rehome UMEM: drop LAN %s (slot %d) → new home LAN %s (slot %d), keep=%d\n",
-            p->locals[drop_li].ifname, drop_li,
-            p->locals[new_home].ifname, new_home, keep_n);
-    fflush(stderr);
-
-    /* #region agent log */
-    snprintf(js, sizeof(js),
-             "{\"drop\":\"%s\",\"drop_slot\":%d,\"new_home\":\"%s\",\"new_home_slot\":%d,"
-             "\"keep_n\":%d}",
-             p->locals[drop_li].ifname, drop_li,
-             p->locals[new_home].ifname, new_home, keep_n);
-    agent_dbg_ndjson("A", "interface.c:unplumb_local_rehome", "rehome_plan", js);
-    /* #endregion */
 
     profile_iface_xdp_detach_local(p, drop_li);
     for (int k = 0; k < keep_n; k++) {
@@ -1432,24 +1231,12 @@ int ne_pair_unplumb_local_rehome(struct ne_pair *p, int drop_li,
         }
     }
 
-    /* #region agent log */
-    snprintf(js, sizeof(js),
-             "{\"umem_fd\":%d,\"umem_fq_li\":%d,\"local_q_total\":%d,\"wan_q_total\":%d}",
-             xsk_umem__fd(p->umem), p->umem_fq_li, p->local_queue_total, p->wan_queue_total);
-    agent_dbg_ndjson("A", "interface.c:unplumb_local_rehome", "rehome_done", js);
-    /* #endregion */
-
-    fprintf(stderr, "[DP] rehome UMEM done — umem_fd=%d home_slot=%d (XDP rebind required)\n",
-            xsk_umem__fd(p->umem), p->umem_fq_li);
-    fflush(stderr);
     return 1;
 }
 
 void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
 {
     int nq;
-    int holds_umem_fd;
-    int others;
 
     if (!p || dp_slot < 0 || dp_slot >= p->wan_count || !p->wan_live[dp_slot])
         return;
@@ -1457,16 +1244,6 @@ void ne_pair_unplumb_wan_dp(struct ne_pair *p, int dp_slot)
     profile_iface_xdp_detach_wan(p, dp_slot);
     p->wan_live[dp_slot] = 0;
     nq = p->wans[dp_slot].queue_count;
-    holds_umem_fd = iface_holds_umem_fd(p, &p->wans[dp_slot], nq);
-    others = ne_pair_other_live_count(p, -1, dp_slot);
-
-    if (holds_umem_fd && others > 0) {
-        fprintf(stderr,
-                "[DP] WARN: unplumb WAN %s holds umem fd while %d other live iface(s)\n",
-                p->wans[dp_slot].ifname[0] ? p->wans[dp_slot].ifname : "?",
-                others);
-        fflush(stderr);
-    }
 
     reclaim_iface_umem_frames(p, &p->wans[dp_slot]);
     delete_iface_xsks(p, &p->wans[dp_slot], nq);
@@ -1756,8 +1533,6 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 {   
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
-    uint32_t pending = ne_ring_count(src);
-    int cpu = sched_getcpu();
 
     if (!free_slots) {
         if (tx_no_free)
@@ -1768,13 +1543,11 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
             else
                 ne_dp_stats_tx_full_wan(tls_dp_tx_slot, 1);
         }
-        ne_dp_warn_tx(cpu, 1, pending);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
         return 0;
     }
-    ne_dp_warn_tx(cpu, 0, pending);
 
     uint32_t popped = 0;
     uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;

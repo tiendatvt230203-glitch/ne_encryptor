@@ -3,16 +3,12 @@
 #include "../../inc/core/config.h"
 
 #include <openssl/hmac.h>
-#include <openssl/rand.h>
 #include <stdatomic.h>
 #include <string.h>
 
 #include "pqc_handshake.h"
 
 static atomic_uint_fast32_t g_nonce_counter;
-
-static __thread uint8_t tls_nonce_salt[16];
-static __thread int tls_salt_initialized;
 
 static int key_size_bytes(int aes_bits)
 {
@@ -132,19 +128,19 @@ void packet_crypto_cleanup(struct packet_crypto_ctx *ctx)
 void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag, uint8_t *out_nonce,
                            int *out_nonce_len)
 {
-    const int ns = PACKET_CRYPTO_NONCE_BYTES;
+    (void)counter;
+    (void)proto_flag;
 
-    out_nonce[0] = (uint8_t)((proto_flag << 7) | ((counter >> 24) & 0x7F));
-    out_nonce[1] = (uint8_t)((counter >> 16) & 0xFF);
-    out_nonce[2] = (uint8_t)((counter >> 8) & 0xFF);
-    out_nonce[3] = (uint8_t)(counter & 0xFF);
+    if (!out_nonce || !out_nonce_len)
+        return;
 
-    if (!tls_salt_initialized) {
-        RAND_bytes(tls_nonce_salt, (int)sizeof(tls_nonce_salt));
-        tls_salt_initialized = 1;
+    /* Shared with PQC: salt[8] + counter[4] via trf_pqc_generate_nonce. */
+    (void)trf_pqc_init_global();
+    if (trf_pqc_generate_nonce(out_nonce) != TRF_PQC_OK) {
+        *out_nonce_len = 0;
+        return;
     }
-    memcpy(out_nonce + 4, tls_nonce_salt, (size_t)(ns - 4));
-    *out_nonce_len = ns;
+    *out_nonce_len = PACKET_CRYPTO_NONCE_BYTES;
 }
 
 void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size, uint8_t iv[AES128_IV_SIZE])
