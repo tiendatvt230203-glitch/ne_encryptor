@@ -1,6 +1,6 @@
-#include "../../inc/crypto/crypto_option.h"
-#include "../../inc/crypto/eth_parse.h"
-#include "../../inc/core/interface.h"
+#include "../../../inc/crypto/crypto_option.h"
+#include "../../../inc/crypto/eth_parse.h"
+#include "../../../inc/core/interface.h"
 
 #include <netinet/in.h>
 #include <stdatomic.h>

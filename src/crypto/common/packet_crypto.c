@@ -1,6 +1,6 @@
-#include "../../inc/crypto/packet_crypto.h"
-#include "../../inc/crypto/traffic_crypto.h"
-#include "../../inc/core/config.h"
+#include "../../../inc/crypto/packet_crypto.h"
+#include "../../../inc/crypto/traffic_crypto.h"
+#include "../../../inc/core/config.h"
 
 #include <openssl/hmac.h>
 #include <stdatomic.h>

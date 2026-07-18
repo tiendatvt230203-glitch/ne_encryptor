@@ -1,10 +1,15 @@
 #ifndef INTERFACE_H
 #define INTERFACE_H
 
-#include "common.h"
 #include "config.h"
+#include <linux/if_link.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
+#include <xdp/xsk.h>
+
+#define MAX_QUEUES     64
 
 #define NE_RING        16384u
 #define NE_FRAME       2048u
@@ -14,6 +19,19 @@
 #define NE_QUEUE_OVERRIDE 0
 
 #define NE_FQ_PREFILL   16384u
+
+#ifndef XDP_FLAGS_SKB_MODE
+#define XDP_FLAGS_SKB_MODE (1U << 1)
+#endif
+#ifndef XDP_FLAGS_DRV_MODE
+#define XDP_FLAGS_DRV_MODE (1U << 2)
+#endif
+#ifndef XDP_FLAGS_HW_MODE
+#define XDP_FLAGS_HW_MODE (1U << 3)
+#endif
+#ifndef XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
+#define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
+#endif
 
 #include "cpu_map.h"
 

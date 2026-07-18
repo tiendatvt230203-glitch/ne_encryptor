@@ -25,13 +25,11 @@ CORE_SRCS = $(wildcard src/core/forwarder/*.c) \
             $(wildcard src/core/flow/*.c) \
             $(wildcard src/core/util/*.c)
 
+CRYPTO_COMMON_SRCS = $(wildcard src/crypto/common/*.c)
+
 APP_SRC = main.c \
           $(CORE_SRCS) \
-          src/crypto/eth_parse.c \
-          src/crypto/packet_crypto.c \
-          src/crypto/aes_crypto.c \
-          src/crypto/crypto_option_router.c \
-          src/crypto/crypto_option_registry.c \
+          $(CRYPTO_COMMON_SRCS) \
           $(OPT_SRCS) \
           $(PQC_SRCS)
 APP_OBJ = $(APP_SRC:.c=.o)
@@ -59,7 +57,7 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/*.o \
+	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
 		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
 		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)
