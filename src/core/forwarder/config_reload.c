@@ -3,6 +3,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/profile_iface_xdp.h"
+#include "pqc_l2_handshake.h"
 
 #include <pthread.h>
 #include <stdatomic.h>

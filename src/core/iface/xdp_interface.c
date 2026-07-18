@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static __thread const char *tls_dp_tx_dir;

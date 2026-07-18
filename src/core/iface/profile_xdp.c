@@ -214,17 +214,6 @@ static const struct wan_config *wan_by_ifname(const struct app_config *cfg, cons
     return NULL;
 }
 
-static const struct profile_config *profile_by_id(const struct app_config *cfg, int profile_id)
-{
-    if (!cfg || profile_id <= 0)
-        return NULL;
-    for (int i = 0; i < cfg->profile_count; i++) {
-        if (cfg->profiles[i].id == profile_id)
-            return &cfg->profiles[i];
-    }
-    return NULL;
-}
-
 
 static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname)
 {
