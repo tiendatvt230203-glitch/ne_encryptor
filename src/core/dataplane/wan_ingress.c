@@ -427,6 +427,21 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
 }
 
+static int wire_policy_matches_layer(crypto_wire_layer layer, uint8_t policy_id)
+{
+    const struct crypto_policy *cp = fwd_crypto_policy_for_wire_id(policy_id);
+
+    if (!cp)
+        return 0;
+    if (layer == CRYPTO_WIRE_L2)
+        return cp->action == POLICY_ACTION_ENCRYPT_L2;
+    if (layer == CRYPTO_WIRE_L3)
+        return cp->action == POLICY_ACTION_ENCRYPT_L3;
+    if (layer == CRYPTO_WIRE_L4)
+        return cp->action == POLICY_ACTION_ENCRYPT_L4;
+    return 0;
+}
+
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -440,7 +455,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     if (job.len < 14u || job.len > NE_FRAME)
         goto drop;
 
-    if (crypto_wire_detach(pkt, job.len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE) {
+    if (crypto_wire_detach(pkt, job.len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE &&
+        wire_policy_matches_layer(wi.layer, wi.policy_id)) {
         have_wire = 1;
         if (!fwd->cfg->crypto_enabled)
             goto drop;
@@ -453,6 +469,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
         wan_clamp_tcp_mss(fwd, pkt, job.len, &wi);
     } else {
+        /* Plain / bypass, or L4 magic false-positive on TCP header. */
         wi.layer = CRYPTO_WIRE_NONE;
         wi.policy_id = 0;
         wi.is_frag = 0;

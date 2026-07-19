@@ -99,17 +99,13 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         tunnel_off = l3_off + ip_hdr_len + L4_WIRE_PORT_LEN;
         if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
             return -1;
+        /* Only new layout: nonce|core|policy|magic — never treat TCP/UDP
+         * header bytes at ns+1 as magic (plain bypass false positives). */
         if (pkt_len > (uint32_t)(tunnel_off + ns + 2) &&
             wire_l4_magic(pkt[tunnel_off + ns + 2])) {
             out->layer = CRYPTO_WIRE_L4;
             out->policy_id = pkt[tunnel_off + ns + 1];
             out->is_frag = (pkt[tunnel_off + ns + 2] == L4_FRAG_MAGIC);
-            return 0;
-        }
-        if (wire_l4_magic(pkt[tunnel_off + ns + 1])) {
-            out->layer = CRYPTO_WIRE_L4;
-            out->policy_id = pkt[tunnel_off + ns];
-            out->is_frag = (pkt[tunnel_off + ns + 1] == L4_FRAG_MAGIC);
             return 0;
         }
     }
