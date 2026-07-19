@@ -52,6 +52,7 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         return -1;
     out->layer = CRYPTO_WIRE_NONE;
     out->policy_id = 0;
+    out->core_id = 0;
     out->is_frag = 0;
     if (!pkt || pkt_len < 14)
         return -1;
@@ -61,11 +62,15 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         et = (uint16_t)(((uint16_t)pkt[et_off] << 8) | pkt[et_off + 1]);
         if (et == NE_L2_FAKE_ETHERTYPE) {
             int pol_off = et_off + 2;
+            int core_off;
 
             if (pkt_len < (uint32_t)(pol_off + 1))
                 return -1;
             out->layer = CRYPTO_WIRE_L2;
             out->policy_id = pkt[pol_off];
+            core_off = crypto_eth_l2_core_id_off(pkt, pkt_len);
+            if (core_off >= 0 && pkt_len > (uint32_t)core_off)
+                out->core_id = pkt[core_off];
             /* L2 frag magic sits at ciphertext start — never set is_frag here
              * (false positives ~1/256). Decrypt-first in wan_ingress. */
             (void)ns;
@@ -88,6 +93,7 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
             return -1;
         out->layer = CRYPTO_WIRE_L3;
+        out->core_id = pkt[tunnel_off + ns];
         out->policy_id = pkt[tunnel_off + ns + 1];
         if (pkt_len > (uint32_t)(tunnel_off + ns + 2) &&
             pkt[tunnel_off + ns + 2] == L3_FRAG_MAGIC)
@@ -104,6 +110,7 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         if (pkt_len > (uint32_t)(tunnel_off + ns + 2) &&
             wire_l4_magic(pkt[tunnel_off + ns + 2])) {
             out->layer = CRYPTO_WIRE_L4;
+            out->core_id = pkt[tunnel_off + ns];
             out->policy_id = pkt[tunnel_off + ns + 1];
             out->is_frag = (pkt[tunnel_off + ns + 2] == L4_FRAG_MAGIC);
             return 0;

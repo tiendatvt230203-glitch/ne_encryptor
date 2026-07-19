@@ -32,6 +32,7 @@ typedef enum {
 struct crypto_wire_info {
     crypto_wire_layer layer;
     uint8_t policy_id;
+    uint8_t core_id;
     uint8_t is_frag;
 };
 

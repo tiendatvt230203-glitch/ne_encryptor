@@ -228,11 +228,19 @@ static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
     return -1;
 }
 
+static struct ne_ring *mid_to_local_ring(struct forwarder *fwd, int li)
+{
+    int bwi = dp_bypass_current_worker_idx();
+
+    if (bwi >= 0)
+        return &fwd->mid_to_local_bypass[li][bwi];
+    return &fwd->mid_to_local[li][dp_crypto_current_worker_idx()];
+}
+
 static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                                    const uint8_t *pkt, int profile_pi)
 {
     const struct profile_config *prof;
-    int wi;
     int sent = 0;
     uint16_t sent_mask = 0;
 
@@ -244,8 +252,6 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
     if (!prof->enabled || prof->local_count <= 0)
         return -1;
 
-    wi = dp_crypto_current_worker_idx();
-
     for (int i = 0; i < prof->local_count; i++) {
         int li = prof->local_indices[i];
         struct ne_ring *ring;
@@ -255,7 +261,7 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
         if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
             continue;
 
-        ring = &fwd->mid_to_local[li][wi];
+        ring = mid_to_local_ring(fwd, li);
 
         if (sent == 0) {
             job->dir = NE_DIR_LOCAL;
@@ -421,7 +427,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (li >= 0 && profile_owns_local(fwd->cfg, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
-        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
+        return dp_ring_push(fwd, mid_to_local_ring(fwd, li), job);
     }
 
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
@@ -472,6 +478,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         /* Plain / bypass, or L4 magic false-positive on TCP header. */
         wi.layer = CRYPTO_WIRE_NONE;
         wi.policy_id = 0;
+        wi.core_id = 0;
         wi.is_frag = 0;
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;

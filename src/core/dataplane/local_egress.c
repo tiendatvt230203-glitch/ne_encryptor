@@ -14,19 +14,26 @@
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
 
+static struct ne_ring *mid_to_wan_ring(struct forwarder *fwd, int wan_dp)
+{
+    int bwi = dp_bypass_current_worker_idx();
+
+    if (bwi >= 0)
+        return &fwd->mid_to_wan_bypass[wan_dp][bwi];
+    return &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
+}
+
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
-    int wi = dp_crypto_current_worker_idx();
-
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][wi], job);
+    return dp_ring_push(fwd, mid_to_wan_ring(fwd, wan_dp), job);
 }
 
 static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                             uint32_t l1, struct ne_packet *tail, uint32_t l2, int wan_dp)
 {
-    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
+    struct ne_ring *tx = mid_to_wan_ring(fwd, wan_dp);
     if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
         return -1;
     if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
@@ -150,6 +157,26 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
     return 0;
 }
 
+int dataplane_local_is_bypass(struct forwarder *fwd, int local_idx,
+                              const uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+    int flow_ok;
+    int profile_idx;
+    const struct crypto_policy *cp;
+
+    if (!fwd || !pkt)
+        return 0;
+    flow_ok = dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                            &src_port, &dst_port, &proto) == 0;
+    if (pick_profile_policy(fwd, local_idx, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
+                            &profile_idx, &cp) != 0)
+        return 0;
+    return cp->action == POLICY_ACTION_BYPASS;
+}
+
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -180,6 +207,9 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
+    /* Encrypt path must not run on bypass workers. */
+    if (dp_bypass_current_worker_idx() >= 0)
+        goto drop;
     if (!fwd->cfg->crypto_enabled)
         goto drop;
 
