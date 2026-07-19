@@ -95,7 +95,7 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         return 0;
     }
 
-    if (ip_proto == 6 || ip_proto == 17 || ip_proto == 1) {
+    if (ip_proto == 6 || ip_proto == 17) {
         tunnel_off = l3_off + ip_hdr_len + L4_WIRE_PORT_LEN;
         if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
             return -1;

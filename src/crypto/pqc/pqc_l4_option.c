@@ -232,11 +232,6 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
             return -1;
         return 8;
     }
-    if (ip_proto == 1) {
-        if (remaining < 4)
-            return -1;
-        return 4;
-    }
     return -1;
 }
 
@@ -442,7 +437,7 @@ static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     transport_off = l3_off + ip_hdr_len;
     if (pkt_len < (size_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+    if (ip_proto != 6 && ip_proto != 17)
         return -1;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (pkt_len < (size_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
@@ -641,7 +636,7 @@ static int l4_udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     transport_off = l3_off + ip_hdr_len;
     if (*pkt_len < (uint32_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+    if (ip_proto != 6 && ip_proto != 17)
         return 0;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
@@ -800,156 +795,36 @@ static int l4_tcp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
 }
 static int l4_icmp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
-    int l3_off;
-    uint8_t ip_proto;
-    int ip_hdr_len;
-    int transport_off;
-    size_t remaining;
-    int transport_hdr_size;
-    int plain_off;
-    size_t plain_len;
-    int n;
-
-    if (!ctx || !ctx->initialized || !pkt)
-        return -1;
-    l3_off = crypto_eth_ipv4_offset(pkt, *pkt_len);
-    if (l3_off < 0)
-        return 0;
-    if (*pkt_len < (uint32_t)l3_off + 20)
-        return -1;
-    ip_proto = pkt[l3_off + 9];
-    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
-        return -1;
-    remaining = *pkt_len - (size_t)transport_off;
-    transport_hdr_size = opt_transport_hdr_size(pkt + transport_off, ip_proto, remaining);
-    if (transport_hdr_size < 0)
-        return 0;
-    plain_off = transport_off + L4_WIRE_PORT_LEN;
-    plain_len = *pkt_len - (size_t)plain_off;
-    if (plain_len == 0)
-        return 0;
-    n = l4_do_encrypt(ctx, pkt, *pkt_len, l3_off, ip_hdr_len, plain_off, plain_len);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
+    (void)ctx;
+    (void)pkt;
+    (void)pkt_len;
     return 0;
 }
 
 static int l4_icmp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
-    int l3_off;
-    uint8_t ip_proto;
-    int ip_hdr_len;
-    int transport_off;
-    int tunnel_off;
-    int n;
-
-    if (!ctx || !ctx->initialized || !pkt)
-        return -1;
-    l3_off = crypto_eth_ipv4_offset(pkt, *pkt_len);
-    if (l3_off < 0)
-        return 0;
-    if (*pkt_len < (uint32_t)l3_off + 20)
-        return -1;
-    ip_proto = pkt[l3_off + 9];
-    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
-        return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return 0;
-    tunnel_off = transport_off + L4_WIRE_PORT_LEN;
-    if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
-        !l4_is_tunnel_header(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
-        return 0;
-    n = l4_do_decrypt(ctx, pkt, *pkt_len, l3_off, ip_hdr_len, transport_off, tunnel_off);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
+    (void)ctx;
+    (void)pkt;
+    (void)pkt_len;
     return 0;
 }
+
 static int l4_ospf_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
-    int l3_off;
-    uint8_t ip_proto;
-    int ip_hdr_len;
-    int transport_off;
-    size_t remaining;
-    int transport_hdr_size;
-    int plain_off;
-    size_t plain_len;
-    int n;
-
-    if (!ctx || !ctx->initialized || !pkt)
-        return -1;
-    l3_off = crypto_eth_ipv4_offset(pkt, *pkt_len);
-    if (l3_off < 0)
-        return 0;
-    if (*pkt_len < (uint32_t)l3_off + 20)
-        return -1;
-    ip_proto = pkt[l3_off + 9];
-    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
-        return -1;
-    remaining = *pkt_len - (size_t)transport_off;
-    transport_hdr_size = opt_transport_hdr_size(pkt + transport_off, ip_proto, remaining);
-    if (transport_hdr_size < 0)
-        return 0;
-    plain_off = transport_off + L4_WIRE_PORT_LEN;
-    plain_len = *pkt_len - (size_t)plain_off;
-    if (plain_len == 0)
-        return 0;
-    n = l4_do_encrypt(ctx, pkt, *pkt_len, l3_off, ip_hdr_len, plain_off, plain_len);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
+    (void)ctx;
+    (void)pkt;
+    (void)pkt_len;
     return 0;
 }
 
 static int l4_ospf_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
 {
-    int l3_off;
-    uint8_t ip_proto;
-    int ip_hdr_len;
-    int transport_off;
-    int tunnel_off;
-    int n;
-
-    if (!ctx || !ctx->initialized || !pkt)
-        return -1;
-    l3_off = crypto_eth_ipv4_offset(pkt, *pkt_len);
-    if (l3_off < 0)
-        return 0;
-    if (*pkt_len < (uint32_t)l3_off + 20)
-        return -1;
-    ip_proto = pkt[l3_off + 9];
-    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    transport_off = l3_off + ip_hdr_len;
-    if (*pkt_len < (uint32_t)transport_off)
-        return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return 0;
-    tunnel_off = transport_off + L4_WIRE_PORT_LEN;
-    if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
-        !l4_is_tunnel_header(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
-        return 0;
-    n = l4_do_decrypt(ctx, pkt, *pkt_len, l3_off, ip_hdr_len, transport_off, tunnel_off);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
+    (void)ctx;
+    (void)pkt;
+    (void)pkt_len;
     return 0;
 }
+
 CRYPTO_OPS_PLAIN(crypto_opt_l4_pqc_tcp_ops, l4_tcp_encrypt, l4_tcp_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l4_pqc_icmp_ops, l4_icmp_encrypt, l4_icmp_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l4_pqc_ospf_ops, l4_ospf_encrypt, l4_ospf_decrypt)

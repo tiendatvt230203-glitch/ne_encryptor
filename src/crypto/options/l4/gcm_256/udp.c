@@ -222,11 +222,6 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
             return -1;
         return 8;
     }
-    if (ip_proto == 1) {
-        if (remaining < 4)
-            return -1;
-        return 4;
-    }
     return -1;
 }
 
@@ -477,7 +472,7 @@ static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     transport_off = l3_off + ip_hdr_len;
     if (pkt_len < (size_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+    if (ip_proto != 6 && ip_proto != 17)
         return -1;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (pkt_len < (size_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
@@ -679,7 +674,7 @@ static int udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
     transport_off = l3_off + ip_hdr_len;
     if (*pkt_len < (uint32_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
+    if (ip_proto != 6 && ip_proto != 17)
         return 0;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
