@@ -90,8 +90,9 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
             return -1;
         out->layer = CRYPTO_WIRE_L3;
-        out->policy_id = pkt[tunnel_off + ns];
-        if (pkt[tunnel_off + ns + 1] == L3_FRAG_MAGIC)
+        out->policy_id = pkt[tunnel_off + ns + 1];
+        if (pkt_len > (uint32_t)(tunnel_off + ns + 2) &&
+            pkt[tunnel_off + ns + 2] == L3_FRAG_MAGIC)
             out->is_frag = 1;
         return 0;
     }
@@ -218,11 +219,11 @@ uint32_t crypto_option_wire_overhead(crypto_option_id id)
         return 30u;
     case CRYPTO_OPT_L3_CTR128:
     case CRYPTO_OPT_L3_CTR256:
-        return 14u;
+        return 15u;
     case CRYPTO_OPT_L3_GCM128:
     case CRYPTO_OPT_L3_GCM256:
     case CRYPTO_OPT_L3_PQC:
-        return 30u;
+        return 31u;
     case CRYPTO_OPT_L4_CTR128:
     case CRYPTO_OPT_L4_CTR256:
         return 15u; /* nonce12 + core + policy + marker */

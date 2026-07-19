@@ -273,7 +273,7 @@ static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 }
 
 
-#define OPT_FRAG_META_LEN       38
+#define OPT_FRAG_META_LEN       39
 
 
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
@@ -447,7 +447,7 @@ static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (pkt_len < (size_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
         return -1;
-    if (packet[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] != L4_FRAG_MAGIC)
+    if (packet[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] != L4_FRAG_MAGIC)
         return -1;
     opt_read_frag_tag(packet + tunnel_off + L4_TUNNEL_HDR_SIZE, out_pkt_id, out_frag_index);
     return l4_decrypt_fragment_body(ctx, packet, pkt_len, transport_off, tunnel_off);
@@ -686,11 +686,11 @@ static int l4_udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_d
     tunnel_off = 14 + ip_hdr_len + L4_WIRE_PORT_LEN;
     if (pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
         return 0;
-    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1 >= (int)pkt_len)
+    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2 >= (int)pkt_len)
         return 0;
-    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] != L4_FRAG_MAGIC)
+    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] != L4_FRAG_MAGIC)
         return 0;
-    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES];
+    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1];
     if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L4, CRYPTO_MODE_PQC, 256, wire_pol))
         return 0;
     opt_read_frag_tag(pkt_data + tunnel_off + L4_TUNNEL_HDR_SIZE, pkt_id, frag_index);
