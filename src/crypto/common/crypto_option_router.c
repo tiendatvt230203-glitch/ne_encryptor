@@ -61,16 +61,14 @@ int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_
         et = (uint16_t)(((uint16_t)pkt[et_off] << 8) | pkt[et_off + 1]);
         if (et == NE_L2_FAKE_ETHERTYPE) {
             int pol_off = et_off + 2;
-            int frag_off;
 
             if (pkt_len < (uint32_t)(pol_off + 1))
                 return -1;
             out->layer = CRYPTO_WIRE_L2;
             out->policy_id = pkt[pol_off];
-            frag_off = crypto_eth_l2_frag_magic_off(pkt, pkt_len, ns);
-            if (frag_off >= 0 && pkt_len > (uint32_t)frag_off &&
-                pkt[frag_off] == L2_FRAG_MAGIC)
-                out->is_frag = 1;
+            /* L2 frag magic sits at ciphertext start — never set is_frag here
+             * (false positives ~1/256). Decrypt-first in wan_ingress. */
+            (void)ns;
             return 0;
         }
     }

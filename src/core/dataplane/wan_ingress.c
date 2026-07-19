@@ -77,6 +77,59 @@ static int reassemble_layer(crypto_wire_layer layer,
     return 0;
 }
 
+static int decrypt_wan_l2(struct forwarder *fwd, struct ne_packet *job,
+                          const struct crypto_wire_info *wi)
+{
+    uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
+    uint32_t len = job->len;
+    struct packet_crypto_ctx *ctx;
+    crypto_option_id opt;
+    uint8_t backup[NE_FRAME];
+    uint32_t backup_len;
+    int pending = 0;
+    int maybe_frag = 0;
+    int frag_off;
+
+    (void)fwd;
+    if (!pkt || len > NE_FRAME)
+        return -1;
+    if (wire_resolve_opt(CRYPTO_WIRE_L2, wi->policy_id, &opt, &ctx) != 0)
+        return -1;
+
+    frag_off = crypto_eth_l2_frag_magic_off(pkt, len, PACKET_CRYPTO_NONCE_BYTES);
+    if (frag_off >= 0 && len > (uint32_t)frag_off &&
+        pkt[frag_off] == L2_FRAG_MAGIC)
+        maybe_frag = 1;
+
+    backup_len = len;
+    if (maybe_frag)
+        memcpy(backup, pkt, backup_len);
+
+    /* Decrypt-first: L2 frag magic overlaps ciphertext — never trust is_frag. */
+    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) == 0 &&
+        wan_l2_plain_ipv4(pkt, len)) {
+        job->len = len;
+        return 0;
+    }
+
+    if (!maybe_frag)
+        return -1;
+
+    memcpy(pkt, backup, backup_len);
+    len = backup_len;
+
+    if (reassemble_layer(CRYPTO_WIRE_L2, wi->policy_id, pkt, &len, &pending) == 0) {
+        if (pending)
+            return 1;
+        job->len = len;
+        return 0;
+    }
+
+    memcpy(pkt, backup, backup_len);
+    job->len = backup_len;
+    return -1;
+}
+
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
                        const struct crypto_wire_info *wi_in)
 {
@@ -99,6 +152,9 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
         return 0;
     }
 
+    if (wi.layer == CRYPTO_WIRE_L2)
+        return decrypt_wan_l2(fwd, job, &wi);
+
     if (wi.is_frag) {
         if (reassemble_layer(wi.layer, wi.policy_id, pkt, &len, &pending) == 0) {
             if (pending)
@@ -106,15 +162,12 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
             job->len = len;
             return 0;
         }
-        if (wi.layer != CRYPTO_WIRE_L2)
-            return -1;
+        return -1;
     }
 
     if (wire_resolve_opt(wi.layer, wi.policy_id, &opt, &ctx) != 0)
         return -1;
     if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
-        return -1;
-    if (wi.layer == CRYPTO_WIRE_L2 && !wan_l2_plain_ipv4(pkt, len))
         return -1;
 
     job->len = len;
@@ -248,64 +301,91 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
     return best_pi;
 }
 
-static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
+static int wan_tcp_is_syn(const uint8_t *pkt, uint32_t len)
 {
-    uint32_t src_ip = 0, dst_ip = 0;
-    uint16_t src_port = 0, dst_port = 0;
-    uint8_t proto = 0;
-    const struct crypto_policy *best = NULL;
-    int best_pri = 0x7fffffff;
-    int best_id = 0x7fffffff;
+    int l3_off;
+    const uint8_t *ip;
+    uint32_t ihl;
 
-    if (!fwd || !pkt || !fwd->cfg)
-        return;
-    if (dp_parse_flow(pkt, len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
-        return;
-    if (proto != IPPROTO_TCP)
-        return;
-
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *prof = &fwd->cfg->profiles[pi];
-        const struct crypto_policy *cp;
-
-        if (!prof->enabled)
-            continue;
-        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
-        if (!cp || cp->action == POLICY_ACTION_BYPASS)
-            continue;
-        if (!best || cp->priority < best_pri ||
-            (cp->priority == best_pri && cp->id < best_id)) {
-            best = cp;
-            best_pri = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    if (!best)
-        return;
-    (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
-                               crypto_option_wire_overhead(crypto_option_from_policy(best)));
+    l3_off = crypto_eth_ipv4_offset(pkt, len);
+    if (l3_off < 0)
+        return 0;
+    if (len < (uint32_t)(l3_off + 20))
+        return 0;
+    ip = pkt + l3_off;
+    if ((ip[0] & 0xF0) != 0x40 || ip[9] != IPPROTO_TCP)
+        return 0;
+    ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
+    if (ihl < 20 || len < (uint32_t)(l3_off + ihl + 14))
+        return 0;
+    return (ip[ihl + 13] & 0x02) != 0;
 }
 
-static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
+static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len,
+                              const struct crypto_wire_info *wi)
 {
-    struct crypto_wire_info wi;
+    const struct crypto_policy *best = NULL;
+    crypto_option_id opt;
 
     if (!fwd || !pkt || !fwd->cfg)
-        return -1;
-    if (crypto_wire_detach(pkt, len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE)
-        return profile_pi_for_wire_policy(fwd, wi.policy_id);
-    return wan_profile_pi_bypass(fwd, pkt, len);
+        return;
+    if (!wan_tcp_is_syn(pkt, len))
+        return;
+
+    if (wi && wi->layer != CRYPTO_WIRE_NONE) {
+        best = fwd_crypto_policy_for_wire_id(wi->policy_id);
+        if (!best || best->action == POLICY_ACTION_BYPASS)
+            return;
+        opt = crypto_option_from_policy(best);
+        (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
+                                   crypto_option_wire_overhead(opt));
+        return;
+    }
+
+    {
+        uint32_t src_ip = 0, dst_ip = 0;
+        uint16_t src_port = 0, dst_port = 0;
+        uint8_t proto = 0;
+        int best_pri = 0x7fffffff;
+        int best_id = 0x7fffffff;
+
+        if (dp_parse_flow(pkt, len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
+            return;
+        if (proto != IPPROTO_TCP)
+            return;
+
+        for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+            const struct profile_config *prof = &fwd->cfg->profiles[pi];
+            const struct crypto_policy *cp;
+
+            if (!prof->enabled)
+                continue;
+            cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
+                                             src_port, dst_port, proto);
+            if (!cp || cp->action == POLICY_ACTION_BYPASS)
+                continue;
+            if (!best || cp->priority < best_pri ||
+                (cp->priority == best_pri && cp->id < best_id)) {
+                best = cp;
+                best_pri = cp->priority;
+                best_id = cp->id;
+            }
+        }
+        if (!best)
+            return;
+        (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
+                                   crypto_option_wire_overhead(crypto_option_from_policy(best)));
+    }
 }
 
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
-                                const uint8_t *wire_pkt, uint32_t wire_len)
+                                const struct crypto_wire_info *wi)
 {
     uint8_t *pkt;
     int profile_pi;
     int li;
 
-    if (!fwd || !job || !wire_pkt || wire_len < 14u)
+    if (!fwd || !job)
         return -1;
     pkt = ne_packet_data(&fwd->pair, job->addr);
     if (!pkt || job->len < 14u)
@@ -313,7 +393,10 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (!eth_dmac_is_unicast(pkt))
         return -1;
 
-    profile_pi = wan_profile_pi(fwd, wire_pkt, wire_len);
+    if (wi && wi->layer != CRYPTO_WIRE_NONE)
+        profile_pi = profile_pi_for_wire_policy(fwd, wi->policy_id);
+    else
+        profile_pi = wan_profile_pi_bypass(fwd, pkt, job->len);
     if (profile_pi < 0)
         return -1;
 
@@ -330,20 +413,18 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    uint8_t wire_buf[NE_FRAME];
-    uint32_t wire_len;
     int dec;
     struct crypto_wire_info wi;
+    int have_wire = 0;
 
     if (!fwd || !pkt)
         goto drop;
 
-    wire_len = job.len;
-    if (wire_len < 14u || wire_len > NE_FRAME)
+    if (job.len < 14u || job.len > NE_FRAME)
         goto drop;
-    memcpy(wire_buf, pkt, wire_len);
 
     if (crypto_wire_detach(pkt, job.len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE) {
+        have_wire = 1;
         if (!fwd->cfg->crypto_enabled)
             goto drop;
         dec = decrypt_wan(fwd, &job, &wi);
@@ -353,13 +434,16 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec != 0)
             goto drop;
-        wan_clamp_tcp_mss(fwd, pkt, job.len);
+        wan_clamp_tcp_mss(fwd, pkt, job.len, &wi);
     } else {
+        wi.layer = CRYPTO_WIRE_NONE;
+        wi.policy_id = 0;
+        wi.is_frag = 0;
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
     }
 
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
+    if (forward_wan_to_local(fwd, &job, have_wire ? &wi : NULL) != 0)
         goto drop;
     ne_dp_stats_wan_fwd(1);
     return;
