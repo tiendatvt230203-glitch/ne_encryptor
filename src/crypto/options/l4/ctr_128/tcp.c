@@ -26,13 +26,9 @@ static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 {
-    if (buf[nonce_size + 2] != L4_TUNNEL_MAGIC)
-        return 0;
-    if ((buf[0] & 0x80) != 0)
-        return 0;
-    return 1;
+    /* L4 wire marker only — L2/L3 (incl. IP totlen) untouched. */
+    return buf[nonce_size + 2] == L4_TUNNEL_MAGIC;
 }
-
 
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int plain_off, size_t plain_len)
@@ -46,6 +42,9 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     int tunnel_off = plain_off;
     int enc_off = tunnel_off + L4_TUNNEL_HDR_SIZE;
     uint8_t iv[AES128_IV_SIZE];
+
+    if (pkt_len + (size_t)L4_TUNNEL_HDR_SIZE > NE_FRAME)
+        return -1;
 
     crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);
     memmove(packet + enc_off, packet + plain_off, plain_len);

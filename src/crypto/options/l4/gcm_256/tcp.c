@@ -25,11 +25,8 @@ static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 {
-    if (buf[nonce_size + 2] != L4_TUNNEL_MAGIC)
-        return 0;
-    if ((buf[0] & 0x80) != 0)
-        return 0;
-    return 1;
+    /* L4 wire marker only — L2/L3 (incl. IP totlen) untouched. */
+    return buf[nonce_size + 2] == L4_TUNNEL_MAGIC;
 }
 
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
