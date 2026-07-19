@@ -138,7 +138,10 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
     struct crypto_wire_info wi;
     struct packet_crypto_ctx *ctx;
     crypto_option_id opt;
+    crypto_proto_class pclass;
     int pending = 0;
+    int l3_off;
+    uint8_t ip_proto;
 
     if (!fwd || !pkt || !job)
         return -1;
@@ -167,7 +170,21 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
 
     if (wire_resolve_opt(wi.layer, wi.policy_id, &opt, &ctx) != 0)
         return -1;
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
+
+    /* L2/L3 share one wire shape (fake et / fake proto) → TCP ops.
+     * L4 keeps real IP proto (6/17/1) → must pick matching ops. */
+    pclass = CRYPTO_PROTO_TCP;
+    if (wi.layer == CRYPTO_WIRE_L4) {
+        l3_off = crypto_eth_ipv4_offset(pkt, len);
+        if (l3_off < 0 || len < (uint32_t)(l3_off + 10))
+            return -1;
+        ip_proto = pkt[l3_off + 9];
+        pclass = crypto_proto_classify(ip_proto);
+        if (pclass == CRYPTO_PROTO_OTHER)
+            return -1;
+    }
+
+    if (crypto_option_decrypt(opt, pclass, ctx, pkt, &len) != 0)
         return -1;
 
     job->len = len;
