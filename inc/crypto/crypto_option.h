@@ -14,13 +14,28 @@
 
 #define L4_WIRE_PORT_LEN 4
 #define L3_FAKE_PROTOCOL 99
-
-/* --- worker bind (forwarder sets once per crypto thread) --- */
+#define L2_FRAG_MAGIC    0x5B
+#define L3_FRAG_MAGIC    0x5C
+#define L4_TUNNEL_MAGIC  0xA5
+#define L4_FRAG_MAGIC    0x5A
 
 void crypto_option_bind_worker_idx(uint8_t worker_idx);
 uint8_t crypto_option_worker_idx(void);
 
-/* --- ingress: extract policy id from wire --- */
+typedef enum {
+    CRYPTO_WIRE_NONE = 0,
+    CRYPTO_WIRE_L2 = 2,
+    CRYPTO_WIRE_L3 = 3,
+    CRYPTO_WIRE_L4 = 4
+} crypto_wire_layer;
+
+struct crypto_wire_info {
+    crypto_wire_layer layer;
+    uint8_t policy_id;
+    uint8_t is_frag;
+};
+
+int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_info *out);
 
 int crypto_l3_extract_policy_id(const struct app_config *cfg,
                                 uint8_t *pkt,

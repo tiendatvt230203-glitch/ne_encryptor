@@ -14,86 +14,56 @@
 #include <netinet/in.h>
 #include <string.h>
 
-static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id)
-{
-    if (!fwd || !fwd->cfg)
-        return NULL;
-    for (int i = 0; i < fwd->cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
-        const struct crypto_policy *cp = &fwd->cfg->policies[i];
-        if (cp->action == action && (uint8_t)cp->id == wire_id)
-            return cp;
-    }
-    return NULL;
-}
-
-
 static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
 {
     return crypto_pkt_is_ipv4(pkt, len);
 }
 
-/* Encrypted NE wire: L2 marker / L3 fake-proto / L4 tunnel / frag — not plain bypass. */
-static int wan_wire_is_encrypted(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
+static int wire_action_for_layer(crypto_wire_layer layer)
 {
-    uint16_t pid = 0;
-    uint8_t fidx = 0;
-    uint8_t pol = 0;
-
-    if (!pkt || !fwd || !fwd->cfg)
-        return 0;
-    if (fwd_crypto_has_l2_marker(pkt, len))
-        return 1;
-    if (crypto_option_is_any_fragment(fwd->cfg, pkt, len, &pid, &fidx))
-        return 1;
-    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return 1;
-    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return 1;
-    return 0;
+    if (layer == CRYPTO_WIRE_L2)
+        return POLICY_ACTION_ENCRYPT_L2;
+    if (layer == CRYPTO_WIRE_L3)
+        return POLICY_ACTION_ENCRYPT_L3;
+    if (layer == CRYPTO_WIRE_L4)
+        return POLICY_ACTION_ENCRYPT_L4;
+    return POLICY_ACTION_BYPASS;
 }
 
-static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
+static int wire_resolve_opt(crypto_wire_layer layer, uint8_t policy_id,
+                            crypto_option_id *opt_out, struct packet_crypto_ctx **ctx_out)
 {
-    struct packet_crypto_ctx *ctx;
     const struct crypto_policy *cp;
-    crypto_option_id opt;
-    uint8_t wire_id = 0;
+    struct packet_crypto_ctx *ctx;
+    int want = wire_action_for_layer(layer);
 
-    if (!pkt || !len)
-        return 0;
-    if (!crypto_eth_l2_has_marker(pkt, *len))
-        return 0;
-    if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_id) != 0)
-        return 0;
-    ctx = fwd_crypto_ctx_for_wire_id(wire_id);
+    if (!opt_out || !ctx_out || want == POLICY_ACTION_BYPASS)
+        return -1;
+    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
     if (!ctx)
         return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) != 0)
+    cp = fwd_crypto_policy_for_wire_id(policy_id);
+    if (!cp || cp->action != want)
         return -1;
+    *ctx_out = ctx;
+    *opt_out = crypto_option_from_policy(cp);
     return 0;
 }
 
-static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
-                         uint8_t policy_id, int *pending)
+static int reassemble_layer(crypto_wire_layer layer,
+                            uint8_t policy_id, uint8_t *pkt, uint32_t *len, int *pending)
 {
     struct packet_crypto_ctx *ctx;
-    const struct crypto_policy *cp;
     crypto_option_id opt;
     int slot, rr;
     uint8_t buf[4096];
     uint32_t blen = 0;
 
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
-    if (!ctx)
+    if (wire_resolve_opt(layer, policy_id, &opt, &ctx) != 0)
         return -1;
-    slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
+    slot = fwd_crypto_profile_slot_for_id(fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, policy_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
     rr = crypto_option_reassemble(opt, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
                                   ctx, pkt, len, buf, &blen);
     if (rr == 0) {
@@ -107,168 +77,45 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
     return 0;
 }
 
-static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
-                         uint8_t policy_id, int *pending)
+static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job,
+                       const struct crypto_wire_info *wi_in)
 {
-    struct packet_crypto_ctx *ctx;
-    const struct crypto_policy *cp;
-    crypto_option_id opt;
-    int slot, rr;
-    uint8_t buf[4096];
-    uint32_t blen = 0;
-
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
-    if (!ctx)
-        return -1;
-    slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
-    if (slot < 0)
-        return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L3_GCM128;
-    rr = crypto_option_reassemble(opt, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
-                                  ctx, pkt, len, buf, &blen);
-    if (rr == 0) {
-        *pending = 1;
-        return 0;
-    }
-    if (rr != 1)
-        return -1;
-    memcpy(pkt, buf, blen);
-    *len = blen;
-    return 0;
-}
-
-static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
-                         uint8_t policy_id, int *pending)
-{
-    struct packet_crypto_ctx *ctx;
-    const struct crypto_policy *cp;
-    crypto_option_id opt;
-    int slot, rr;
-    uint8_t buf[4096];
-    uint32_t blen = 0;
-
-    ctx = fwd_crypto_ctx_for_wire_id(policy_id);
-    if (!ctx)
-        return -1;
-    slot = fwd_crypto_profile_slot_for_id(
-        fwd_crypto_profile_id_for_wire_id(policy_id));
-    if (slot < 0)
-        return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L4, policy_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L4_GCM128;
-    rr = crypto_option_reassemble(opt, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
-                                  ctx, pkt, len, buf, &blen);
-    if (rr == 0) {
-        *pending = 1;
-        return 0;
-    }
-    if (rr != 1)
-        return -1;
-    memcpy(pkt, buf, blen);
-    *len = blen;
-    return 0;
-}
-
-static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
-{
-    uint8_t scratch[8192];
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
-    uint16_t pid = 0;
-    uint8_t fidx = 0;
-    uint8_t pol = 0;
+    struct crypto_wire_info wi;
+    struct packet_crypto_ctx *ctx;
+    crypto_option_id opt;
     int pending = 0;
 
     if (!fwd || !pkt || !job)
         return -1;
-    /* Caller must only invoke this for encrypted wire; plain bypass never enters. */
-    if (!wan_wire_is_encrypted(fwd, pkt, len))
+    if (wi_in) {
+        wi = *wi_in;
+    } else if (crypto_wire_detach(pkt, len, &wi) != 0 || wi.layer == CRYPTO_WIRE_NONE) {
         return 0;
-
-    {
-        int frag_mark = 0;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int mark_off;
-        uint32_t orig_len = len;
-        uint8_t wire_pol = 0;
-
-        mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
-        if (mark_off >= 0 && len > (uint32_t)mark_off)
-            frag_mark = (pkt[mark_off] == 0x5B);
-
-        int need_backup = frag_mark ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx);
-        if (need_backup && orig_len <= sizeof(scratch))
-            memcpy(scratch, pkt, orig_len);
-        if (decrypt_l2(fwd, pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
-            if (need_backup)
-                memcpy(pkt, scratch, orig_len);
-            len = orig_len;
-            if (crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-                crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-                crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-                crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-                crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0)
-                    return -1;
-                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0)
-                    return -1;
-            } else {
-                return -1;
-            }
-        }
     }
-    if (pending)
-        return 1;
-
     if (!fwd->cfg->crypto_enabled) {
         job->len = len;
         return 0;
     }
 
-    if (crypto_option_is_fragment(CRYPTO_OPT_L3_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L3_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L3_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L3_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L3_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) != 0)
-            return -1;
-        if (reassemble_l3(fwd, pkt, &len, pol, &pending) != 0)
-            return -1;
-    } else if (crypto_l3_extract_policy_id(fwd->cfg, pkt, len, &pol) == 0) {
-        const struct crypto_policy *cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L3, pol);
-        struct packet_crypto_ctx *ctx = fwd_crypto_ctx_for_wire_id(pol);
-        crypto_option_id opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L3_GCM128;
-        if (!ctx || crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
+    if (wi.is_frag) {
+        if (reassemble_layer(wi.layer, wi.policy_id, pkt, &len, &pending) == 0) {
+            if (pending)
+                return 1;
+            job->len = len;
+            return 0;
+        }
+        if (wi.layer != CRYPTO_WIRE_L2)
             return -1;
     }
-    if (pending)
-        return 1;
 
-    if (crypto_option_is_fragment(CRYPTO_OPT_L4_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L4_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L4_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L4_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-        crypto_option_is_fragment(CRYPTO_OPT_L4_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
-        if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) != 0)
-            return -1;
-        if (reassemble_l4(fwd, pkt, &len, pol, &pending) != 0)
-            return -1;
-    } else if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, len, &pol) == 0) {
-        const struct crypto_policy *cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L4, pol);
-        struct packet_crypto_ctx *ctx = fwd_crypto_ctx_for_wire_id(pol);
-        crypto_option_id opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L4_GCM128;
-        if (!ctx || crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
-            return -1;
-    }
-    if (pending)
-        return 1;
+    if (wire_resolve_opt(wi.layer, wi.policy_id, &opt, &ctx) != 0)
+        return -1;
+    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
+        return -1;
+    if (wi.layer == CRYPTO_WIRE_L2 && !wan_l2_plain_ipv4(pkt, len))
+        return -1;
 
     job->len = len;
     return 0;
@@ -442,21 +289,12 @@ static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
 
 static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
-    uint8_t pol = 0;
+    struct crypto_wire_info wi;
 
     if (!fwd || !pkt || !fwd->cfg)
         return -1;
-    if (fwd_crypto_has_l2_marker(pkt, len)) {
-        uint8_t wire_pol = 0;
-
-        if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0)
-            return -1;
-        return profile_pi_for_wire_policy(fwd, wire_pol);
-    }
-    if (crypto_l3_extract_policy_id(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, pol);
-    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, (uint8_t *)pkt, len, &pol) == 0)
-        return profile_pi_for_wire_policy(fwd, pol);
+    if (crypto_wire_detach(pkt, len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE)
+        return profile_pi_for_wire_policy(fwd, wi.policy_id);
     return wan_profile_pi_bypass(fwd, pkt, len);
 }
 
@@ -495,7 +333,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint8_t wire_buf[NE_FRAME];
     uint32_t wire_len;
     int dec;
-    int encrypted;
+    struct crypto_wire_info wi;
 
     if (!fwd || !pkt)
         goto drop;
@@ -505,11 +343,10 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 
-    encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
-    if (encrypted) {
+    if (crypto_wire_detach(pkt, job.len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE) {
         if (!fwd->cfg->crypto_enabled)
             goto drop;
-        dec = decrypt_wan(fwd, &job);
+        dec = decrypt_wan(fwd, &job, &wi);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
             return;
@@ -518,7 +355,6 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
-        /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
     }

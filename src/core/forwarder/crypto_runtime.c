@@ -325,6 +325,20 @@ int fwd_crypto_profile_id_for_wire_id(uint8_t wire_id)
     return -1;
 }
 
+const struct crypto_policy *fwd_crypto_policy_for_wire_id(uint8_t wire_id)
+{
+    fwd_crypto_maybe_expire_prev_grace();
+    int pi = policy_index_by_wire_id[wire_id];
+    if (pi >= 0 && pi < active_policy_count)
+        return &active_policies[pi];
+    if (prev_grace_active) {
+        int ppi = prev_policy_index_by_wire_id[wire_id];
+        if (ppi >= 0 && ppi < prev_active_policy_count)
+            return &prev_active_policies[ppi];
+    }
+    return NULL;
+}
+
 int fwd_crypto_flow_table_ready(int slot)
 {
     if (slot < 0 || slot >= MAX_PROFILES)

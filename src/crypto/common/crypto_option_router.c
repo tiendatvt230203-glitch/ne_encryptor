@@ -33,46 +33,105 @@ crypto_proto_class crypto_proto_classify(uint8_t ip_proto)
     return CRYPTO_PROTO_OTHER;
 }
 
-/* ===================== ingress policy extract ===================== */
+static int wire_l4_magic(uint8_t b)
+{
+    return b == L4_TUNNEL_MAGIC || b == L4_FRAG_MAGIC;
+}
+
+int crypto_wire_detach(const uint8_t *pkt, uint32_t pkt_len, struct crypto_wire_info *out)
+{
+    int et_off;
+    uint16_t et;
+    int l3_off;
+    int ip_hdr_len;
+    uint8_t ip_proto;
+    int tunnel_off;
+    const int ns = PACKET_CRYPTO_NONCE_BYTES;
+
+    if (!out)
+        return -1;
+    out->layer = CRYPTO_WIRE_NONE;
+    out->policy_id = 0;
+    out->is_frag = 0;
+    if (!pkt || pkt_len < 14)
+        return -1;
+
+    et_off = crypto_eth_inner_et_off(pkt, pkt_len);
+    if (et_off >= 0) {
+        et = (uint16_t)(((uint16_t)pkt[et_off] << 8) | pkt[et_off + 1]);
+        if (et == NE_L2_FAKE_ETHERTYPE) {
+            int pol_off = et_off + 2;
+            int frag_off;
+
+            if (pkt_len < (uint32_t)(pol_off + 1))
+                return -1;
+            out->layer = CRYPTO_WIRE_L2;
+            out->policy_id = pkt[pol_off];
+            frag_off = crypto_eth_l2_frag_magic_off(pkt, pkt_len, ns);
+            if (frag_off >= 0 && pkt_len > (uint32_t)frag_off &&
+                pkt[frag_off] == L2_FRAG_MAGIC)
+                out->is_frag = 1;
+            return 0;
+        }
+    }
+
+    l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
+    if (l3_off < 0)
+        return -1;
+    if (pkt_len < (uint32_t)(l3_off + 20))
+        return -1;
+    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
+    if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len))
+        return -1;
+    ip_proto = pkt[l3_off + 9];
+
+    if (ip_proto == L3_FAKE_PROTOCOL) {
+        tunnel_off = l3_off + ip_hdr_len;
+        if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
+            return -1;
+        out->layer = CRYPTO_WIRE_L3;
+        out->policy_id = pkt[tunnel_off + ns];
+        if (pkt[tunnel_off + ns + 1] == L3_FRAG_MAGIC)
+            out->is_frag = 1;
+        return 0;
+    }
+
+    if (ip_proto == 6 || ip_proto == 17 || ip_proto == 1) {
+        tunnel_off = l3_off + ip_hdr_len + L4_WIRE_PORT_LEN;
+        if (pkt_len < (uint32_t)(tunnel_off + ns + 2))
+            return -1;
+        if (pkt_len > (uint32_t)(tunnel_off + ns + 2) &&
+            wire_l4_magic(pkt[tunnel_off + ns + 2])) {
+            out->layer = CRYPTO_WIRE_L4;
+            out->policy_id = pkt[tunnel_off + ns + 1];
+            out->is_frag = (pkt[tunnel_off + ns + 2] == L4_FRAG_MAGIC);
+            return 0;
+        }
+        if (wire_l4_magic(pkt[tunnel_off + ns + 1])) {
+            out->layer = CRYPTO_WIRE_L4;
+            out->policy_id = pkt[tunnel_off + ns];
+            out->is_frag = (pkt[tunnel_off + ns + 1] == L4_FRAG_MAGIC);
+            return 0;
+        }
+    }
+
+    return -1;
+}
 
 int crypto_l3_extract_policy_id(const struct app_config *cfg,
                                 uint8_t *pkt,
                                 uint32_t pkt_len,
                                 uint8_t *policy_id_out)
 {
-    const int tunnel_hdr_size = PACKET_CRYPTO_NONCE_BYTES + 2;
+    struct crypto_wire_info wi;
 
-    if (!cfg || !pkt || !policy_id_out || pkt_len < 14 + 20)
+    (void)cfg;
+    if (!pkt || !policy_id_out)
         return -1;
-
-    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800)
+    if (crypto_wire_detach(pkt, pkt_len, &wi) != 0 || wi.layer != CRYPTO_WIRE_L3)
         return -1;
-
-    int l3_off = 14;
-    int ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
-        return -1;
-
-    if (pkt[l3_off + 9] != L3_FAKE_PROTOCOL)
-        return -1;
-
-    int tunnel_off = l3_off + ip_hdr_len;
-    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size))
-        return -1;
-
-    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-        const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3)
-            continue;
-        const int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 1 >= (int)pkt_len)
-            continue;
-        if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
-            continue;
-        *policy_id_out = (uint8_t)cp->id;
-        return 0;
-    }
-    return -1;
+    *policy_id_out = wi.policy_id;
+    return 0;
 }
 
 int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
@@ -80,57 +139,15 @@ int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
                                       uint32_t pkt_len,
                                       uint8_t *policy_id_out)
 {
-    if (!cfg || !pkt || !policy_id_out)
-        return -1;
+    struct crypto_wire_info wi;
 
-    int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
-    if (l3_off < 0)
+    (void)cfg;
+    if (!pkt || !policy_id_out)
         return -1;
-    if (pkt_len < (uint32_t)(l3_off + 20))
+    if (crypto_wire_detach(pkt, pkt_len, &wi) != 0 || wi.layer != CRYPTO_WIRE_L4)
         return -1;
-
-    uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
-        return -1;
-
-    uint8_t ip_proto = pkt[l3_off + 9];
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return -1;
-    int transport_off = l3_off + ip_hdr_len;
-    if (transport_off >= (int)pkt_len)
-        return -1;
-
-    int tunnel_off = transport_off + L4_WIRE_PORT_LEN;
-    if (tunnel_off >= (int)pkt_len)
-        return -1;
-
-    /* New: nonce|core|policy|marker ; Old: nonce|policy|magic (UDP/ICMP chưa đổi) */
-    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-        const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4)
-            continue;
-        const int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 2 < (int)pkt_len) {
-            uint8_t marker = pkt[tunnel_off + ns + 2];
-            if ((marker == 0xA5 || marker == 0x5A) &&
-                pkt[tunnel_off + ns + 1] == (uint8_t)cp->id) {
-                *policy_id_out = (uint8_t)cp->id;
-                return 0;
-            }
-        }
-        if (tunnel_off + ns + 1 < (int)pkt_len) {
-            uint8_t magic = pkt[tunnel_off + ns + 1];
-            if ((magic == 0xA5 || magic == 0x5A) &&
-                pkt[tunnel_off + ns] == (uint8_t)cp->id) {
-                *policy_id_out = (uint8_t)cp->id;
-                return 0;
-            }
-        }
-    }
-
-    return -1;
+    *policy_id_out = wi.policy_id;
+    return 0;
 }
 
 /* ===================== option router ===================== */
@@ -290,14 +307,16 @@ int crypto_option_is_any_fragment(const struct app_config *cfg,
                                   const uint8_t *pkt_data, uint32_t pkt_len,
                                   uint16_t *pkt_id, uint8_t *frag_index)
 {
-    for (int i = 0; i < CRYPTO_OPT_COUNT; i++) {
-        if (i == CRYPTO_OPT_BYPASS)
-            continue;
-        if (crypto_option_is_fragment((crypto_option_id)i, CRYPTO_PROTO_UDP,
-                                      cfg, pkt_data, pkt_len, pkt_id, frag_index))
-            return 1;
-    }
-    return 0;
+    struct crypto_wire_info wi;
+
+    (void)cfg;
+    if (crypto_wire_detach(pkt_data, pkt_len, &wi) != 0 || !wi.is_frag)
+        return 0;
+    if (pkt_id)
+        *pkt_id = 0;
+    if (frag_index)
+        *frag_index = 0;
+    return 1;
 }
 
 void crypto_option_frag_gc(crypto_option_id id, crypto_proto_class proto,

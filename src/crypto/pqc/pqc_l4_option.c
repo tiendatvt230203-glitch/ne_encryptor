@@ -269,7 +269,6 @@ static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce, int 
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 {
-    /* L4 wire marker only — L2/L3 (incl. IP totlen) untouched. */
     return buf[nonce_size + 2] == L4_TUNNEL_MAGIC;
 }
 
