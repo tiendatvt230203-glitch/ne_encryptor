@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <strings.h>
+#include <net/if.h>
 #include <openssl/sha.h>
 #include "../../inc/crypto/pqc_handshake.h"
 
@@ -330,151 +331,6 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
     }
 }
 
-static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_config *p,
-                                       int local_idx, int wan_cfg_idx, const char *bridge_id)
-{
-    int wan_dp;
-
-    if (local_idx < 0 || wan_cfg_idx < 0)
-        return;
-    if (p->bridge_count >= MAX_BRIDGES_PER_PROFILE) {
-        fprintf(stderr,
-                "[DB] profile \"%s\": bridge %s skipped — MAX_BRIDGES_PER_PROFILE reached\n",
-                p->name, bridge_id ? bridge_id : "?");
-        return;
-    }
-
-    wan_dp = config_wan_cfg_to_dp(cfg, wan_cfg_idx);
-    if (wan_dp < 0) {
-        fprintf(stderr,
-                "[DB] profile \"%s\": bridge %s WAN not on dataplane — skipped\n",
-                p->name, bridge_id ? bridge_id : "?");
-        return;
-    }
-
-    p->bridges[p->bridge_count].local_idx = local_idx;
-    p->bridges[p->bridge_count].wan_dp = wan_dp;
-    p->bridge_count++;
-}
-
-static void profile_load_bridges(struct app_config *cfg, struct profile_config *p,
-                                 PGconn *conn, int profile_id)
-{
-    char id_str[32];
-    const char *params[1];
-    PGresult *res;
-    int rows;
-    int col_bridge;
-    int col_ifname;
-    int col_tag;
-    char cur_bridge[64];
-    int cur_local = -1;
-    int cur_wan_cfg = -1;
-
-    if (!cfg || !p || !conn)
-        return;
-
-    snprintf(id_str, sizeof(id_str), "%d", profile_id);
-    params[0] = id_str;
-
-    res = PQexecParams(conn,
-        "SELECT pbr.bridge_id::text AS bridge_id, bi.ifname, bi.tag "
-        "FROM profile_bridge_ref pbr "
-        "JOIN bridge_interfaces bi ON bi.bridge_id = pbr.bridge_id "
-        "WHERE pbr.profile_id = $1 "
-        "ORDER BY pbr.bridge_id, bi.tag",
-        1, NULL, params, NULL, NULL, 0);
-
-    if (!res) {
-        fprintf(stderr, "[DB] profile \"%s\": bridge query failed\n", p->name);
-        return;
-    }
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] profile \"%s\": bridge query error: %s\n",
-                p->name, PQresultErrorMessage(res));
-        PQclear(res);
-        return;
-    }
-
-    col_bridge = PQfnumber(res, "bridge_id");
-    col_ifname = PQfnumber(res, "ifname");
-    col_tag = PQfnumber(res, "tag");
-    if (col_bridge < 0 || col_ifname < 0 || col_tag < 0) {
-        fprintf(stderr, "[DB] profile \"%s\": bridge row missing columns\n", p->name);
-        PQclear(res);
-        return;
-    }
-
-    cur_bridge[0] = '\0';
-    rows = PQntuples(res);
-    for (int r = 0; r < rows; r++) {
-        const char *bridge_id = PQgetvalue(res, r, col_bridge);
-        const char *ifname = PQgetvalue(res, r, col_ifname);
-        const char *tag = PQgetvalue(res, r, col_tag);
-        int li;
-        int wi;
-
-        if (!bridge_id || !ifname || !tag)
-            continue;
-
-        if (cur_bridge[0] != '\0' && strcmp(cur_bridge, bridge_id) != 0) {
-            profile_commit_bridge_pair(cfg, p, cur_local, cur_wan_cfg, cur_bridge);
-            cur_local = -1;
-            cur_wan_cfg = -1;
-        }
-        strncpy(cur_bridge, bridge_id, sizeof(cur_bridge) - 1);
-        cur_bridge[sizeof(cur_bridge) - 1] = '\0';
-
-        if (strcasecmp(tag, "LAN") == 0) {
-            li = find_local_index_by_ifname(cfg, ifname);
-            if (li < 0) {
-                fprintf(stderr,
-                        "[DB] profile \"%s\": bridge %s LAN %s not in ne_lan — skipped\n",
-                        p->name, bridge_id, ifname);
-                continue;
-            }
-            if (cur_local >= 0) {
-                fprintf(stderr,
-                        "[DB] profile \"%s\": bridge %s has multiple LAN — ignored %s\n",
-                        p->name, bridge_id, ifname);
-                continue;
-            }
-            cur_local = li;
-        } else if (strcasecmp(tag, "WAN") == 0) {
-            wi = find_wan_index_by_ifname(cfg, ifname);
-            if (wi < 0) {
-                fprintf(stderr,
-                        "[DB] profile \"%s\": bridge %s WAN %s not in ne_wan — skipped\n",
-                        p->name, bridge_id, ifname);
-                continue;
-            }
-            if (cur_wan_cfg >= 0) {
-                fprintf(stderr,
-                        "[DB] profile \"%s\": bridge %s has multiple WAN — ignored %s\n",
-                        p->name, bridge_id, ifname);
-                continue;
-            }
-            cur_wan_cfg = wi;
-        } else {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": bridge %s tag=%s unsupported — skipped\n",
-                    p->name, bridge_id, tag);
-        }
-    }
-
-    if (cur_bridge[0] != '\0')
-        profile_commit_bridge_pair(cfg, p, cur_local, cur_wan_cfg, cur_bridge);
-
-    if (p->bridge_enable && p->bridge_count == 0) {
-        fprintf(stderr,
-                "[DB] profile \"%s\": bridge_enable=true but no valid 1:1 bridge pairs loaded\n",
-                p->name);
-    }
-
-    PQclear(res);
-}
-
-
 static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int profile_id) {
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%d", profile_id);
@@ -524,9 +380,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         1, NULL, params, NULL, NULL, 0);
     profile_append_locals_from_rows(cfg, p, res);
     PQclear(res);
-
-    if (p->bridge_enable)
-        profile_load_bridges(cfg, p, conn, profile_id);
 
     res = PQexecParams(conn,
         "SELECT id, priority, action, proto, "

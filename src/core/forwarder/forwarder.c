@@ -2,6 +2,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/forwarder_reload.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
+#include "../../../inc/core/kernel_bridge.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane.h"
 #include "../../../inc/core/crypto_route.h"
@@ -383,6 +384,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
     fwd->wan_count = config_count_dataplane_wans(cfg);
+
+    /* Capture kernel br LAN<->WAN pairs before detach; userspace ARP bridge uses this map. */
+    kernel_bridge_refresh_profile_pairs(cfg, 1);
+
     if (fwd->local_count > MAX_INTERFACES)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)

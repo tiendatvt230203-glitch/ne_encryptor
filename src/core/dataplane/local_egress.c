@@ -170,13 +170,14 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (dp_pkt_is_arp(pkt, job.len)) {
-        /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
+        mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
+        /* ARP bridges plain — never gated by crypto policy. */
         if (arp_bridge_from_local(fwd, &job, pkt, li) == 0)
             return;
         goto drop;
     }
 
-    mac_learn(fwd, li, pkt, job.len);
+    mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_TRAFFIC);
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
