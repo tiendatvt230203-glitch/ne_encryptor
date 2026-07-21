@@ -82,15 +82,13 @@ static int kernel_bridge_slaves_collect(struct kernel_bridge_slave *out, int max
 
     fp = popen("bridge link show 2>/dev/null", "r");
     if (!fp) {
-        fprintf(stderr, "[BR] bridge link show: popen failed\n");
+        fprintf(stderr, "[BR] bridge link show failed\n");
         return 0;
     }
 
-    fprintf(stderr, "[BR] bridge link show:\n");
     while (fgets(line, sizeof(line), fp) && n < max_out) {
         if (parse_bridge_link_line(line, out[n].ifname, out[n].master) != 0)
             continue;
-        fprintf(stderr, "[BR]   slave %s master %s\n", out[n].ifname, out[n].master);
         n++;
     }
     pclose(fp);
@@ -104,8 +102,7 @@ static void kernel_bridge_detach_slave(const char *ifname)
     if (!ifname_safe(ifname))
         return;
     snprintf(cmd, sizeof(cmd), "ip link set %s nomaster 2>/dev/null", ifname);
-    if (system(cmd) == 0)
-        fprintf(stderr, "[BR] detached %s from kernel bridge\n", ifname);
+    (void)system(cmd);
 }
 
 static int find_local_index_by_ifname(const struct app_config *cfg, const char *ifname)
@@ -179,18 +176,11 @@ static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_co
 
 static void profile_log_members(const struct app_config *cfg, const struct profile_config *p)
 {
-    fprintf(stderr, "[BR] profile %s members:", p->name);
-    for (int i = 0; i < p->local_count; i++) {
-        int li = p->local_indices[i];
-        if (li >= 0 && li < cfg->local_count)
-            fprintf(stderr, " LAN=%s", cfg->locals[li].ifname);
-    }
-    for (int i = 0; i < p->wan_count; i++) {
-        int wi = p->wan_indices[i];
-        if (wi >= 0 && wi < cfg->wan_count)
-            fprintf(stderr, " WAN=%s", cfg->wans[wi].ifname);
-    }
-    fprintf(stderr, " (bridge_pairs=%d)\n", p->bridge_count);
+    if (p->bridge_count > 0)
+        return;
+    fprintf(stderr, "[BR] profile %s: no bridge pairs (lan=%d wan=%d)\n",
+            p->name, p->local_count, p->wan_count);
+    (void)cfg;
 }
 
 void kernel_bridge_refresh_profile_pairs(struct app_config *cfg, int detach_slaves)
@@ -289,5 +279,7 @@ void kernel_bridge_refresh_profile_pairs(struct app_config *cfg, int detach_slav
     if (detach_slaves) {
         for (int si = 0; si < slave_count; si++)
             kernel_bridge_detach_slave(slaves[si].ifname);
+        if (slave_count > 0)
+            fprintf(stderr, "[BR] detached %d kernel bridge slave(s)\n", slave_count);
     }
 }

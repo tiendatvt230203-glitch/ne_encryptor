@@ -487,6 +487,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
         return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
     }
 
+    mac_flood_log(fwd, pkt, profile_pi);
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
 }
 
@@ -508,6 +509,9 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     if (dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+
+        if (wan_dp >= 0)
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len);
 
         /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
         if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp) == 0)

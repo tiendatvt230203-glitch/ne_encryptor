@@ -37,4 +37,7 @@ void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint3
                enum mac_learn_src src);
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);
 
+/* Log rate-limited flood while dmac is unknown; silent once mac is in table. */
+void mac_flood_log(struct forwarder *fwd, const uint8_t dmac[MAC_LEN], int profile_pi);
+
 #endif

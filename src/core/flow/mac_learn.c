@@ -11,7 +11,49 @@
 #endif
 
 #define MAC_LEARN_ENTRY_TTL_MS  (MAC_LEARN_CACHE_TTL_MIN * 60ull * 1000ull)
+#define MAC_FLOOD_LOG_INTERVAL_MS 10000ull
+#define MAC_FLOOD_TRACK_MAX 64
 #define ETH_HEADER_SIZE         14u
+
+enum mac_upsert_result {
+    MAC_UPSERT_REFRESH = 0,
+    MAC_UPSERT_NEW,
+    MAC_UPSERT_MOVE,
+    MAC_UPSERT_REPLACE,
+};
+
+struct mac_flood_track {
+    uint8_t mac[MAC_LEN];
+    uint64_t last_log_ms;
+    uint8_t in_use;
+};
+
+static struct mac_flood_track g_flood_track[MAC_FLOOD_TRACK_MAX];
+
+static const char *mac_learn_src_name(enum mac_learn_src src)
+{
+    return src == MAC_LEARN_SRC_ARP ? "arp" : "traffic";
+}
+
+static void log_mac_fmt(const char *event, enum mac_learn_src src,
+                        const uint8_t mac[MAC_LEN], const char *ifname)
+{
+    fprintf(stderr,
+            "[MAC] %s src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s\n",
+            event, mac_learn_src_name(src),
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            ifname ? ifname : "-");
+}
+
+static void log_mac_move(enum mac_learn_src src, const uint8_t mac[MAC_LEN],
+                         const char *old_ifname, const char *new_ifname)
+{
+    fprintf(stderr,
+            "[MAC] move src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s->%s\n",
+            mac_learn_src_name(src),
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            old_ifname ? old_ifname : "-", new_ifname ? new_ifname : "-");
+}
 
 static uint64_t monotonic_ms(void)
 {
@@ -60,36 +102,6 @@ static int find_idx_by_ifname_locked(const struct mac_learn_table *t, const char
     return -1;
 }
 
-static const char *mac_learn_src_name(enum mac_learn_src src)
-{
-    return src == MAC_LEARN_SRC_ARP ? "arp" : "traffic";
-}
-
-static void log_mac(const char *event, enum mac_learn_src src,
-                    const uint8_t mac[MAC_LEN], const char *ifname)
-{
-    fprintf(stderr, "[MAC] %s src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s\n",
-            event, mac_learn_src_name(src),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            ifname ? ifname : "-");
-}
-
-static void log_mac_move(enum mac_learn_src src, const uint8_t mac[MAC_LEN],
-                         const char *old_ifname, const char *new_ifname)
-{
-    fprintf(stderr, "[MAC] move src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s->%s\n",
-            mac_learn_src_name(src),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            old_ifname ? old_ifname : "-", new_ifname ? new_ifname : "-");
-}
-
-static void log_mac_stale(const uint8_t mac[MAC_LEN], const char *ifname, uint64_t idle_ms)
-{
-    fprintf(stderr, "[MAC] clean-stale %02x:%02x:%02x:%02x:%02x:%02x iface=%s idle_ms=%llu\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            ifname ? ifname : "-", (unsigned long long)idle_ms);
-}
-
 static void remove_idx_locked(struct mac_learn_table *t, int idx)
 {
     if (!t || idx < 0 || idx >= t->count)
@@ -100,51 +112,55 @@ static void remove_idx_locked(struct mac_learn_table *t, int idx)
     hash_rebuild_locked(t);
 }
 
-static void upsert_locked(struct mac_learn_table *t, const char *ifname,
-                          const uint8_t mac[MAC_LEN], uint64_t now_ms,
-                          enum mac_learn_src src)
+static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const char *ifname,
+                                            const uint8_t mac[MAC_LEN], uint64_t now_ms,
+                                            char old_ifname_out[IF_NAMESIZE])
 {
     int if_idx = find_idx_by_ifname_locked(t, ifname);
     int mac_idx;
 
+    if (old_ifname_out)
+        old_ifname_out[0] = '\0';
+
     if (if_idx >= 0) {
         if (memcmp(t->list[if_idx].mac, mac, MAC_LEN) == 0) {
             t->list[if_idx].last_seen_ms = now_ms;
-            log_mac("refresh", src, mac, t->list[if_idx].ifname);
-            return;
+            return MAC_UPSERT_REFRESH;
         }
-
-        log_mac("clean-replace", src, t->list[if_idx].mac, t->list[if_idx].ifname);
 
         mac_idx = find_idx_by_mac_locked(t, mac);
-        if (mac_idx >= 0 && mac_idx != if_idx) {
-            log_mac_move(src, mac, t->list[mac_idx].ifname, ifname);
+        if (mac_idx >= 0 && mac_idx != if_idx)
             remove_idx_locked(t, mac_idx);
-            if_idx = find_idx_by_ifname_locked(t, ifname);
-            if (if_idx < 0)
-                return;
-        }
+
+        if_idx = find_idx_by_ifname_locked(t, ifname);
+        if (if_idx < 0)
+            return MAC_UPSERT_REFRESH;
 
         memcpy(t->list[if_idx].mac, mac, MAC_LEN);
         t->list[if_idx].last_seen_ms = now_ms;
-        log_mac("learn", src, mac, t->list[if_idx].ifname);
         hash_rebuild_locked(t);
-        return;
+        return MAC_UPSERT_REPLACE;
     }
 
     mac_idx = find_idx_by_mac_locked(t, mac);
     if (mac_idx >= 0) {
-        log_mac_move(src, mac, t->list[mac_idx].ifname, ifname);
+        char old_ifname[IF_NAMESIZE];
+
+        strncpy(old_ifname, t->list[mac_idx].ifname, sizeof(old_ifname) - 1);
+        old_ifname[sizeof(old_ifname) - 1] = '\0';
+        if (old_ifname_out)
+            strncpy(old_ifname_out, old_ifname, IF_NAMESIZE - 1);
         strncpy(t->list[mac_idx].ifname, ifname, IF_NAMESIZE - 1);
         t->list[mac_idx].ifname[IF_NAMESIZE - 1] = '\0';
         t->list[mac_idx].last_seen_ms = now_ms;
-        return;
+        if (strcmp(old_ifname, ifname) != 0)
+            return MAC_UPSERT_MOVE;
+        return MAC_UPSERT_REFRESH;
     }
 
     if (t->count >= MAC_LEARN_MAX_ENTRIES) {
-        fprintf(stderr, "[MAC] skip src=%s reason=table-full iface=%s\n",
-                mac_learn_src_name(src), ifname ? ifname : "-");
-        return;
+        fprintf(stderr, "[MAC] table full on %s\n", ifname ? ifname : "-");
+        return MAC_UPSERT_REFRESH;
     }
 
     int i = t->count++;
@@ -153,8 +169,8 @@ static void upsert_locked(struct mac_learn_table *t, const char *ifname,
     strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
     t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
     t->list[i].last_seen_ms = now_ms;
-    log_mac("learn", src, mac, t->list[i].ifname);
     hash_rebuild_locked(t);
+    return MAC_UPSERT_NEW;
 }
 
 static void table_init(struct mac_learn_table *t)
@@ -166,16 +182,27 @@ static void table_init(struct mac_learn_table *t)
 }
 
 static void table_learn(struct mac_learn_table *t, const char *ifname,
-                        const uint8_t mac[MAC_LEN], enum mac_learn_src src)
+                        const uint8_t mac[MAC_LEN], enum mac_learn_src src,
+                        enum mac_upsert_result *result_out)
 {
     uint64_t now_ms;
+    enum mac_upsert_result r;
+    char old_ifname[IF_NAMESIZE];
 
     if (!t || !ifname || !mac || ifname[0] == '\0')
         return;
     now_ms = monotonic_ms();
     pthread_spin_lock(&t->lock);
-    upsert_locked(t, ifname, mac, now_ms, src);
+    r = upsert_locked(t, ifname, mac, now_ms, old_ifname);
     pthread_spin_unlock(&t->lock);
+
+    if (result_out)
+        *result_out = r;
+
+    if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_REPLACE)
+        log_mac_fmt("learn", src, mac, ifname);
+    else if (r == MAC_UPSERT_MOVE)
+        log_mac_move(src, mac, old_ifname, ifname);
 }
 
 static int table_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
@@ -231,8 +258,6 @@ static void table_purge_orphan_locked(struct mac_learn_table *t, const struct ap
             if (w != i)
                 t->list[w] = t->list[i];
             w++;
-        } else {
-            log_mac("clean-orphan", MAC_LEARN_SRC_TRAFFIC, t->list[i].mac, t->list[i].ifname);
         }
     }
     if (w != t->count) {
@@ -255,8 +280,6 @@ static void table_expire_stale_locked(struct mac_learn_table *t, uint64_t now_ms
             if (w != i)
                 t->list[w] = t->list[i];
             w++;
-        } else {
-            log_mac_stale(t->list[i].mac, t->list[i].ifname, idle_ms);
         }
     }
     if (w != t->count) {
@@ -276,6 +299,86 @@ static void table_maintain(struct mac_learn_table *t, const struct app_config *c
     table_purge_orphan_locked(t, cfg);
     table_expire_stale_locked(t, now_ms, MAC_LEARN_ENTRY_TTL_MS);
     pthread_spin_unlock(&t->lock);
+}
+
+static int table_has_mac_locked(const struct mac_learn_table *t, const uint8_t mac[MAC_LEN])
+{
+    return find_idx_by_mac_locked(t, mac) >= 0;
+}
+
+static int flood_track_slot(const uint8_t mac[MAC_LEN])
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < MAC_FLOOD_TRACK_MAX; i++) {
+        if (!g_flood_track[i].in_use) {
+            if (free_slot < 0)
+                free_slot = i;
+            continue;
+        }
+        if (memcmp(g_flood_track[i].mac, mac, MAC_LEN) == 0)
+            return i;
+    }
+    return free_slot;
+}
+
+static void flood_track_clear_mac(const uint8_t mac[MAC_LEN])
+{
+    for (int i = 0; i < MAC_FLOOD_TRACK_MAX; i++) {
+        if (g_flood_track[i].in_use &&
+            memcmp(g_flood_track[i].mac, mac, MAC_LEN) == 0) {
+            g_flood_track[i].in_use = 0;
+            return;
+        }
+    }
+}
+
+void mac_flood_log(struct forwarder *fwd, const uint8_t dmac[MAC_LEN], int profile_pi)
+{
+    const struct profile_config *prof;
+    uint64_t now_ms;
+    int slot;
+    int known;
+
+    if (!fwd || !fwd->cfg || !dmac)
+        return;
+    if (profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
+        return;
+    prof = &fwd->cfg->profiles[profile_pi];
+    if (!prof->enabled || prof->local_count <= 0)
+        return;
+
+    pthread_spin_lock(&fwd->mac_table.lock);
+    known = table_has_mac_locked(&fwd->mac_table, dmac);
+    pthread_spin_unlock(&fwd->mac_table.lock);
+    if (known)
+        return;
+
+    now_ms = monotonic_ms();
+    slot = flood_track_slot(dmac);
+    if (slot < 0)
+        return;
+    if (g_flood_track[slot].in_use &&
+        now_ms - g_flood_track[slot].last_log_ms < MAC_FLOOD_LOG_INTERVAL_MS)
+        return;
+
+    memcpy(g_flood_track[slot].mac, dmac, MAC_LEN);
+    g_flood_track[slot].in_use = 1;
+    g_flood_track[slot].last_log_ms = now_ms;
+
+    fprintf(stderr,
+            "[MAC] flood unknown dmac=%02x:%02x:%02x:%02x:%02x:%02x profile=%s lan=",
+            dmac[0], dmac[1], dmac[2], dmac[3], dmac[4], dmac[5], prof->name);
+    for (int i = 0; i < prof->local_count; i++) {
+        int li = prof->local_indices[i];
+
+        if (li < 0 || li >= fwd->local_count)
+            continue;
+        if (i > 0)
+            fprintf(stderr, ",");
+        fprintf(stderr, "%s", fwd->locals[li].ifname);
+    }
+    fprintf(stderr, "\n");
 }
 
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname)
@@ -324,31 +427,22 @@ void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint3
                enum mac_learn_src src)
 {
     const uint8_t *eth_src;
-    const char *ifname;
 
     if (!fwd || !pkt || len < ETH_HEADER_SIZE ||
         ingress_idx < 0 || ingress_idx >= fwd->local_count)
         return;
 
-    ifname = fwd->locals[ingress_idx].ifname;
     eth_src = pkt + MAC_LEN;
-    if (mac_is_zero(eth_src)) {
-        fprintf(stderr, "[MAC] skip src=%s reason=zero-mac iface=%s\n",
-                mac_learn_src_name(src), ifname);
+    if (mac_is_zero(eth_src) || mac_is_multicast(eth_src))
         return;
-    }
-    if (mac_is_multicast(eth_src)) {
-        fprintf(stderr, "[MAC] skip src=%s reason=multicast-mac iface=%s\n",
-                mac_learn_src_name(src), ifname);
-        return;
-    }
 
-    fprintf(stderr, "[MAC] ingest src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s len=%u\n",
-            mac_learn_src_name(src),
-            eth_src[0], eth_src[1], eth_src[2], eth_src[3], eth_src[4], eth_src[5],
-            ifname, len);
+    {
+        enum mac_upsert_result r = MAC_UPSERT_REFRESH;
 
-    table_learn(&fwd->mac_table, ifname, eth_src, src);
+        table_learn(&fwd->mac_table, fwd->locals[ingress_idx].ifname, eth_src, src, &r);
+        if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_REPLACE || r == MAC_UPSERT_MOVE)
+            flood_track_clear_mac(eth_src);
+    }
 }
 
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
@@ -358,15 +452,8 @@ int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
 
     if (!fwd || !mac)
         return -1;
-    if (table_lookup(&fwd->mac_table, mac, ifname) != 0) {
-        fprintf(stderr, "[MAC] lookup miss %02x:%02x:%02x:%02x:%02x:%02x\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (table_lookup(&fwd->mac_table, mac, ifname) != 0)
         return -1;
-    }
     li = ingress_idx_by_ifname(fwd, ifname);
-    if (li >= 0) {
-        fprintf(stderr, "[MAC] lookup hit %02x:%02x:%02x:%02x:%02x:%02x -> iface=%s idx=%d\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ifname, li);
-    }
     return li;
 }

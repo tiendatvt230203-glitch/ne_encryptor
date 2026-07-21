@@ -8,6 +8,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <stdio.h>
 #include <string.h>
 
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
@@ -112,6 +113,66 @@ int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len)
         et = ((uint16_t)pkt[16] << 8) | pkt[17];
     }
     return et == 0x0806u;
+}
+
+static int arp_payload_offset(const uint8_t *pkt, uint32_t len, uint32_t *off_out)
+{
+    uint32_t off = 14u;
+    uint16_t et;
+
+    if (!pkt || !off_out || len < off + 28u)
+        return -1;
+
+    et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == 0x8100u) {
+        off = 18u;
+        if (len < off + 28u)
+            return -1;
+    }
+    *off_out = off;
+    return 0;
+}
+
+static void format_mac(const uint8_t mac[6], char *buf, size_t bufsz)
+{
+    snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
+{
+    uint8_t b[4];
+
+    memcpy(b, &ip_be, 4);
+    snprintf(buf, bufsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+void dp_log_arp_userspace(const char *dir, const char *iface,
+                          const uint8_t *pkt, uint32_t len)
+{
+    uint32_t off;
+    const uint8_t *arp;
+    uint16_t op;
+    char sha[18], tha[18], spa[16], tpa[16];
+
+    if (!dir || !iface || !pkt)
+        return;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return;
+
+    arp = pkt + off;
+    op = ((uint16_t)arp[6] << 8) | arp[7];
+    format_mac(arp + 8, sha, sizeof(sha));
+    format_mac(arp + 18, tha, sizeof(tha));
+    format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
+    format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
+
+    fprintf(stderr,
+            "[ARP] userspace dir=%s iface=%s len=%u op=%s "
+            "sha=%s spa=%s tha=%s tpa=%s\n",
+            dir, iface, len,
+            op == 1 ? "request" : (op == 2 ? "reply" : "other"),
+            sha, spa, tha, tpa);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)

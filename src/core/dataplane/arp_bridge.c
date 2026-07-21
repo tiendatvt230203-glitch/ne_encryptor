@@ -6,6 +6,27 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#define ARP_LOG_FAIL_INTERVAL_MS 30000ull
+
+static uint64_t arp_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+static int arp_log_fail_ratelimit(uint64_t *last_ms)
+{
+    uint64_t now = arp_monotonic_ms();
+
+    if (!last_ms || now - *last_ms < ARP_LOG_FAIL_INTERVAL_MS)
+        return 0;
+    *last_ms = now;
+    return 1;
+}
 
 static struct ne_ring *arp_mid_to_local_ring(struct forwarder *fwd, int li)
 {
@@ -243,28 +264,34 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
 
     profile_pi = config_select_profile_for_local(fwd->cfg, ingress_li);
     if (profile_pi < 0) {
-        fprintf(stderr, "[ARP] bridge local %s fail: no profile\n",
-                local_ifname(fwd, ingress_li));
+        static uint64_t last_no_profile_ms;
+
+        if (arp_log_fail_ratelimit(&last_no_profile_ms))
+            fprintf(stderr, "[ARP] bridge local %s fail: no profile\n",
+                    local_ifname(fwd, ingress_li));
         return -1;
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
     if (resolve_wan_dp_for_local_arp(fwd, prof, ingress_li, &wan_dp) != 0) {
-        fprintf(stderr,
-                "[ARP] bridge local %s fail: no wan pair (profile=%s lan=%d wan=%d dp_wan=%d bridges=%d)\n",
-                local_ifname(fwd, ingress_li), prof->name,
-                prof->local_count, prof->wan_count,
-                profile_dataplane_wan_count(fwd->cfg, prof), prof->bridge_count);
+        static uint64_t last_no_pair_ms;
+
+        if (arp_log_fail_ratelimit(&last_no_pair_ms))
+            fprintf(stderr,
+                    "[ARP] bridge local %s fail: no wan pair (profile=%s lan=%d wan=%d dp_wan=%d bridges=%d)\n",
+                    local_ifname(fwd, ingress_li), prof->name,
+                    prof->local_count, prof->wan_count,
+                    profile_dataplane_wan_count(fwd->cfg, prof), prof->bridge_count);
         return -1;
     }
-    if (wan_dp < 0 || wan_dp >= fwd->wan_count) {
-        fprintf(stderr, "[ARP] bridge local %s fail: bad wan_dp=%d\n",
-                local_ifname(fwd, ingress_li), wan_dp);
+    if (wan_dp < 0 || wan_dp >= fwd->wan_count)
         return -1;
-    }
     if (fwd_wan_is_stopped(wan_dp)) {
-        fprintf(stderr, "[ARP] bridge local %s -> wan %s fail: wan stopped\n",
-                local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
+        static uint64_t last_wan_stopped_ms;
+
+        if (arp_log_fail_ratelimit(&last_wan_stopped_ms))
+            fprintf(stderr, "[ARP] bridge local %s -> wan %s fail: wan stopped\n",
+                    local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
         return -1;
     }
 
@@ -272,12 +299,13 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
     if (dp_ring_push(fwd, ring, job) != 0) {
-        fprintf(stderr, "[ARP] bridge local %s -> wan %s fail: ring push\n",
-                local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
+        static uint64_t last_ring_fail_ms;
+
+        if (arp_log_fail_ratelimit(&last_ring_fail_ms))
+            fprintf(stderr, "[ARP] bridge local %s -> wan %s fail: ring push\n",
+                    local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
         return -1;
     }
-    fprintf(stderr, "[ARP] bridge local %s -> wan %s ok len=%u\n",
-            local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp), job->len);
     return 0;
 }
 
@@ -294,32 +322,36 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
 
     profile_pi = profile_pi_for_wan_dp(fwd, ingress_wan_dp);
     if (profile_pi < 0) {
-        fprintf(stderr, "[ARP] bridge wan %s fail: no profile\n",
-                wan_ifname(fwd, ingress_wan_dp));
+        static uint64_t last_no_profile_ms;
+
+        if (arp_log_fail_ratelimit(&last_no_profile_ms))
+            fprintf(stderr, "[ARP] bridge wan %s fail: no profile\n",
+                    wan_ifname(fwd, ingress_wan_dp));
         return -1;
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
     if (resolve_local_for_wan_arp(fwd, prof, ingress_wan_dp, &local_idx) != 0) {
-        fprintf(stderr, "[ARP] bridge wan %s fail: no local pair (profile=%s)\n",
-                wan_ifname(fwd, ingress_wan_dp), prof->name);
+        static uint64_t last_no_pair_ms;
+
+        if (arp_log_fail_ratelimit(&last_no_pair_ms))
+            fprintf(stderr, "[ARP] bridge wan %s fail: no local pair (profile=%s)\n",
+                    wan_ifname(fwd, ingress_wan_dp), prof->name);
         return -1;
     }
-    if (local_idx < 0 || local_idx >= fwd->local_count) {
-        fprintf(stderr, "[ARP] bridge wan %s fail: bad local_idx=%d\n",
-                wan_ifname(fwd, ingress_wan_dp), local_idx);
+    if (local_idx < 0 || local_idx >= fwd->local_count)
         return -1;
-    }
 
     ring = arp_mid_to_local_ring(fwd, local_idx);
     job->dir = NE_DIR_LOCAL;
     job->local_idx = (uint8_t)local_idx;
     if (dp_ring_push(fwd, ring, job) != 0) {
-        fprintf(stderr, "[ARP] bridge wan %s -> local %s fail: ring push\n",
-                wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
+        static uint64_t last_ring_fail_ms;
+
+        if (arp_log_fail_ratelimit(&last_ring_fail_ms))
+            fprintf(stderr, "[ARP] bridge wan %s -> local %s fail: ring push\n",
+                    wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
         return -1;
     }
-    fprintf(stderr, "[ARP] bridge wan %s -> local %s ok len=%u\n",
-            wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx), job->len);
     return 0;
 }
