@@ -409,6 +409,53 @@ int config_select_profile_for_local(const struct app_config *cfg, int local_idx)
     return -1;
 }
 
+static int policy_covers_ip(const struct crypto_policy *cp, uint32_t ip)
+{
+    int src_hit = 0, dst_hit = 0;
+
+    if (!cp)
+        return 0;
+    /* Catch-all any/any: every IP is in scope. Otherwise only non-any sides. */
+    if (cp->src_any && cp->dst_any)
+        return 1;
+    if (!cp->src_any)
+        src_hit = cidr_match_with_negate(0, cp->src_negate, ip, cp->src_net, cp->src_mask);
+    if (!cp->dst_any)
+        dst_hit = cidr_match_with_negate(0, cp->dst_negate, ip, cp->dst_net, cp->dst_mask);
+    return src_hit || dst_hit;
+}
+
+int config_local_policies_cover_ip(const struct app_config *cfg, int local_idx, uint32_t ip)
+{
+    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
+        return 0;
+
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        int owns = 0;
+
+        if (!p->enabled)
+            continue;
+        for (int i = 0; i < p->local_count; i++) {
+            if (p->local_indices[i] == local_idx) {
+                owns = 1;
+                break;
+            }
+        }
+        if (!owns)
+            continue;
+
+        for (int i = 0; i < p->policy_count; i++) {
+            int poli = p->policy_indices[i];
+            if (poli < 0 || poli >= cfg->policy_count)
+                continue;
+            if (policy_covers_ip(&cfg->policies[poli], ip))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static int crypto_policy_match_packet(const struct crypto_policy *cp,
                                       uint32_t src_ip, uint32_t dst_ip,
                                       uint16_t src_port, uint16_t dst_port,

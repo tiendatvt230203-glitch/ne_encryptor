@@ -9,10 +9,14 @@
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/forwarder_wan.h"
 
 #include <netinet/in.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
 {
@@ -237,6 +241,20 @@ static struct ne_ring *mid_to_local_ring(struct forwarder *fwd, int li)
     return &fwd->mid_to_local[li][dp_crypto_current_worker_idx()];
 }
 
+static void log_mac_flooding_ratelimited(void)
+{
+    static uint64_t last_ms;
+    struct timespec ts;
+    uint64_t now_ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ms = ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+    if (now_ms - last_ms < 1000ull)
+        return;
+    last_ms = now_ms;
+    fprintf(stderr, "[MAC] flooding\n");
+}
+
 static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                                    const uint8_t *pkt, int profile_pi)
 {
@@ -251,6 +269,8 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
     prof = &fwd->cfg->profiles[profile_pi];
     if (!prof->enabled || prof->local_count <= 0)
         return -1;
+
+    log_mac_flooding_ratelimited();
 
     for (int i = 0; i < prof->local_count; i++) {
         int li = prof->local_indices[i];
@@ -424,12 +444,16 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
         return -1;
 
     li = mac_lookup(fwd, pkt);
-    if (li >= 0 && profile_owns_local(fwd->cfg, profile_pi, li)) {
+    if (li >= 0) {
+        /* Known MAC: never flood — unicast to learned iface or drop if wrong profile. */
+        if (!profile_owns_local(fwd->cfg, profile_pi, li))
+            return -1;
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
         return dp_ring_push(fwd, mid_to_local_ring(fwd, li), job);
     }
 
+    /* Unknown MAC only: flood profile locals (rate-limited log inside). */
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
 }
 
@@ -454,12 +478,20 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     int dec;
     struct crypto_wire_info wi;
     int have_wire = 0;
+    int wan_dp;
 
     if (!fwd || !pkt)
         goto drop;
 
     if (job.len < 14u || job.len > NE_FRAME)
         goto drop;
+
+    if (dp_pkt_is_arp(pkt, job.len)) {
+        wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp) == 0)
+            return;
+        goto drop;
+    }
 
     if (crypto_wire_detach(pkt, job.len, &wi) == 0 && wi.layer != CRYPTO_WIRE_NONE &&
         wire_policy_matches_layer(wi.layer, wi.policy_id)) {

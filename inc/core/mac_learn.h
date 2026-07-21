@@ -13,7 +13,6 @@ struct forwarder;
 struct mac_learn_entry {
     uint8_t mac[MAC_LEN];
     char ifname[IF_NAMESIZE];
-    uint64_t last_seen_ms;
 };
 
 struct mac_learn_table {

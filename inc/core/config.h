@@ -16,6 +16,7 @@
 #define WAN_REORDER_WINDOW_KB   10240
 #define MAX_PROFILES 32
 #define MAX_PROFILE_INTERFACES 16
+#define MAX_BRIDGES_PER_PROFILE MAX_PROFILE_INTERFACES
 #define MAX_CRYPTO_POLICIES 128
 #define POLICY_PROTO_ANY 0
 #define POLICY_PROTO_TCP_UDP 254
@@ -54,10 +55,18 @@ struct crypto_policy {
     uint8_t key[AES_KEY_LEN];
 };
 
+struct bridge_pair {
+    int local_idx;
+    int wan_dp;
+};
+
 struct profile_config {
     int id;
     char name[64];
     int enabled;
+    int bridge_enable;
+    int bridge_count;
+    struct bridge_pair bridges[MAX_BRIDGES_PER_PROFILE];
     int local_indices[MAX_PROFILE_INTERFACES];
     int local_count;
     int wan_indices[MAX_PROFILE_INTERFACES];
@@ -124,6 +133,7 @@ int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx
 int config_policy_db_id_taken(const struct app_config *cfg, int db_id);
 int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
+int config_local_policies_cover_ip(const struct app_config *cfg, int local_idx, uint32_t ip);
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,

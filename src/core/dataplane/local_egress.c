@@ -7,12 +7,63 @@
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
 #include <string.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
+#define ETH_P_ARP_BE    0x0806u
+#define ARP_OP_REQUEST  1u
+#define ARP_OP_REPLY    2u
+
+static uint16_t eth_be16(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+/* Ethernet ARP Request/Reply → SPA (network order). Returns 0 on success. */
+static int parse_arp_spa(const uint8_t *pkt, uint32_t len, uint32_t *spa_out)
+{
+    uint16_t et;
+    uint16_t op;
+
+    if (!pkt || !spa_out || len < 42u)
+        return -1;
+
+    et = eth_be16(pkt + 12);
+    if (et != ETH_P_ARP_BE)
+        return -1;
+
+    /* hrd=1, pro=0x0800, hln=6, pln=4 */
+    if (eth_be16(pkt + 14) != 1u ||
+        eth_be16(pkt + 16) != 0x0800u ||
+        pkt[18] != 6u ||
+        pkt[19] != 4u)
+        return -1;
+
+    op = eth_be16(pkt + 20);
+    if (op != ARP_OP_REQUEST && op != ARP_OP_REPLY)
+        return -1;
+
+    memcpy(spa_out, pkt + 28, sizeof(*spa_out));
+    return 0;
+}
+
+static void maybe_learn_arp(struct forwarder *fwd, int local_idx,
+                            const uint8_t *pkt, uint32_t len)
+{
+    uint32_t spa;
+
+    if (!fwd || !fwd->cfg || !pkt)
+        return;
+    if (parse_arp_spa(pkt, len, &spa) != 0)
+        return;
+    if (!config_local_policies_cover_ip(fwd->cfg, local_idx, spa))
+        return;
+    mac_learn(fwd, local_idx, pkt, len);
+}
 
 static struct ne_ring *mid_to_wan_ring(struct forwarder *fwd, int wan_dp)
 {
@@ -192,11 +243,21 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     struct packet_crypto_ctx *pctx;
     int enc;
 
-    mac_learn(fwd, li, pkt, job.len);
+    if (!flow_ok) {
+        if (dp_pkt_is_arp(pkt, job.len)) {
+            maybe_learn_arp(fwd, li, pkt, job.len);
+            if (arp_bridge_from_local(fwd, &job, pkt, li) == 0)
+                return;
+        }
+        goto drop;
+    }
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)
         goto drop;
+
+    mac_learn(fwd, li, pkt, job.len);
+
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto, job.len);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))

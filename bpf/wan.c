@@ -38,7 +38,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 proto = eth->h_proto;
 
     if (proto == __constant_htons(ETH_P_ARP)) {
-        return XDP_PASS;
+        goto redirect;
     }
 
     if (proto == __constant_htons(ETH_P_IP)) {

@@ -4,6 +4,7 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane.h"
+#include "../../../inc/core/dataplane_util.h"
 #include "../../../inc/core/crypto_route.h"
 
 #include "../../../inc/core/main_diag.h"
@@ -182,8 +183,12 @@ static void *local_rx_thread(void *arg)
             const uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             int li = batch[i].local_idx < fwd->local_count ? (int)batch[i].local_idx : 0;
             int wi;
+            int to_bypass;
 
-            if (dataplane_local_is_bypass(fwd, li, pkt, batch[i].len)) {
+            /* ARP: bypass path only — no crypto channel / no encrypt. */
+            to_bypass = dp_pkt_is_arp(pkt, batch[i].len) ||
+                        dataplane_local_is_bypass(fwd, li, pkt, batch[i].len);
+            if (to_bypass) {
                 wi = dp_bypass_pick_worker(pkt, batch[i].len);
                 if (ne_ring_try_push(&fwd->local_to_bypass[wi], &batch[i]) != 0) {
                     ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
@@ -258,7 +263,11 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+            /* ARP: bypass only — no crypto channel. */
+            if (dp_pkt_is_arp(pkt, batch[i].len))
+                wi = DP_CRYPTO_WAN_PLAIN;
+            else
+                wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
             if (wi == DP_CRYPTO_WAN_PLAIN) {
                 wi = dp_bypass_pick_worker(pkt, batch[i].len);
                 if (ne_ring_try_push(&fwd->wan_to_bypass[wi], &batch[i]) != 0) {

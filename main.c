@@ -340,6 +340,8 @@ static int profile_db_unchanged(const struct profile_config *old,
 {
     if (old->id != new->id ||
         old->enabled != new->enabled ||
+        old->bridge_enable != new->bridge_enable ||
+        old->bridge_count != new->bridge_count ||
         old->policy_count != new->policy_count ||
         old->local_count != new->local_count ||
         old->wan_count != new->wan_count ||
@@ -385,6 +387,11 @@ static int profile_db_unchanged(const struct profile_config *old,
     for (int i = 0; i < old->wan_count; i++) {
         if (old->wan_indices[i] != new->wan_indices[i] ||
             old->wan_bandwidth_weight[i] != new->wan_bandwidth_weight[i])
+            return 0;
+    }
+    for (int i = 0; i < old->bridge_count; i++) {
+        if (old->bridges[i].local_idx != new->bridges[i].local_idx ||
+            old->bridges[i].wan_dp != new->bridges[i].wan_dp)
             return 0;
     }
     return 1;
