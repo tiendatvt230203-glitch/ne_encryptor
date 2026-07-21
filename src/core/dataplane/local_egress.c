@@ -12,6 +12,7 @@
 
 #include <netinet/in.h>
 #include <string.h>
+#include <net/if.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
 
@@ -170,11 +171,15 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (dp_pkt_is_arp(pkt, job.len)) {
-        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len);
+        char bridge_to[IF_NAMESIZE] = "";
+
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
         /* ARP bridges plain — never gated by crypto policy. */
-        if (arp_bridge_from_local(fwd, &job, pkt, li) == 0)
+        if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
+            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
             return;
+        }
+        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL);
         goto drop;
     }
 

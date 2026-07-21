@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <net/if.h>
 
 #define ARP_LOG_FAIL_INTERVAL_MS 30000ull
 
@@ -252,12 +253,16 @@ static const char *wan_ifname(struct forwarder *fwd, int wan_dp)
 }
 
 int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
-                          const uint8_t *pkt, int ingress_li)
+                          const uint8_t *pkt, int ingress_li,
+                          char egress_ifname[IF_NAMESIZE])
 {
     int profile_pi;
     const struct profile_config *prof;
     int wan_dp;
     struct ne_ring *ring;
+
+    if (egress_ifname)
+        egress_ifname[0] = '\0';
 
     if (!fwd || !fwd->cfg || !job || !pkt)
         return -1;
@@ -306,16 +311,22 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                     local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
         return -1;
     }
+    if (egress_ifname)
+        strncpy(egress_ifname, wan_ifname(fwd, wan_dp), IF_NAMESIZE - 1);
     return 0;
 }
 
 int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
-                        const uint8_t *pkt, int ingress_wan_dp)
+                        const uint8_t *pkt, int ingress_wan_dp,
+                        char egress_ifname[IF_NAMESIZE])
 {
     int profile_pi;
     const struct profile_config *prof;
     int local_idx;
     struct ne_ring *ring;
+
+    if (egress_ifname)
+        egress_ifname[0] = '\0';
 
     if (!fwd || !fwd->cfg || !job || !pkt)
         return -1;
@@ -353,5 +364,7 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
                     wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
         return -1;
     }
+    if (egress_ifname)
+        strncpy(egress_ifname, local_ifname(fwd, local_idx), IF_NAMESIZE - 1);
     return 0;
 }

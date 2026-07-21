@@ -509,13 +509,15 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     if (dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-
-        if (wan_dp >= 0)
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len);
+        char bridge_to[IF_NAMESIZE] = "";
 
         /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
-        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp) == 0)
+        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
             return;
+        }
+        if (wan_dp >= 0)
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
         goto drop;
     }
 

@@ -148,12 +148,14 @@ static void format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
 }
 
 void dp_log_arp_userspace(const char *dir, const char *iface,
-                          const uint8_t *pkt, uint32_t len)
+                          const uint8_t *pkt, uint32_t len,
+                          const char *bridge_to)
 {
     uint32_t off;
     const uint8_t *arp;
     uint16_t op;
     char sha[18], tha[18], spa[16], tpa[16];
+    const char *bridge = bridge_to && bridge_to[0] ? bridge_to : "drop";
 
     if (!dir || !iface || !pkt)
         return;
@@ -169,10 +171,10 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
 
     fprintf(stderr,
             "[ARP] userspace dir=%s iface=%s len=%u op=%s "
-            "sha=%s spa=%s tha=%s tpa=%s\n",
+            "sha=%s spa=%s tha=%s tpa=%s bridge=%s\n",
             dir, iface, len,
             op == 1 ? "request" : (op == 2 ? "reply" : "other"),
-            sha, spa, tha, tpa);
+            sha, spa, tha, tpa, bridge);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)

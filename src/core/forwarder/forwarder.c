@@ -385,8 +385,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     fwd->local_count = cfg->local_count;
     fwd->wan_count = config_count_dataplane_wans(cfg);
 
-    /* Capture kernel br LAN<->WAN pairs before detach; userspace ARP bridge uses this map. */
-    kernel_bridge_refresh_profile_pairs(cfg, 1);
+    /* Kernel br on first boot → discover + persist; later boots load saved pairs. */
+    kernel_bridge_refresh_profile_pairs(cfg);
 
     if (fwd->local_count > MAX_INTERFACES)
         fwd->local_count = MAX_INTERFACES;

@@ -1,30 +1,20 @@
 #include "../../../inc/core/kernel_bridge.h"
+#include "../../../inc/db/db_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <net/if.h>
+#include <sys/stat.h>
 
 #define KERNEL_BRIDGE_SLAVE_MAX 64
 #define KERNEL_BRIDGE_MASTER_MAX 16
+#define KERNEL_BRIDGE_PAIRS_FILE NE_STATE_DIR "/bridge_pairs.conf"
 
 struct kernel_bridge_slave {
     char ifname[IF_NAMESIZE];
     char master[IF_NAMESIZE];
 };
-
-static int ifname_safe(const char *ifname)
-{
-    if (!ifname || !ifname[0])
-        return 0;
-    for (const char *p = ifname; *p; p++) {
-        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') || *p == '_' || *p == '.' || *p == '-')
-            continue;
-        return 0;
-    }
-    return 1;
-}
 
 static int parse_bridge_link_line(const char *line, char *ifname_out, char *master_out)
 {
@@ -95,16 +85,6 @@ static int kernel_bridge_slaves_collect(struct kernel_bridge_slave *out, int max
     return n;
 }
 
-static void kernel_bridge_detach_slave(const char *ifname)
-{
-    char cmd[128];
-
-    if (!ifname_safe(ifname))
-        return;
-    snprintf(cmd, sizeof(cmd), "ip link set %s nomaster 2>/dev/null", ifname);
-    (void)system(cmd);
-}
-
 static int find_local_index_by_ifname(const struct app_config *cfg, const char *ifname)
 {
     if (!cfg || !ifname)
@@ -125,11 +105,6 @@ static int find_wan_index_by_ifname(const struct app_config *cfg, const char *if
             return i;
     }
     return -1;
-}
-
-static int config_wan_cfg_to_dp_local(const struct app_config *cfg, int cfg_idx)
-{
-    return config_wan_cfg_to_dp(cfg, cfg_idx);
 }
 
 static int profile_owns_local_idx(const struct profile_config *p, int local_idx)
@@ -160,7 +135,7 @@ static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_co
     if (p->bridge_count >= MAX_BRIDGES_PER_PROFILE)
         return;
 
-    wan_dp = config_wan_cfg_to_dp_local(cfg, wan_cfg_idx);
+    wan_dp = config_wan_cfg_to_dp(cfg, wan_cfg_idx);
     if (wan_dp < 0)
         return;
 
@@ -178,31 +153,108 @@ static void profile_log_members(const struct app_config *cfg, const struct profi
 {
     if (p->bridge_count > 0)
         return;
-    fprintf(stderr, "[BR] profile %s: no bridge pairs (lan=%d wan=%d)\n",
+    fprintf(stderr,
+            "[BR] profile %s: no bridge pairs (lan=%d wan=%d)\n",
             p->name, p->local_count, p->wan_count);
     (void)cfg;
 }
 
-void kernel_bridge_refresh_profile_pairs(struct app_config *cfg, int detach_slaves)
+static void kernel_bridge_state_dir_ensure(void)
 {
-    struct kernel_bridge_slave slaves[KERNEL_BRIDGE_SLAVE_MAX];
-    char masters[KERNEL_BRIDGE_MASTER_MAX][IF_NAMESIZE];
-    int slave_count;
-    int master_count = 0;
+    mkdir(NE_STATE_DIR, 0755);
+}
+
+static void kernel_bridge_save_persisted(const struct app_config *cfg)
+{
+    FILE *fp;
+    int n = 0;
 
     if (!cfg)
         return;
 
-    for (int pi = 0; pi < cfg->profile_count; pi++)
-        cfg->profiles[pi].bridge_count = 0;
-
-    slave_count = kernel_bridge_slaves_collect(slaves, KERNEL_BRIDGE_SLAVE_MAX);
-    if (slave_count <= 0) {
-        fprintf(stderr, "[BR] no kernel bridge slaves (already detached?)\n");
-        for (int pi = 0; pi < cfg->profile_count; pi++)
-            profile_log_members(cfg, &cfg->profiles[pi]);
+    kernel_bridge_state_dir_ensure();
+    fp = fopen(KERNEL_BRIDGE_PAIRS_FILE, "w");
+    if (!fp) {
+        fprintf(stderr, "[BR] failed to save %s\n", KERNEL_BRIDGE_PAIRS_FILE);
         return;
     }
+
+    fprintf(fp, "# network-encryptor LAN<->WAN pairs (persisted)\n");
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (!p->enabled)
+            continue;
+        for (int bi = 0; bi < p->bridge_count; bi++) {
+            int li = p->bridges[bi].local_idx;
+            int wi = config_wan_dp_to_cfg(cfg, p->bridges[bi].wan_dp);
+
+            if (li < 0 || li >= cfg->local_count || wi < 0 || wi >= cfg->wan_count)
+                continue;
+            fprintf(fp, "%s %s %s\n", p->name,
+                    cfg->locals[li].ifname, cfg->wans[wi].ifname);
+            n++;
+        }
+    }
+    fclose(fp);
+    if (n > 0)
+        fprintf(stderr, "[BR] saved %d pair(s) to %s\n", n, KERNEL_BRIDGE_PAIRS_FILE);
+}
+
+static int kernel_bridge_load_persisted(struct app_config *cfg)
+{
+    FILE *fp;
+    char line[256];
+    char prof_name[64];
+    char lan[IF_NAMESIZE];
+    char wan[IF_NAMESIZE];
+    int loaded = 0;
+
+    if (!cfg)
+        return 0;
+
+    fp = fopen(KERNEL_BRIDGE_PAIRS_FILE, "r");
+    if (!fp)
+        return 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        int li;
+        int wi;
+
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+        if (sscanf(line, "%63s %15s %15s", prof_name, lan, wan) != 3)
+            continue;
+
+        li = find_local_index_by_ifname(cfg, lan);
+        wi = find_wan_index_by_ifname(cfg, wan);
+        if (li < 0 || wi < 0)
+            continue;
+
+        for (int pi = 0; pi < cfg->profile_count; pi++) {
+            struct profile_config *p = &cfg->profiles[pi];
+
+            if (!p->enabled || strcmp(p->name, prof_name) != 0)
+                continue;
+            if (!profile_owns_local_idx(p, li) || !profile_owns_wan_cfg(p, wi))
+                continue;
+            profile_commit_bridge_pair(cfg, p, li, wi, "persisted");
+            loaded++;
+        }
+    }
+    fclose(fp);
+    if (loaded > 0)
+        fprintf(stderr, "[BR] using %d persisted pair(s) from %s\n",
+                loaded, KERNEL_BRIDGE_PAIRS_FILE);
+    return loaded;
+}
+
+static void kernel_bridge_discover_from_slaves(struct app_config *cfg,
+                                               const struct kernel_bridge_slave *slaves,
+                                               int slave_count)
+{
+    char masters[KERNEL_BRIDGE_MASTER_MAX][IF_NAMESIZE];
+    int master_count = 0;
 
     for (int si = 0; si < slave_count; si++) {
         int found = 0;
@@ -275,11 +327,32 @@ void kernel_bridge_refresh_profile_pairs(struct app_config *cfg, int detach_slav
 
         profile_log_members(cfg, p);
     }
+}
 
-    if (detach_slaves) {
-        for (int si = 0; si < slave_count; si++)
-            kernel_bridge_detach_slave(slaves[si].ifname);
-        if (slave_count > 0)
-            fprintf(stderr, "[BR] detached %d kernel bridge slave(s)\n", slave_count);
+void kernel_bridge_refresh_profile_pairs(struct app_config *cfg)
+{
+    struct kernel_bridge_slave slaves[KERNEL_BRIDGE_SLAVE_MAX];
+    int slave_count;
+
+    if (!cfg)
+        return;
+
+    for (int pi = 0; pi < cfg->profile_count; pi++)
+        cfg->profiles[pi].bridge_count = 0;
+
+    slave_count = kernel_bridge_slaves_collect(slaves, KERNEL_BRIDGE_SLAVE_MAX);
+    if (slave_count > 0) {
+        fprintf(stderr, "[BR] discovered from kernel bridge (%d slave(s))\n", slave_count);
+        kernel_bridge_discover_from_slaves(cfg, slaves, slave_count);
+        kernel_bridge_save_persisted(cfg);
+        return;
     }
+
+    if (kernel_bridge_load_persisted(cfg) > 0)
+        return;
+
+    fprintf(stderr,
+            "[BR] no kernel br and no persisted pairs — set up br on first start\n");
+    for (int pi = 0; pi < cfg->profile_count; pi++)
+        profile_log_members(cfg, &cfg->profiles[pi]);
 }
