@@ -364,6 +364,39 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
             dp->wan_count++;
         }
 
+        dp->bridge_enable = sp->bridge_enable;
+        for (int bi = 0; bi < sp->bridge_count; bi++) {
+            int src_li = sp->bridges[bi].local_idx;
+            int src_wan_dp = sp->bridges[bi].wan_dp;
+            int src_wi;
+            int merged_li;
+            int merged_wi;
+            int merged_wan_dp;
+
+            if (src_li < 0 || src_li >= src->local_count)
+                continue;
+            merged_li = local_map[src_li];
+            if (merged_li < 0 || merged_li >= dst->local_count)
+                continue;
+
+            src_wi = config_wan_dp_to_cfg(src, src_wan_dp);
+            if (src_wi < 0 || src_wi >= src->wan_count)
+                continue;
+            merged_wi = wan_map[src_wi];
+            if (merged_wi < 0 || merged_wi >= dst->wan_count)
+                continue;
+
+            merged_wan_dp = config_wan_cfg_to_dp(dst, merged_wi);
+            if (merged_wan_dp < 0)
+                continue;
+            if (dp->bridge_count >= MAX_BRIDGES_PER_PROFILE)
+                break;
+
+            dp->bridges[dp->bridge_count].local_idx = merged_li;
+            dp->bridges[dp->bridge_count].wan_dp = merged_wan_dp;
+            dp->bridge_count++;
+        }
+
         if (iface_validate_failed) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: merge failed (duplicate or invalid LAN/WAN)\n",
