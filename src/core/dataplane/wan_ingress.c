@@ -9,6 +9,7 @@
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -504,6 +505,15 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     if (wire_len < 14u || wire_len > NE_FRAME)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
+
+    if (dp_pkt_is_arp(pkt, job.len)) {
+        int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+
+        /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
+        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp) == 0)
+            return;
+        goto drop;
+    }
 
     encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
     if (encrypted) {

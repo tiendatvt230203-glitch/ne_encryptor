@@ -98,6 +98,22 @@ int dp_apply_wan_l2(uint8_t *pkt, uint32_t len,
     return dp_write_l2(pkt, len, dst, src, 0);
 }
 
+int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len)
+{
+    uint16_t et;
+
+    if (!pkt || len < ETH_HEADER_SIZE)
+        return 0;
+
+    et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == 0x8100u) {
+        if (len < 18u)
+            return 0;
+        et = ((uint16_t)pkt[16] << 8) | pkt[17];
+    }
+    return et == 0x0806u;
+}
+
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {

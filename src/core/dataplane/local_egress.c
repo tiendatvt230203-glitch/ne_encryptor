@@ -7,6 +7,7 @@
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -164,6 +165,16 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     int pi;
     struct packet_crypto_ctx *pctx;
     int enc;
+
+    if (!fwd || !pkt)
+        goto drop;
+
+    if (dp_pkt_is_arp(pkt, job.len)) {
+        /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
+        if (arp_bridge_from_local(fwd, &job, pkt, li) == 0)
+            return;
+        goto drop;
+    }
 
     mac_learn(fwd, li, pkt, job.len);
 
