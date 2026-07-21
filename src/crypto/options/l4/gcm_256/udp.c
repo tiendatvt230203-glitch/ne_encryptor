@@ -222,6 +222,11 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
             return -1;
         return 8;
     }
+    if (ip_proto == 1) {
+        if (remaining < 4)
+            return -1;
+        return 4;
+    }
     return -1;
 }
 
@@ -229,29 +234,31 @@ static int opt_transport_hdr_size(const uint8_t *transport_hdr, uint8_t ip_proto
 #define L4_FRAG_MAGIC           0x5A
 #define L4_TUNNEL_MAGIC         0xA5
 #define L4_FRAG_TAG_SIZE        4
-#define L4_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 3)
+#define L4_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 2)
 
 static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce_size,
                                    uint8_t policy_id)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = crypto_option_worker_idx();
-    buf[nonce_size + 1] = policy_id;
-    buf[nonce_size + 2] = L4_TUNNEL_MAGIC;
+    buf[nonce_size] = policy_id;
+    buf[nonce_size + 1] = L4_TUNNEL_MAGIC;
 }
 
 static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce, int nonce_size,
                                         uint8_t policy_id)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = crypto_option_worker_idx();
-    buf[nonce_size + 1] = policy_id;
-    buf[nonce_size + 2] = L4_FRAG_MAGIC;
+    buf[nonce_size] = policy_id;
+    buf[nonce_size + 1] = L4_FRAG_MAGIC;
 }
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size)
 {
-    return buf[nonce_size + 2] == L4_TUNNEL_MAGIC;
+    if (buf[nonce_size + 1] != L4_TUNNEL_MAGIC)
+        return 0;
+    if (OPT_IS_PQC == 0 && (buf[0] & 0x80) != 0)
+        return 0;
+    return 1;
 }
 
 static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr_len,
@@ -268,7 +275,7 @@ static void l4_fix_ipv4_totlen_and_cksum(uint8_t *packet, int l3_off, int ip_hdr
     crypto_ipv4_checksum_replace_word(ip, old_totlen, new_totlen);
 }
 
-#define OPT_FRAG_META_LEN       39
+#define OPT_FRAG_META_LEN       38
 
 static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int l3_off, int ip_hdr_len, int plain_off, size_t plain_len)
@@ -472,12 +479,12 @@ static int l4_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     transport_off = l3_off + ip_hdr_len;
     if (pkt_len < (size_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17)
+    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
         return -1;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (pkt_len < (size_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
         return -1;
-    if (packet[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] != L4_FRAG_MAGIC)
+    if (packet[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] != L4_FRAG_MAGIC)
         return -1;
     opt_read_frag_tag(packet + tunnel_off + L4_TUNNEL_HDR_SIZE, out_pkt_id, out_frag_index);
     return l4_decrypt_fragment_body(ctx, packet, pkt_len, transport_off, tunnel_off);
@@ -674,7 +681,7 @@ static int udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
     transport_off = l3_off + ip_hdr_len;
     if (*pkt_len < (uint32_t)transport_off)
         return -1;
-    if (ip_proto != 6 && ip_proto != 17)
+    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
         return 0;
     tunnel_off = transport_off + L4_WIRE_PORT_LEN;
     if (*pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE) ||
@@ -708,11 +715,11 @@ static int udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_data
     tunnel_off = 14 + ip_hdr_len + L4_WIRE_PORT_LEN;
     if (pkt_len < (uint32_t)(tunnel_off + L4_TUNNEL_HDR_SIZE + L4_FRAG_TAG_SIZE))
         return 0;
-    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2 >= (int)pkt_len)
+    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1 >= (int)pkt_len)
         return 0;
-    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] != L4_FRAG_MAGIC)
+    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] != L4_FRAG_MAGIC)
         return 0;
-    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1];
+    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES];
     if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L4, CRYPTO_MODE_GCM, 256, wire_pol))
         return 0;
     opt_read_frag_tag(pkt_data + tunnel_off + L4_TUNNEL_HDR_SIZE, pkt_id, frag_index);

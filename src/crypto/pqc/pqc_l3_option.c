@@ -214,8 +214,6 @@ static int opt_policy_match(const struct app_config *cfg, int action, int mode,
 #define L3_FRAG_MAGIC           0x5C
 #define L3_FRAG_TAG_SIZE        4
 #define L3_TUNNEL_HDR_SIZE      (PACKET_CRYPTO_NONCE_BYTES + 2)
-#define L3_FRAG_TUNNEL_HDR_SIZE (PACKET_CRYPTO_NONCE_BYTES + 3)
-#define L3_ORIG_PROTO_LEN       1
 #define L3_IPV4_PROTO_OFF       (ETH_HEADER_SIZE + 9)
 #define L3_IPV4_TOTLEN_OFF      (ETH_HEADER_SIZE + 2)
 
@@ -258,35 +256,36 @@ static void l3_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce, int 
                                         uint8_t policy_id)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = crypto_option_worker_idx();
-    buf[nonce_size + 1] = policy_id;
-    buf[nonce_size + 2] = L3_FRAG_MAGIC;
+    buf[nonce_size] = policy_id;
+    buf[nonce_size + 1] = L3_FRAG_MAGIC;
 }
 
 static int l3_is_frag_tunnel(const uint8_t *tunnel, int nonce_size)
 {
-    return tunnel[nonce_size + 2] == L3_FRAG_MAGIC;
+    return tunnel[nonce_size + 1] == L3_FRAG_MAGIC;
 }
 
 static void l3_write_tunnel_header(uint8_t *buf, const uint8_t *nonce, int nonce_size,
-                                   uint8_t policy_id)
+                                   uint8_t policy_id, uint8_t orig_proto)
 {
     memcpy(buf, nonce, (size_t)nonce_size);
-    buf[nonce_size] = crypto_option_worker_idx();
-    buf[nonce_size + 1] = policy_id;
+    buf[nonce_size] = policy_id;
+    buf[nonce_size + 1] = orig_proto;
 }
 
 static void l3_read_tunnel_header(const uint8_t *buf, int nonce_size, uint8_t *nonce_out,
-                                  uint8_t *proto_flag, uint8_t *policy_id)
+                                  uint8_t *proto_flag, uint8_t *policy_id, uint8_t *orig_proto)
 {
     memcpy(nonce_out, buf, (size_t)nonce_size);
     if (proto_flag)
         *proto_flag = buf[0] >> 7;
     if (policy_id)
-        *policy_id = buf[nonce_size + 1];
+        *policy_id = buf[nonce_size];
+    if (orig_proto)
+        *orig_proto = buf[nonce_size + 1];
 }
 
-#define OPT_FRAG_META_LEN       35
+#define OPT_FRAG_META_LEN       34
 
 static int l3_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
                          int tunnel_off, uint8_t *ip, uint16_t old_totlen, uint8_t fake_proto)
@@ -298,23 +297,20 @@ static int l3_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     int enc_off = tunnel_off + L3_TUNNEL_HDR_SIZE;
     int new_len = 0;
     int total_overhead;
-    size_t plain_len;
 
-    if (pkt_len + (size_t)L3_TUNNEL_HDR_SIZE + (size_t)L3_ORIG_PROTO_LEN + AES_GCM_TAG_SIZE > NE_FRAME)
-        return -1;
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
     if (crypto_pqc_generate_nonce(nonce) != 0)
         return -1;
     memmove(packet + enc_off, packet + tunnel_off, payload_len);
-    packet[enc_off + payload_len] = orig_proto;
-    plain_len = payload_len + (size_t)L3_ORIG_PROTO_LEN;
-    l3_write_tunnel_header(packet + tunnel_off, nonce, CRYPTO_PQC_NONCE_BYTES, ctx->wire_id);
-    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)plain_len, &new_len) != 0)
+    l3_write_tunnel_header(packet + tunnel_off, nonce, CRYPTO_PQC_NONCE_BYTES,
+                                  ctx->wire_id, orig_proto);
+    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)payload_len, &new_len) != 0)
         return -1;
-    total_overhead = L3_TUNNEL_HDR_SIZE + L3_ORIG_PROTO_LEN + AES_GCM_TAG_SIZE;
+    total_overhead = L3_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
     l3_patch_ipv4_fast(ip, old_totlen + (uint16_t)total_overhead, fake_proto);
     return (int)(pkt_len + (size_t)total_overhead);
+
 }
 
 static int l3_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len,
@@ -326,22 +322,18 @@ static int l3_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     int dec_len = 0;
     int enc_off = tunnel_off + L3_TUNNEL_HDR_SIZE;
     size_t total_after = pkt_len - (size_t)enc_off;
-    size_t plain_len;
-    int total_overhead = L3_TUNNEL_HDR_SIZE + L3_ORIG_PROTO_LEN + AES_GCM_TAG_SIZE;
 
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
-    l3_read_tunnel_header(packet + tunnel_off, CRYPTO_PQC_NONCE_BYTES, nonce, NULL, NULL);
+    l3_read_tunnel_header(packet + tunnel_off, CRYPTO_PQC_NONCE_BYTES,
+                               nonce, NULL, NULL, &orig_proto);
     if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_off,
                                    (int)total_after, &dec_len) != 0)
         return -1;
-    if (dec_len < L3_ORIG_PROTO_LEN)
-        return -1;
-    orig_proto = packet[enc_off + dec_len - 1];
-    plain_len = (size_t)dec_len - (size_t)L3_ORIG_PROTO_LEN;
-    memmove(packet + tunnel_off, packet + enc_off, plain_len);
-    l3_patch_ipv4_fast(ip, old_totlen - (uint16_t)total_overhead, orig_proto);
-    return (int)(pkt_len - (size_t)total_overhead);
+    memmove(packet + tunnel_off, packet + enc_off, (size_t)dec_len);
+    l3_patch_ipv4_fast(ip, old_totlen - (uint16_t)(L3_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE), orig_proto);
+    return (int)(pkt_len - (size_t)(L3_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE));
+
 }
 
 static int l3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
@@ -354,7 +346,7 @@ static int l3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
     int tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
-    int enc_off = tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
+    int enc_off = tunnel_off + L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
     int new_len = 0;
     size_t need = (size_t)enc_off + enc_plain_len + AES_GCM_TAG_SIZE;
     size_t ip_payload_len;
@@ -369,10 +361,10 @@ static int l3_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         return -1;
     memmove(out_buf + enc_off, enc_plain, enc_plain_len);
     l3_write_tunnel_header_frag(out_buf + tunnel_off, nonce, CRYPTO_PQC_NONCE_BYTES, ctx->wire_id);
-    opt_write_frag_tag(out_buf + tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE, pkt_id, frag_index);
+    opt_write_frag_tag(out_buf + tunnel_off + L3_TUNNEL_HDR_SIZE, pkt_id, frag_index);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off, (int)enc_plain_len, &new_len) != 0)
         return -1;
-    ip_payload_len = (size_t)(L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE + new_len);
+    ip_payload_len = (size_t)(L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE + new_len);
     l3_patch_ipv4_fast(out_buf + ETH_HEADER_SIZE, (uint16_t)(ip_hdr_len + ip_payload_len), fake_proto);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
@@ -385,7 +377,7 @@ static int l3_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     uint8_t *ip = packet + ETH_HEADER_SIZE;
     uint8_t fake_proto = OPT_FAKE_PROTOCOL;
     int tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
-    int enc_off = tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
+    int enc_off = tunnel_off + L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
 
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
@@ -400,10 +392,10 @@ static int l3_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     if (crypto_pqc_generate_nonce(nonce) != 0)
         return -1;
     l3_write_tunnel_header_frag(packet + tunnel_off, nonce, CRYPTO_PQC_NONCE_BYTES, ctx->wire_id);
-    opt_write_frag_tag(packet + tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE, pkt_id, 0);
+    opt_write_frag_tag(packet + tunnel_off + L3_TUNNEL_HDR_SIZE, pkt_id, 0);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off, (int)frag0_plain_len, &new_len) != 0)
         return -1;
-    l3_patch_ipv4_fast(ip, (uint16_t)(ip_hdr_len + L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE + new_len), fake_proto);
+    l3_patch_ipv4_fast(ip, (uint16_t)(ip_hdr_len + L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE + new_len), fake_proto);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
 }
@@ -443,12 +435,12 @@ static int l3_decrypt_fragment(struct packet_crypto_ctx *ctx, uint8_t *packet, s
     if (packet[L3_IPV4_PROTO_OFF] != OPT_FAKE_PROTOCOL)
         return -1;
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
-    enc_off = tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
+    enc_off = tunnel_off + L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE;
     if (pkt_len < (size_t)enc_off)
         return -1;
     if (!l3_is_frag_tunnel(packet + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
         return -1;
-    opt_read_frag_tag(packet + tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE, out_pkt_id, out_frag_index);
+    opt_read_frag_tag(packet + tunnel_off + L3_TUNNEL_HDR_SIZE, out_pkt_id, out_frag_index);
     return l3_decrypt_fragment_body(ctx, packet, pkt_len, tunnel_off, enc_off);
 }
 
@@ -587,7 +579,7 @@ static int l3_udp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
         return -1;
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (pkt[L3_IPV4_PROTO_OFF] == OPT_FAKE_PROTOCOL &&
-        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 3) &&
+        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2) &&
         l3_is_frag_tunnel(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
         return 0;
     ip = pkt + ETH_HEADER_SIZE;
@@ -618,7 +610,7 @@ static int l3_udp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (*pkt_len < (uint32_t)(tunnel_off + L3_TUNNEL_HDR_SIZE))
         return 0;
-    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] == L3_FRAG_MAGIC)
+    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] == L3_FRAG_MAGIC)
         return 0;
     if (pkt[L3_IPV4_PROTO_OFF] != OPT_FAKE_PROTOCOL)
         return 0;
@@ -661,16 +653,16 @@ static int l3_udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_d
     if (ip_hdr_len < 20)
         return 0;
     tunnel_off = 14 + ip_hdr_len;
-    if (pkt_len < (uint32_t)(tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE))
+    if (pkt_len < (uint32_t)(tunnel_off + L3_TUNNEL_HDR_SIZE + L3_FRAG_TAG_SIZE))
         return 0;
-    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2 >= (int)pkt_len)
+    if (tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1 >= (int)pkt_len)
         return 0;
-    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] != L3_FRAG_MAGIC)
+    if (pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] != L3_FRAG_MAGIC)
         return 0;
-    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1];
+    wire_pol = pkt_data[tunnel_off + PACKET_CRYPTO_NONCE_BYTES];
     if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L3, CRYPTO_MODE_PQC, 256, wire_pol))
         return 0;
-    opt_read_frag_tag(pkt_data + tunnel_off + L3_FRAG_TUNNEL_HDR_SIZE, pkt_id, frag_index);
+    opt_read_frag_tag(pkt_data + tunnel_off + L3_TUNNEL_HDR_SIZE, pkt_id, frag_index);
     return (*frag_index <= 1) ? 1 : 0;
 }
 
@@ -723,7 +715,7 @@ static int l3_tcp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
         return -1;
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (pkt[L3_IPV4_PROTO_OFF] == OPT_FAKE_PROTOCOL &&
-        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 3) &&
+        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2) &&
         l3_is_frag_tunnel(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
         return 0;
     ip = pkt + ETH_HEADER_SIZE;
@@ -754,7 +746,7 @@ static int l3_tcp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (*pkt_len < (uint32_t)(tunnel_off + L3_TUNNEL_HDR_SIZE))
         return 0;
-    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] == L3_FRAG_MAGIC)
+    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] == L3_FRAG_MAGIC)
         return 0;
     if (pkt[L3_IPV4_PROTO_OFF] != OPT_FAKE_PROTOCOL)
         return 0;
@@ -784,7 +776,7 @@ static int l3_icmp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t
         return -1;
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (pkt[L3_IPV4_PROTO_OFF] == OPT_FAKE_PROTOCOL &&
-        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 3) &&
+        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2) &&
         l3_is_frag_tunnel(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
         return 0;
     ip = pkt + ETH_HEADER_SIZE;
@@ -815,7 +807,7 @@ static int l3_icmp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (*pkt_len < (uint32_t)(tunnel_off + L3_TUNNEL_HDR_SIZE))
         return 0;
-    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] == L3_FRAG_MAGIC)
+    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] == L3_FRAG_MAGIC)
         return 0;
     if (pkt[L3_IPV4_PROTO_OFF] != OPT_FAKE_PROTOCOL)
         return 0;
@@ -845,7 +837,7 @@ static int l3_ospf_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t
         return -1;
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (pkt[L3_IPV4_PROTO_OFF] == OPT_FAKE_PROTOCOL &&
-        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 3) &&
+        *pkt_len >= (uint32_t)(tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2) &&
         l3_is_frag_tunnel(pkt + tunnel_off, PACKET_CRYPTO_NONCE_BYTES))
         return 0;
     ip = pkt + ETH_HEADER_SIZE;
@@ -876,7 +868,7 @@ static int l3_ospf_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t
     tunnel_off = ETH_HEADER_SIZE + ip_hdr_len;
     if (*pkt_len < (uint32_t)(tunnel_off + L3_TUNNEL_HDR_SIZE))
         return 0;
-    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 2] == L3_FRAG_MAGIC)
+    if (pkt[tunnel_off + PACKET_CRYPTO_NONCE_BYTES + 1] == L3_FRAG_MAGIC)
         return 0;
     if (pkt[L3_IPV4_PROTO_OFF] != OPT_FAKE_PROTOCOL)
         return 0;

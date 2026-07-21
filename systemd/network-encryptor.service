@@ -15,3 +15,7 @@ WantedBy=multi-user.target
 # ln -s /usr/bin/bin-ne/network-encryptor /usr/local/bin/network-encryptor
 # /etc/ld.so.conf.d/network-encryptor.conf
 # ldconfig
+# ethtool -K <interface> gro off lro off
+# ethtool -K <interface> tso off gso off
+# ethtool -k eno2 | grep generic-receive-offload
+# ethtool -K eno2 gro on

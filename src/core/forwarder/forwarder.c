@@ -4,7 +4,6 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane.h"
-#include "../../../inc/core/dataplane_util.h"
 #include "../../../inc/core/crypto_route.h"
 
 #include "../../../inc/core/main_diag.h"
@@ -67,19 +66,17 @@ static void dp_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
 
 static void dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
-    struct ne_ring *rings[NE_CRYPTO_WORKERS + NE_BYPASS_WORKERS];
-    int n = 0;
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
         return;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[n++] = &fwd->mid_to_local[local_idx][w];
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++)
-        rings[n++] = &fwd->mid_to_local_bypass[local_idx][w];
+        rings[w] = &fwd->mid_to_local[local_idx][w];
 
     for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_local_all(&fwd->pair, rings, n, local_idx, tx_slot);
+        int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
+                                         local_idx, tx_slot);
         if (sent <= 0)
             break;
     }
@@ -87,19 +84,17 @@ static void dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 
 static void dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
-    struct ne_ring *rings[NE_CRYPTO_WORKERS + NE_BYPASS_WORKERS];
-    int n = 0;
+    struct ne_ring *rings[NE_CRYPTO_WORKERS];
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
         return;
 
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[n++] = &fwd->mid_to_wan[wan_idx][w];
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++)
-        rings[n++] = &fwd->mid_to_wan_bypass[wan_idx][w];
+        rings[w] = &fwd->mid_to_wan[wan_idx][w];
 
     for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, n, wan_idx, tx_slot);
+        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
+                                       wan_idx, tx_slot);
         if (sent <= 0)
             break;
     }
@@ -180,30 +175,13 @@ static void *local_rx_thread(void *arg)
         }
 
         for (int i = 0; i < rcvd; i++) {
-            const uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            int li = batch[i].local_idx < fwd->local_count ? (int)batch[i].local_idx : 0;
-            int wi;
-            int to_bypass;
-
-            /* ARP: bypass path only — no crypto channel / no encrypt. */
-            to_bypass = dp_pkt_is_arp(pkt, batch[i].len) ||
-                        dataplane_local_is_bypass(fwd, li, pkt, batch[i].len);
-            if (to_bypass) {
-                wi = dp_bypass_pick_worker(pkt, batch[i].len);
-                if (ne_ring_try_push(&fwd->local_to_bypass[wi], &batch[i]) != 0) {
-                    ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                       ne_ring_count(&fwd->local_to_bypass[wi]));
-                    ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
-                    ne_frame_free(&fwd->pair, batch[i].addr);
-                }
-            } else {
-                wi = dp_crypto_pick_local_worker(pkt, batch[i].len);
-                if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                    ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                       ne_ring_count(&fwd->local_to_mid[wi]));
-                    ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
-                    ne_frame_free(&fwd->pair, batch[i].addr);
-                }
+            int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
+                                                 batch[i].len);
+            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
+                ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
+                                   ne_ring_count(&fwd->local_to_mid[wi]));
+                ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
+                ne_frame_free(&fwd->pair, batch[i].addr);
             }
         }
         ne_recv_release_local_slot(&fwd->pair, ctx->rx_slot);
@@ -263,21 +241,7 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            /* ARP: bypass only — no crypto channel. */
-            if (dp_pkt_is_arp(pkt, batch[i].len))
-                wi = DP_CRYPTO_WAN_PLAIN;
-            else
-                wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
-            if (wi == DP_CRYPTO_WAN_PLAIN) {
-                wi = dp_bypass_pick_worker(pkt, batch[i].len);
-                if (ne_ring_try_push(&fwd->wan_to_bypass[wi], &batch[i]) != 0) {
-                    ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
-                                       ne_ring_count(&fwd->wan_to_bypass[wi]));
-                    ne_dp_stats_rx_ring_drop_wan(ctx->rx_slot, 1);
-                    ne_frame_free(&fwd->pair, batch[i].addr);
-                }
-                continue;
-            }
+            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
             if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;
@@ -316,12 +280,6 @@ static void *wan_tx_thread(void *arg)
 }
 
 struct crypto_worker_ctx {
-    struct forwarder *fwd;
-    int worker_idx;
-    uint8_t cpu_id;
-};
-
-struct bypass_worker_ctx {
     struct forwarder *fwd;
     int worker_idx;
     uint8_t cpu_id;
@@ -409,32 +367,6 @@ static void *crypto_worker_thread(void *arg)
     return NULL;
 }
 
-static void *bypass_worker_thread(void *arg)
-{
-    struct bypass_worker_ctx *ctx = arg;
-    struct forwarder *fwd = ctx->fwd;
-    struct ne_packet job;
-
-    pin_cpu(ctx->cpu_id);
-    dp_bypass_worker_bind(ctx->worker_idx);
-
-    while (atomic_load_explicit(&running, memory_order_acquire)) {
-        int did_work = 0;
-
-        if (ne_ring_try_pop(&fwd->wan_to_bypass[ctx->worker_idx], &job) == 0) {
-            dataplane_process_wan(fwd, job);
-            did_work = 1;
-        }
-        if (ne_ring_try_pop(&fwd->local_to_bypass[ctx->worker_idx], &job) == 0) {
-            dataplane_process_local(fwd, job);
-            did_work = 1;
-        }
-        if (!did_work)
-            sched_yield();
-    }
-    return NULL;
-}
-
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 {
     if (!fwd || !cfg || cfg->local_count <= 0)
@@ -504,22 +436,9 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
             return -1;
         }
     }
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++) {
-        if (ne_ring_init(&fwd->local_to_bypass[w], NE_RING, 0) != 0 ||
-            ne_ring_init(&fwd->wan_to_bypass[w], NE_RING, 0) != 0) {
-            forwarder_cleanup(fwd);
-            return -1;
-        }
-    }
     for (int i = 0; i < fwd->local_count; i++) {
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
             if (ne_ring_init(&fwd->mid_to_local[i][w], NE_RING, 1) != 0) {
-                forwarder_cleanup(fwd);
-                return -1;
-            }
-        }
-        for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++) {
-            if (ne_ring_init(&fwd->mid_to_local_bypass[i][w], NE_RING, 1) != 0) {
                 forwarder_cleanup(fwd);
                 return -1;
             }
@@ -528,12 +447,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     for (int i = 0; i < fwd->wan_count; i++) {
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
             if (ne_ring_init(&fwd->mid_to_wan[i][w], NE_RING, 1) != 0) {
-                forwarder_cleanup(fwd);
-                return -1;
-            }
-        }
-        for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++) {
-            if (ne_ring_init(&fwd->mid_to_wan_bypass[i][w], NE_RING, 1) != 0) {
                 forwarder_cleanup(fwd);
                 return -1;
             }
@@ -559,29 +472,20 @@ void forwarder_cleanup(struct forwarder *fwd)
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);
     }
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++) {
-        ne_ring_destroy(&fwd->local_to_bypass[w]);
-        ne_ring_destroy(&fwd->wan_to_bypass[w]);
-    }
     for (int i = 0; i < MAX_INTERFACES; i++) {
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
             ne_ring_destroy(&fwd->mid_to_wan[i][w]);
-        for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++)
-            ne_ring_destroy(&fwd->mid_to_wan_bypass[i][w]);
     }
     for (int i = 0; i < MAX_INTERFACES; i++) {
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
             ne_ring_destroy(&fwd->mid_to_local[i][w]);
-        for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++)
-            ne_ring_destroy(&fwd->mid_to_local_bypass[i][w]);
     }
     fwd_crypto_cleanup_all_profile_slots();
     ne_pair_close(&fwd->pair);
 }
 
 static void forwarder_join_started(struct forwarder *fwd, int local_rx_started, int local_tx_started,
-                                   int crypto_started, int bypass_started,
-                                   int wan_tx_started, int wan_rx_started)
+                                   int crypto_started, int wan_tx_started, int wan_rx_started)
 {
     atomic_store_explicit(&running, 0, memory_order_release);
     for (int w = 0; w < local_rx_started; w++)
@@ -590,8 +494,6 @@ static void forwarder_join_started(struct forwarder *fwd, int local_rx_started, 
         pthread_join(fwd->local_tx_threads[w], NULL);
     for (int w = 0; w < crypto_started; w++)
         pthread_join(fwd->crypto_threads[w], NULL);
-    for (int w = 0; w < bypass_started; w++)
-        pthread_join(fwd->bypass_threads[w], NULL);
     for (int w = 0; w < wan_tx_started; w++)
         pthread_join(fwd->wan_tx_threads[w], NULL);
     for (int w = 0; w < wan_rx_started; w++)
@@ -601,13 +503,11 @@ static void forwarder_join_started(struct forwarder *fwd, int local_rx_started, 
 void forwarder_run(struct forwarder *fwd)
 {
     struct crypto_worker_ctx crypto_ctx[NE_CRYPTO_WORKERS];
-    struct bypass_worker_ctx bypass_ctx[NE_BYPASS_WORKERS];
     struct dp_tx_slot_ctx local_tx_ctx[NE_TX_SLOTS];
     struct dp_tx_slot_ctx wan_tx_ctx[NE_TX_SLOTS];
     struct dp_rx_slot_ctx local_rx_ctx[NE_RX_LAN_SLOTS];
     struct dp_rx_slot_ctx wan_rx_ctx[NE_RX_WAN_SLOTS];
     int crypto_started = 0;
-    int bypass_started = 0;
     int local_rx_started = 0, local_tx_started = 0, wan_tx_started = 0, wan_rx_started = 0;
 
     if (!fwd || forwarder_should_stop())
@@ -624,7 +524,7 @@ void forwarder_run(struct forwarder *fwd)
             local_rx_ctx[w].rx_slot = w;
             local_rx_ctx[w].cpu_id = ne_cpu_rx_lan((uint32_t)w);
             if (pthread_create(&fwd->local_rx_threads[w], NULL, local_rx_thread, &local_rx_ctx[w]) != 0) {
-                forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0, 0);
+                forwarder_join_started(fwd, local_rx_started, 0, 0, 0, 0);
                 return;
             }
             local_rx_started++;
@@ -636,7 +536,7 @@ void forwarder_run(struct forwarder *fwd)
         local_tx_ctx[w].tx_slot = w;
         local_tx_ctx[w].cpu_id = ne_cpu_tx_lan((uint32_t)w);
         if (pthread_create(&fwd->local_tx_threads[w], NULL, local_tx_thread, &local_tx_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, local_tx_started, 0, 0, 0, 0);
+            forwarder_join_started(fwd, local_rx_started, local_tx_started, 0, 0, 0);
             return;
         }
         local_tx_started++;
@@ -647,22 +547,10 @@ void forwarder_run(struct forwarder *fwd)
         crypto_ctx[w].worker_idx = w;
         crypto_ctx[w].cpu_id = ne_cpu_crypto((uint32_t)w);
         if (pthread_create(&fwd->crypto_threads[w], NULL, crypto_worker_thread, &crypto_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started, 0, 0, 0);
+            forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started, 0, 0);
             return;
         }
         crypto_started++;
-    }
-
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++) {
-        bypass_ctx[w].fwd = fwd;
-        bypass_ctx[w].worker_idx = w;
-        bypass_ctx[w].cpu_id = ne_cpu_bypass((uint32_t)w);
-        if (pthread_create(&fwd->bypass_threads[w], NULL, bypass_worker_thread, &bypass_ctx[w]) != 0) {
-            forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
-                                   bypass_started, 0, 0);
-            return;
-        }
-        bypass_started++;
     }
 
     for (int w = 0; w < (int)NE_TX_SLOTS; w++) {
@@ -671,7 +559,7 @@ void forwarder_run(struct forwarder *fwd)
         wan_tx_ctx[w].cpu_id = ne_cpu_tx_wan((uint32_t)w);
         if (pthread_create(&fwd->wan_tx_threads[w], NULL, wan_tx_thread, &wan_tx_ctx[w]) != 0) {
             forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
-                                   bypass_started, wan_tx_started, 0);
+                                   wan_tx_started, 0);
             return;
         }
         wan_tx_started++;
@@ -686,7 +574,7 @@ void forwarder_run(struct forwarder *fwd)
             wan_rx_ctx[w].cpu_id = ne_cpu_rx_wan((uint32_t)w);
             if (pthread_create(&fwd->wan_rx_threads[w], NULL, wan_rx_thread, &wan_rx_ctx[w]) != 0) {
                 forwarder_join_started(fwd, local_rx_started, local_tx_started, crypto_started,
-                                       bypass_started, wan_tx_started, wan_rx_started);
+                                       wan_tx_started, wan_rx_started);
                 return;
             }
             wan_rx_started++;
@@ -704,8 +592,6 @@ void forwarder_run(struct forwarder *fwd)
         pthread_join(fwd->local_tx_threads[w], NULL);
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
         pthread_join(fwd->crypto_threads[w], NULL);
-    for (int w = 0; w < (int)NE_BYPASS_WORKERS; w++)
-        pthread_join(fwd->bypass_threads[w], NULL);
     for (int w = 0; w < (int)NE_TX_SLOTS; w++)
         pthread_join(fwd->wan_tx_threads[w], NULL);
     for (int w = 0; w < wan_rx_started; w++)

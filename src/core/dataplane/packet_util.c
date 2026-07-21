@@ -10,15 +10,6 @@
 #include <netinet/udp.h>
 #include <string.h>
 
-#define ETH_P_ARP_BE 0x0806u
-
-int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len)
-{
-    if (!pkt || len < 14u)
-        return 0;
-    return ((uint16_t)(((uint16_t)pkt[12] << 8) | pkt[13]) == ETH_P_ARP_BE);
-}
-
 int dp_parse_flow(void *pkt_data, uint32_t pkt_len,
                   uint32_t *src_ip, uint32_t *dst_ip,
                   uint16_t *src_port, uint16_t *dst_port, uint8_t *proto)

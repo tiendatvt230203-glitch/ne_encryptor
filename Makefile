@@ -43,30 +43,12 @@ DB_OBJ = $(DB_SRC:.c=.o)
 BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
-# Copy one soname from system into ./lib (real file + symlink).
-define copy_lib_so
-	@src=$$(ldconfig -p 2>/dev/null | awk '$$1 == "$(1)" { print $$NF; exit }'); \
-	if [ -n "$$src" ] && [ -f "$$src" ]; then \
-		real=$$(readlink -f "$$src"); base=$$(basename "$$real"); \
-		cp -f "$$real" $(LIB_DIR)/$$base; \
-		ln -sfn $$base $(LIB_DIR)/$(1); \
-		echo "[lib] $(1) -> $$base"; \
-	fi
-endef
-
 .PHONY: all clean dirs
 
 all: dirs $(BPF_OBJ) $(TARGET)
 
-dirs:
-	mkdir -p $(LIB_DIR)
-
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
-	# -rpath=$ORIGIN/lib: binary chỉ ưu tiên ./lib — phải có đủ .so trong đó
-	$(call copy_lib_so,libbpf.so.1)
-	$(call copy_lib_so,libelf.so.1)
-	$(call copy_lib_so,libz.so.1)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

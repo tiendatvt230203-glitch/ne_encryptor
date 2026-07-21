@@ -4,8 +4,22 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
-#define ETH_HEADER_SIZE 14u
+#ifndef MAC_LEARN_CACHE_TTL_MIN
+#define MAC_LEARN_CACHE_TTL_MIN 5ull
+#endif
+
+#define MAC_LEARN_ENTRY_TTL_MS  (MAC_LEARN_CACHE_TTL_MIN * 60ull * 1000ull)
+#define ETH_HEADER_SIZE         14u
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
 
 static uint8_t mac_hash_key(const uint8_t mac[MAC_LEN])
 {
@@ -54,12 +68,19 @@ static void log_mac(const char *event, const uint8_t mac[MAC_LEN], const char *i
             ifname ? ifname : "-");
 }
 
-static void log_mac_update(const uint8_t mac[MAC_LEN], const char *old_ifname,
-                           const char *new_ifname)
+static void log_mac_move(const uint8_t mac[MAC_LEN], const char *old_ifname,
+                         const char *new_ifname)
 {
-    fprintf(stderr, "[MAC] update %02x:%02x:%02x:%02x:%02x:%02x iface=%s->%s\n",
+    fprintf(stderr, "[MAC] move %02x:%02x:%02x:%02x:%02x:%02x iface=%s->%s\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             old_ifname ? old_ifname : "-", new_ifname ? new_ifname : "-");
+}
+
+static void log_mac_stale(const uint8_t mac[MAC_LEN], const char *ifname, uint64_t idle_ms)
+{
+    fprintf(stderr, "[MAC] clean-stale %02x:%02x:%02x:%02x:%02x:%02x iface=%s idle_ms=%llu\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            ifname ? ifname : "-", (unsigned long long)idle_ms);
 }
 
 static void remove_idx_locked(struct mac_learn_table *t, int idx)
@@ -73,17 +94,22 @@ static void remove_idx_locked(struct mac_learn_table *t, int idx)
 }
 
 static void upsert_locked(struct mac_learn_table *t, const char *ifname,
-                          const uint8_t mac[MAC_LEN])
+                          const uint8_t mac[MAC_LEN], uint64_t now_ms)
 {
     int if_idx = find_idx_by_ifname_locked(t, ifname);
     int mac_idx;
 
     if (if_idx >= 0) {
-        if (memcmp(t->list[if_idx].mac, mac, MAC_LEN) == 0)
+        if (memcmp(t->list[if_idx].mac, mac, MAC_LEN) == 0) {
+            t->list[if_idx].last_seen_ms = now_ms;
             return;
+        }
+        
+        log_mac("clean-replace", t->list[if_idx].mac, t->list[if_idx].ifname);
 
         mac_idx = find_idx_by_mac_locked(t, mac);
         if (mac_idx >= 0 && mac_idx != if_idx) {
+            log_mac_move(mac, t->list[mac_idx].ifname, ifname);
             remove_idx_locked(t, mac_idx);
             if_idx = find_idx_by_ifname_locked(t, ifname);
             if (if_idx < 0)
@@ -91,16 +117,18 @@ static void upsert_locked(struct mac_learn_table *t, const char *ifname,
         }
 
         memcpy(t->list[if_idx].mac, mac, MAC_LEN);
-        log_mac("update", mac, t->list[if_idx].ifname);
+        t->list[if_idx].last_seen_ms = now_ms;
+        log_mac("learn", mac, t->list[if_idx].ifname);
         hash_rebuild_locked(t);
         return;
     }
 
     mac_idx = find_idx_by_mac_locked(t, mac);
     if (mac_idx >= 0) {
-        log_mac_update(mac, t->list[mac_idx].ifname, ifname);
+        log_mac_move(mac, t->list[mac_idx].ifname, ifname);
         strncpy(t->list[mac_idx].ifname, ifname, IF_NAMESIZE - 1);
         t->list[mac_idx].ifname[IF_NAMESIZE - 1] = '\0';
+        t->list[mac_idx].last_seen_ms = now_ms;
         return;
     }
 
@@ -112,6 +140,7 @@ static void upsert_locked(struct mac_learn_table *t, const char *ifname,
     memcpy(t->list[i].mac, mac, MAC_LEN);
     strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
     t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
+    t->list[i].last_seen_ms = now_ms;
     log_mac("learn", mac, t->list[i].ifname);
     hash_rebuild_locked(t);
 }
@@ -126,10 +155,13 @@ static void table_init(struct mac_learn_table *t)
 
 static void table_learn(struct mac_learn_table *t, const char *ifname, const uint8_t mac[MAC_LEN])
 {
+    uint64_t now_ms;
+
     if (!t || !ifname || !mac || ifname[0] == '\0')
         return;
+    now_ms = monotonic_ms();
     pthread_spin_lock(&t->lock);
-    upsert_locked(t, ifname, mac);
+    upsert_locked(t, ifname, mac, now_ms);
     pthread_spin_unlock(&t->lock);
 }
 
@@ -146,6 +178,7 @@ static int table_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
         pthread_spin_unlock(&t->lock);
         return -1;
     }
+    t->list[i].last_seen_ms = monotonic_ms();
     strncpy(ifname, t->list[i].ifname, IF_NAMESIZE - 1);
     ifname[IF_NAMESIZE - 1] = '\0';
     pthread_spin_unlock(&t->lock);
@@ -185,6 +218,32 @@ static void table_purge_orphan_locked(struct mac_learn_table *t, const struct ap
             if (w != i)
                 t->list[w] = t->list[i];
             w++;
+        } else {
+            log_mac("clean-orphan", t->list[i].mac, t->list[i].ifname);
+        }
+    }
+    if (w != t->count) {
+        t->count = w;
+        hash_rebuild_locked(t);
+    }
+}
+
+static void table_expire_stale_locked(struct mac_learn_table *t, uint64_t now_ms, uint64_t ttl_ms)
+{
+    int w = 0;
+
+    if (!t)
+        return;
+
+    for (int i = 0; i < t->count; i++) {
+        uint64_t idle_ms = now_ms - t->list[i].last_seen_ms;
+
+        if (idle_ms <= ttl_ms) {
+            if (w != i)
+                t->list[w] = t->list[i];
+            w++;
+        } else {
+            log_mac_stale(t->list[i].mac, t->list[i].ifname, idle_ms);
         }
     }
     if (w != t->count) {
@@ -195,10 +254,14 @@ static void table_purge_orphan_locked(struct mac_learn_table *t, const struct ap
 
 static void table_maintain(struct mac_learn_table *t, const struct app_config *cfg)
 {
+    uint64_t now_ms;
+
     if (!t)
         return;
+    now_ms = monotonic_ms();
     pthread_spin_lock(&t->lock);
     table_purge_orphan_locked(t, cfg);
+    table_expire_stale_locked(t, now_ms, MAC_LEARN_ENTRY_TTL_MS);
     pthread_spin_unlock(&t->lock);
 }
 

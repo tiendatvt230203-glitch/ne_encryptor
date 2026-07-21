@@ -26,7 +26,6 @@ struct flow_table *fwd_crypto_flow_table(int slot);
 
 struct packet_crypto_ctx *fwd_crypto_ctx_for_wire_id(uint8_t wire_id);
 int fwd_crypto_profile_id_for_wire_id(uint8_t wire_id);
-const struct crypto_policy *fwd_crypto_policy_for_wire_id(uint8_t wire_id);
 int fwd_crypto_policy_ready(int policy_index);
 struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index);
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len);

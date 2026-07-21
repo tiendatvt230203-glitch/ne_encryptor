@@ -842,4 +842,3 @@ const struct crypto_option_ops *crypto_opt_l4_pqc_udp_ops(void)
     };
     return &ops;
 }
-
