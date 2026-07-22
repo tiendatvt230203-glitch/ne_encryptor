@@ -486,6 +486,19 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
     return 1;
 }
 
+/* ARP: SPA/TPA only — no L4 ports; caller requires L2 + protocol any. */
+static int crypto_policy_match_arp_ips(const struct crypto_policy *cp,
+                                       uint32_t spa, uint32_t tpa)
+{
+    if (!cp)
+        return 0;
+    if (!cidr_match_with_negate(cp->src_any, cp->src_negate, spa, cp->src_net, cp->src_mask))
+        return 0;
+    if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, tpa, cp->dst_net, cp->dst_mask))
+        return 0;
+    return 1;
+}
+
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
@@ -505,10 +518,7 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
             continue;
 
         const struct crypto_policy *cp = &cfg->policies[pi];
-        int matched = crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol);
-        if (!matched)
-            matched = crypto_policy_match_packet(cp, dst_ip, src_ip, dst_port, src_port, protocol);
-        if (!matched)
+        if (!crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol))
             continue;
 
         if (!best ||
@@ -537,7 +547,6 @@ const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, 
     for (int i = 0; i < p->policy_count; i++) {
         int pi = p->policy_indices[i];
         const struct crypto_policy *cp;
-        int matched;
 
         if (pi < 0 || pi >= cfg->policy_count)
             continue;
@@ -546,10 +555,7 @@ const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, 
         if (cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->protocol != POLICY_PROTO_ANY)
             continue;
 
-        matched = crypto_policy_match_packet(cp, spa, tpa, 0, 0, POLICY_PROTO_ANY);
-        if (!matched)
-            matched = crypto_policy_match_packet(cp, tpa, spa, 0, 0, POLICY_PROTO_ANY);
-        if (!matched)
+        if (!crypto_policy_match_arp_ips(cp, spa, tpa))
             continue;
 
         if (!best ||
