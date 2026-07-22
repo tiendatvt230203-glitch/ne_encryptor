@@ -86,7 +86,7 @@ static int l2_restore_plain_arp_packet(uint8_t *packet, size_t pkt_len,
 static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int arp_off = crypto_eth_arp_offset(packet, pkt_len);
-    int et_off = crypto_eth_l2_prefix_len(packet, pkt_len);
+    int et_off;
     size_t payload_len;
     uint32_t counter = packet_crypto_next_counter();
     uint8_t nonce[16];
@@ -95,8 +95,9 @@ static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
     uint8_t iv[AES128_IV_SIZE];
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
 
-    if (arp_off < 0 || et_off < 0)
+    if (arp_off < 0)
         return -1;
+    et_off = arp_off - 2;
     payload_len = pkt_len - (size_t)arp_off;
     enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
     if (pkt_len < (size_t)enc_start)

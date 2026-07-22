@@ -368,15 +368,16 @@ static int l2_verify_arp_after_decrypt(const uint8_t *arp_payload, size_t len)
 static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int arp_off = crypto_eth_arp_offset(packet, pkt_len);
-    int et_off = crypto_eth_l2_prefix_len(packet, pkt_len);
+    int et_off;
     size_t payload_len;
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
     int new_len = 0;
     int enc_start;
 
-    if (arp_off < 0 || et_off < 0)
+    if (arp_off < 0)
         return -1;
+    et_off = arp_off - 2;
     payload_len = pkt_len - (size_t)arp_off;
     enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
     if (pkt_len < (size_t)enc_start)

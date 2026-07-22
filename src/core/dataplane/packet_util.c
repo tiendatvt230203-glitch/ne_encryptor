@@ -201,6 +201,38 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
             sha, spa, tha, tpa, bridge);
 }
 
+void dp_log_arp_encrypt(const char *dir, const char *iface,
+                        const uint8_t *pkt, uint32_t len,
+                        int policy_db_id, int policy_pkt_tag,
+                        const char *egress_ifname)
+{
+    uint32_t off;
+    const uint8_t *arp;
+    uint16_t op;
+    char sha[18], tha[18], spa[16], tpa[16];
+
+    if (!dir || !iface || !pkt || !egress_ifname)
+        return;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return;
+
+    arp = pkt + off;
+    op = ((uint16_t)arp[6] << 8) | arp[7];
+    format_mac(arp + 8, sha, sizeof(sha));
+    format_mac(arp + 18, tha, sizeof(tha));
+    format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
+    format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
+
+    fprintf(stderr,
+            "[ARP] encrypt dir=%s iface=%s len=%u op=%s "
+            "sha=%s spa=%s tha=%s tpa=%s "
+            "policy_db_id=%d policy_pkt_tag=%d egress=%s\n",
+            dir, iface, len,
+            op == 1 ? "request" : (op == 2 ? "reply" : "other"),
+            sha, spa, tha, tpa,
+            policy_db_id, policy_pkt_tag, egress_ifname);
+}
+
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
 {
     if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {

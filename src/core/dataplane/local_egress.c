@@ -234,13 +234,13 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                         pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
                         pctx->wire_id = (uint8_t)cp->id;
                         pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
+                        dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
+                                           cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
                         enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                                              CRYPTO_PROTO_ARP, 0);
                         if (enc >= 0) {
                             if (enc == 0)
                                 (void)push_to_wan(fwd, &job, wan_dp);
-                            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len,
-                                                 fwd->wans[wan_dp].ifname);
                             return;
                         }
                     }
