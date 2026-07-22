@@ -523,6 +523,47 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
     return best;
 }
 
+const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, int profile_idx,
+                                                        uint32_t spa, uint32_t tpa)
+{
+    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count)
+        return NULL;
+
+    const struct profile_config *p = &cfg->profiles[profile_idx];
+    const struct crypto_policy *best = NULL;
+    int best_priority = 0x7fffffff;
+    int best_id = 0x7fffffff;
+
+    for (int i = 0; i < p->policy_count; i++) {
+        int pi = p->policy_indices[i];
+        const struct crypto_policy *cp;
+        int matched;
+
+        if (pi < 0 || pi >= cfg->policy_count)
+            continue;
+
+        cp = &cfg->policies[pi];
+        if (cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->protocol != POLICY_PROTO_ANY)
+            continue;
+
+        matched = crypto_policy_match_packet(cp, spa, tpa, 0, 0, POLICY_PROTO_ANY);
+        if (!matched)
+            matched = crypto_policy_match_packet(cp, tpa, spa, 0, 0, POLICY_PROTO_ANY);
+        if (!matched)
+            continue;
+
+        if (!best ||
+            cp->priority < best_priority ||
+            (cp->priority == best_priority && cp->id < best_id)) {
+            best = cp;
+            best_priority = cp->priority;
+            best_id = cp->id;
+        }
+    }
+
+    return best;
+}
+
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {
     return parse_ip_cidr(str, ip, netmask, network);
 }

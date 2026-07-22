@@ -2,6 +2,7 @@
 
 #define ETH_P_8021Q  0x8100u
 #define ETH_P_IP     0x0800u
+#define ETH_P_ARP    0x0806u
 
 static uint16_t eth_read_et(const uint8_t *pkt, int off)
 {
@@ -47,6 +48,31 @@ int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len)
     return et_off + 2;
 }
 
+int crypto_eth_arp_offset(const uint8_t *pkt, size_t pkt_len)
+{
+    int et_off;
+    uint16_t et;
+
+    if (!pkt || pkt_len < 14)
+        return -1;
+
+    et = eth_read_et(pkt, 12);
+    if (et == ETH_P_8021Q) {
+        if (pkt_len < 18)
+            return -1;
+        et_off = 16;
+        et = eth_read_et(pkt, et_off);
+    } else {
+        et_off = 12;
+    }
+
+    if (et != ETH_P_ARP)
+        return -1;
+    if (pkt_len < (size_t)(et_off + 2 + 28))
+        return -1;
+    return et_off + 2;
+}
+
 int crypto_eth_l2_prefix_len(const uint8_t *pkt, size_t pkt_len)
 {
     int et_off = crypto_eth_inner_et_off(pkt, pkt_len);
@@ -61,12 +87,25 @@ int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len)
     return crypto_eth_ipv4_offset(pkt, pkt_len) >= 0;
 }
 
+int crypto_pkt_is_arp(const uint8_t *pkt, size_t pkt_len)
+{
+    return crypto_eth_arp_offset(pkt, pkt_len) >= 0;
+}
+
 void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off)
 {
     if (!pkt || inner_et_off < 0)
         return;
     pkt[inner_et_off] = 0x08;
     pkt[inner_et_off + 1] = 0x00;
+}
+
+void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off)
+{
+    if (!pkt || inner_et_off < 0)
+        return;
+    pkt[inner_et_off] = 0x08;
+    pkt[inner_et_off + 1] = 0x06;
 }
 
 int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len)
