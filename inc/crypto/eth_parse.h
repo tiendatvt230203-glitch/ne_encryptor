@@ -22,8 +22,14 @@ int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_prefix_len(const uint8_t *pkt, size_t pkt_len);
 /** Check xem gói tin có phải IPv4 không: 1 = Đúng (True), 0 = Sai (False) */
 int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len);
+/** Offset tới ARP body (sau ethertype 0x0806), -1 nếu không phải plain ARP */
+int crypto_eth_arp_offset(const uint8_t *pkt, size_t pkt_len);
+/** Check plain ARP frame (ethertype 0x0806) */
+int crypto_pkt_is_arp(const uint8_t *pkt, size_t pkt_len);
 /** Ghi đè mã EtherType chuẩn của IPv4 (0x0800) vào vị trí chỉ định sau khi giải mã xong*/
 void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off);
+/** Restore ethertype 0x0806 after L2 ARP decrypt */
+void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off);
 
 int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len);

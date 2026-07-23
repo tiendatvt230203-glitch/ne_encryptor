@@ -73,9 +73,7 @@ static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr
 static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
                         const struct crypto_policy *cp, int wan_dp,
                         struct packet_crypto_ctx *pctx,
-                        uint32_t src_ip, uint32_t dst_ip,
-                        uint16_t src_port, uint16_t dst_port, uint8_t proto,
-                        int flow_ok)
+                        crypto_proto_class pclass, int flow_ok)
 {
     int worker_idx = dp_crypto_current_worker_idx();
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
@@ -84,12 +82,7 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     uint32_t len = job->len;
     uint32_t l1 = 0, l2 = 0;
     crypto_option_id opt_id = crypto_option_from_policy(cp);
-    crypto_proto_class pclass = crypto_proto_classify(proto);
 
-    (void)src_ip;
-    (void)dst_ip;
-    (void)src_port;
-    (void)dst_port;
     (void)flow_ok;
 
     if (crypto_option_need_split(opt_id, pclass, len)) {
@@ -152,6 +145,59 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
     return 0;
 }
 
+static int pick_arp_l2_policy(struct forwarder *fwd, int local_idx,
+                              uint32_t spa, uint32_t tpa,
+                              int *profile_idx, const struct crypto_policy **cp)
+{
+    if (!fwd || !fwd->cfg || !profile_idx || !cp)
+        return -1;
+
+    const struct crypto_policy *best = NULL;
+    int best_pi = -1, best_pri = 0x7fffffff, best_id = 0x7fffffff;
+
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *p = &fwd->cfg->profiles[pi];
+        const struct crypto_policy *c;
+        int found = 0;
+
+        if (!p->enabled)
+            continue;
+        for (int i = 0; i < p->local_count; i++)
+            if (p->local_indices[i] == local_idx)
+                found = 1;
+        if (!found)
+            continue;
+        c = config_select_arp_l2_policy(fwd->cfg, pi, spa, tpa);
+        if (!c)
+            continue;
+        if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
+            best = c;
+            best_pi = pi;
+            best_pri = c->priority;
+            best_id = c->id;
+        }
+    }
+    if (!best)
+        return -1;
+    *profile_idx = best_pi;
+    *cp = best;
+    return 0;
+}
+
+static int wan_dp_for_local_arp(struct forwarder *fwd, int profile_idx, int local_idx)
+{
+    const struct profile_config *prof;
+
+    if (!fwd || !fwd->cfg || profile_idx < 0 || profile_idx >= fwd->cfg->profile_count)
+        return -1;
+    prof = &fwd->cfg->profiles[profile_idx];
+    for (int i = 0; i < prof->bridge_count; i++) {
+        if (prof->bridges[i].local_idx == local_idx)
+            return prof->bridges[i].wan_dp;
+    }
+    return -1;
+}
+
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -172,9 +218,35 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     if (dp_pkt_is_arp(pkt, job.len)) {
         char bridge_to[IF_NAMESIZE] = "";
+        uint32_t spa = 0, tpa = 0;
 
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
-        /* ARP bridges plain — never gated by crypto policy. */
+        if (dp_parse_arp_ips(pkt, job.len, &spa, &tpa) == 0 &&
+            pick_arp_l2_policy(fwd, li, spa, tpa, &profile_idx, &cp) == 0 &&
+            fwd->cfg->crypto_enabled) {
+            wan_dp = wan_dp_for_local_arp(fwd, profile_idx, li);
+            if (wan_dp >= 0 && wan_dp < fwd->wan_count && !fwd_wan_is_stopped(wan_dp) &&
+                fwd_wan_has_tx_room(fwd, wan_dp)) {
+                pi = (int)(cp - fwd->cfg->policies);
+                if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && fwd_crypto_policy_ready(pi)) {
+                    pctx = fwd_crypto_policy_ctx(pi);
+                    if (pctx) {
+                        pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
+                        pctx->wire_id = (uint8_t)cp->id;
+                        pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
+                        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len,
+                                             fwd->wans[wan_dp].ifname);
+                        enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
+                                             CRYPTO_PROTO_ARP, 0);
+                        if (enc >= 0) {
+                            if (enc == 0)
+                                (void)push_to_wan(fwd, &job, wan_dp);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
             dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
             return;
@@ -217,7 +289,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     pctx->wire_id = (uint8_t)cp->id;
     pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
-                        src_ip, dst_ip, src_port, dst_port, proto, flow_ok);
+                        crypto_proto_classify(proto), flow_ok);
     if (enc < 0)
         goto drop;
     if (enc > 0)

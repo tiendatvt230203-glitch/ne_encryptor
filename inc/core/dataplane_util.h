@@ -9,6 +9,10 @@ int dp_parse_flow(void *pkt, uint32_t len,
 
 int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len);
 
+/* Parse SPA/TPA from Ethernet+IPv4 ARP. Returns 0 on success. */
+int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len,
+                     uint32_t *spa, uint32_t *tpa);
+
 /* Standard monitor line for every ARP frame reaching userspace. */
 void dp_log_arp_userspace(const char *dir, const char *iface,
                           const uint8_t *pkt, uint32_t len,

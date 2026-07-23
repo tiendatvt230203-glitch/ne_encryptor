@@ -133,6 +133,30 @@ static int arp_payload_offset(const uint8_t *pkt, uint32_t len, uint32_t *off_ou
     return 0;
 }
 
+int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len,
+                     uint32_t *spa, uint32_t *tpa)
+{
+    uint32_t off;
+    const uint8_t *arp;
+
+    if (!pkt || !spa || !tpa)
+        return -1;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return -1;
+
+    arp = pkt + off;
+    if (arp[0] != 0x00 || arp[1] != 0x01)
+        return -1;
+    if (arp[2] != 0x08 || arp[3] != 0x00)
+        return -1;
+    if (arp[4] != 6 || arp[5] != 4)
+        return -1;
+
+    memcpy(spa, arp + 14, 4);
+    memcpy(tpa, arp + 24, 4);
+    return 0;
+}
+
 static void format_mac(const uint8_t mac[6], char *buf, size_t bufsz)
 {
     snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
