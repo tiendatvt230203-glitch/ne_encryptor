@@ -13,10 +13,24 @@ int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len);
 int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len,
                      uint32_t *spa, uint32_t *tpa);
 
-/* Standard monitor line for every ARP frame reaching userspace. */
+/* One line per ARP frame: direction/bridge (+ optional L2 policy match).
+ * Pass policy_db_id < 0 when no L2 policy match. */
 void dp_log_arp_userspace(const char *dir, const char *iface,
                           const uint8_t *pkt, uint32_t len,
-                          const char *bridge_to);
+                          const char *bridge_to,
+                          int policy_db_id, int policy_pkt_tag);
+
+/* ARP matched L2 policy and is being encrypted (plain frame still). */
+void dp_log_arp_encrypt(const char *dir, const char *iface,
+                        const uint8_t *pkt, uint32_t len,
+                        int policy_db_id, int policy_pkt_tag,
+                        const char *egress_ifname);
+
+/* ARP decrypted from L2 wire; policy_pkt_tag is wire policy id. */
+void dp_log_arp_decrypt(const char *dir, const char *iface,
+                        const uint8_t *pkt, uint32_t len,
+                        int policy_db_id, int policy_pkt_tag,
+                        const char *bridge_to);
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt);
 

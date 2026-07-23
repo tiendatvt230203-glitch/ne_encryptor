@@ -545,13 +545,23 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dp_pkt_is_arp(pkt, job.len)) {
             int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
             char bridge_to[IF_NAMESIZE] = "";
+            uint8_t wire_id = 0;
+            const struct crypto_policy *cp = NULL;
+            int policy_db_id = -1;
+
+            if (crypto_eth_l2_read_policy_id(wire_buf, wire_len, &wire_id) == 0)
+                cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
+            if (cp)
+                policy_db_id = cp->db_id;
 
             if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+                dp_log_arp_decrypt("wan", fwd->wans[wan_dp].ifname, pkt, job.len,
+                                   policy_db_id, (int)wire_id, bridge_to);
                 return;
             }
             if (wan_dp >= 0)
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
+                dp_log_arp_decrypt("wan", fwd->wans[wan_dp].ifname, pkt, job.len,
+                                   policy_db_id, (int)wire_id, NULL);
             goto drop;
         }
         wan_clamp_tcp_mss(fwd, pkt, job.len);
@@ -559,12 +569,15 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
         char bridge_to[IF_NAMESIZE] = "";
 
+        /* Plain ARP from WAN: no wire overhead yet → direction/bridge log only. */
         if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to,
+                                 -1, -1);
             return;
         }
         if (wan_dp >= 0)
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL,
+                                 -1, -1);
         goto drop;
     } else {
         /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */

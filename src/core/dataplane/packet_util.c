@@ -173,7 +173,8 @@ static void format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
 
 void dp_log_arp_userspace(const char *dir, const char *iface,
                           const uint8_t *pkt, uint32_t len,
-                          const char *bridge_to)
+                          const char *bridge_to,
+                          int policy_db_id, int policy_pkt_tag)
 {
     uint32_t off;
     const uint8_t *arp;
@@ -193,12 +194,74 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
     format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
     format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
 
+    if (policy_db_id >= 0) {
+        fprintf(stderr,
+                "[ARP] dir=%s iface=%s len=%u op=%s "
+                "sha=%s spa=%s tha=%s tpa=%s bridge=%s "
+                "l2_match=yes policy_db_id=%d policy_pkt_tag=%d\n",
+                dir, iface, len,
+                op == 1 ? "request" : (op == 2 ? "reply" : "other"),
+                sha, spa, tha, tpa, bridge,
+                policy_db_id, policy_pkt_tag);
+    } else {
+        fprintf(stderr,
+                "[ARP] dir=%s iface=%s len=%u op=%s "
+                "sha=%s spa=%s tha=%s tpa=%s bridge=%s l2_match=no\n",
+                dir, iface, len,
+                op == 1 ? "request" : (op == 2 ? "reply" : "other"),
+                sha, spa, tha, tpa, bridge);
+    }
+}
+
+static void dp_log_arp_crypto(const char *action, const char *dir, const char *iface,
+                              const uint8_t *pkt, uint32_t len,
+                              int policy_db_id, int policy_pkt_tag,
+                              const char *peer_ifname)
+{
+    uint32_t off;
+    const uint8_t *arp;
+    uint16_t op;
+    char sha[18], tha[18], spa[16], tpa[16];
+    const char *peer = peer_ifname && peer_ifname[0] ? peer_ifname : "-";
+
+    if (!action || !dir || !iface || !pkt)
+        return;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return;
+
+    arp = pkt + off;
+    op = ((uint16_t)arp[6] << 8) | arp[7];
+    format_mac(arp + 8, sha, sizeof(sha));
+    format_mac(arp + 18, tha, sizeof(tha));
+    format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
+    format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
+
     fprintf(stderr,
-            "[ARP] userspace dir=%s iface=%s len=%u op=%s "
-            "sha=%s spa=%s tha=%s tpa=%s bridge=%s\n",
-            dir, iface, len,
+            "[ARP] %s dir=%s iface=%s len=%u op=%s "
+            "sha=%s spa=%s tha=%s tpa=%s "
+            "policy_db_id=%d policy_pkt_tag=%d peer=%s\n",
+            action, dir, iface, len,
             op == 1 ? "request" : (op == 2 ? "reply" : "other"),
-            sha, spa, tha, tpa, bridge);
+            sha, spa, tha, tpa,
+            policy_db_id, policy_pkt_tag, peer);
+}
+
+void dp_log_arp_encrypt(const char *dir, const char *iface,
+                        const uint8_t *pkt, uint32_t len,
+                        int policy_db_id, int policy_pkt_tag,
+                        const char *egress_ifname)
+{
+    dp_log_arp_crypto("encrypt", dir, iface, pkt, len,
+                      policy_db_id, policy_pkt_tag, egress_ifname);
+}
+
+void dp_log_arp_decrypt(const char *dir, const char *iface,
+                        const uint8_t *pkt, uint32_t len,
+                        int policy_db_id, int policy_pkt_tag,
+                        const char *bridge_to)
+{
+    dp_log_arp_crypto("decrypt", dir, iface, pkt, len,
+                      policy_db_id, policy_pkt_tag, bridge_to);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
