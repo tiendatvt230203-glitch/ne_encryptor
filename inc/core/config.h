@@ -138,6 +138,4 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
-const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, int profile_idx,
-                                                        uint32_t spa, uint32_t tpa);
 #endif

@@ -383,7 +383,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
     fwd->wan_count = config_count_dataplane_wans(cfg);
-
     if (fwd->local_count > MAX_INTERFACES)
         fwd->local_count = MAX_INTERFACES;
     if (fwd->wan_count > MAX_INTERFACES)

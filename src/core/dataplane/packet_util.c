@@ -133,30 +133,6 @@ static int arp_payload_offset(const uint8_t *pkt, uint32_t len, uint32_t *off_ou
     return 0;
 }
 
-int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len,
-                     uint32_t *spa, uint32_t *tpa)
-{
-    uint32_t off;
-    const uint8_t *arp;
-
-    if (!pkt || !spa || !tpa)
-        return -1;
-    if (arp_payload_offset(pkt, len, &off) != 0)
-        return -1;
-
-    arp = pkt + off;
-    if (arp[0] != 0x00 || arp[1] != 0x01)
-        return -1;
-    if (arp[2] != 0x08 || arp[3] != 0x00)
-        return -1;
-    if (arp[4] != 6 || arp[5] != 4)
-        return -1;
-
-    memcpy(spa, arp + 14, 4);
-    memcpy(tpa, arp + 24, 4);
-    return 0;
-}
-
 static void format_mac(const uint8_t mac[6], char *buf, size_t bufsz)
 {
     snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -199,38 +175,6 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
             dir, iface, len,
             op == 1 ? "request" : (op == 2 ? "reply" : "other"),
             sha, spa, tha, tpa, bridge);
-}
-
-void dp_log_arp_encrypt(const char *dir, const char *iface,
-                        const uint8_t *pkt, uint32_t len,
-                        int policy_db_id, int policy_pkt_tag,
-                        const char *egress_ifname)
-{
-    uint32_t off;
-    const uint8_t *arp;
-    uint16_t op;
-    char sha[18], tha[18], spa[16], tpa[16];
-
-    if (!dir || !iface || !pkt || !egress_ifname)
-        return;
-    if (arp_payload_offset(pkt, len, &off) != 0)
-        return;
-
-    arp = pkt + off;
-    op = ((uint16_t)arp[6] << 8) | arp[7];
-    format_mac(arp + 8, sha, sizeof(sha));
-    format_mac(arp + 18, tha, sizeof(tha));
-    format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
-    format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
-
-    fprintf(stderr,
-            "[ARP] encrypt dir=%s iface=%s len=%u op=%s "
-            "sha=%s spa=%s tha=%s tpa=%s "
-            "policy_db_id=%d policy_pkt_tag=%d egress=%s\n",
-            dir, iface, len,
-            op == 1 ? "request" : (op == 2 ? "reply" : "other"),
-            sha, spa, tha, tpa,
-            policy_db_id, policy_pkt_tag, egress_ifname);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)

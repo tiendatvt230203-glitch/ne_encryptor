@@ -64,7 +64,6 @@ typedef enum {
     CRYPTO_PROTO_ICMP,
     CRYPTO_PROTO_OSPF,
     CRYPTO_PROTO_OTHER,
-    CRYPTO_PROTO_ARP,
     CRYPTO_PROTO_COUNT
 } crypto_proto_class;
 

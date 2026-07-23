@@ -338,83 +338,6 @@ static int l2_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
 
 }
 
-static int l2_restore_plain_arp_packet(uint8_t *packet, size_t pkt_len,
-                                       const uint8_t *payload, size_t payload_len)
-{
-    int et_off = crypto_eth_l2_prefix_len(packet, pkt_len);
-    int arp_off;
-
-    if (et_off < 0)
-        return -1;
-    arp_off = et_off + 2;
-    crypto_eth_set_arp_et(packet, et_off);
-    memmove(packet + arp_off, payload, payload_len);
-    return arp_off + (int)payload_len;
-}
-
-static int l2_verify_arp_after_decrypt(const uint8_t *arp_payload, size_t len)
-{
-    if (len < 28)
-        return 0;
-    if (arp_payload[0] != 0x00 || arp_payload[1] != 0x01)
-        return 0;
-    if (arp_payload[2] != 0x08 || arp_payload[3] != 0x00)
-        return 0;
-    if (arp_payload[4] != 6 || arp_payload[5] != 4)
-        return 0;
-    return 1;
-}
-
-static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
-{
-    int arp_off = crypto_eth_arp_offset(packet, pkt_len);
-    int et_off;
-    size_t payload_len;
-    crypto_pqc_sess_t pqc;
-    byte nonce[CRYPTO_PQC_NONCE_BYTES];
-    int new_len = 0;
-    int enc_start;
-
-    if (arp_off < 0)
-        return -1;
-    et_off = arp_off - 2;
-    payload_len = pkt_len - (size_t)arp_off;
-    enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
-    if (pkt_len < (size_t)enc_start)
-        return -1;
-    memmove(packet + enc_start, packet + arp_off, payload_len);
-    if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-        return -1;
-    if (crypto_pqc_generate_nonce(nonce) != 0)
-        return -1;
-    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
-    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start, (int)payload_len, &new_len) != 0)
-        return -1;
-    return enc_start + new_len;
-}
-
-static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
-{
-    crypto_pqc_sess_t pqc;
-    byte nonce[CRYPTO_PQC_NONCE_BYTES];
-    int dec_len = 0;
-    int enc_start = l2_enc_start_off(packet, pkt_len);
-    uint8_t *work_ptr;
-
-    if (enc_start < 0)
-        return -1;
-    if (crypto_pqc_sess_load(ctx, &pqc) != 0)
-        return -1;
-    memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
-    work_ptr = packet + enc_start;
-    if (crypto_pqc_decrypt_payload(&pqc, nonce, work_ptr,
-                                   (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
-        return -1;
-    if (!l2_verify_arp_after_decrypt(work_ptr, (size_t)dec_len))
-        return -1;
-    return l2_restore_plain_arp_packet(packet, pkt_len, work_ptr, (size_t)dec_len);
-}
-
 static int l2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     const uint8_t *eth_hdr, const uint8_t *enc_plain, uint32_t enc_plain_len,
     uint16_t pkt_id, uint8_t frag_index,
@@ -855,41 +778,9 @@ static int l2_ospf_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t
     *pkt_len = (uint32_t)n;
     return 0;
 }
-static int l2_arp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
-{
-    int n;
-
-    if (unlikely(!ctx || !ctx->initialized || !pkt || *pkt_len < MIN_ETH_PKT))
-        return -1;
-    if (!crypto_pkt_is_arp(pkt, *pkt_len))
-        return 0;
-    if (!OPT_FAKE_ETHERTYPE)
-        return 0;
-    n = l2_do_encrypt_arp(ctx, pkt, *pkt_len);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
-    return 0;
-}
-
-static int l2_arp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pkt_len)
-{
-    int n;
-
-    if (unlikely(!ctx || !ctx->initialized || !pkt))
-        return -1;
-    if (!crypto_eth_l2_has_marker(pkt, *pkt_len))
-        return 0;
-    n = l2_do_decrypt_arp(ctx, pkt, *pkt_len);
-    if (n < 0)
-        return -1;
-    *pkt_len = (uint32_t)n;
-    return 0;
-}
 CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_tcp_ops, l2_tcp_encrypt, l2_tcp_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_icmp_ops, l2_icmp_encrypt, l2_icmp_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_ospf_ops, l2_ospf_encrypt, l2_ospf_decrypt)
-CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_arp_ops, l2_arp_encrypt, l2_arp_decrypt)
 
 const struct crypto_option_ops *crypto_opt_l2_pqc_udp_ops(void)
 {

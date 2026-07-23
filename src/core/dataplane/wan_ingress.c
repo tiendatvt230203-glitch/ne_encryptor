@@ -33,11 +33,6 @@ static int wan_l2_plain_ipv4(const uint8_t *pkt, uint32_t len)
     return crypto_pkt_is_ipv4(pkt, len);
 }
 
-static int wan_l2_plain_ok(const uint8_t *pkt, uint32_t len)
-{
-    return crypto_pkt_is_ipv4(pkt, len) || crypto_pkt_is_arp(pkt, len);
-}
-
 /* Encrypted NE wire: L2 marker / L3 fake-proto / L4 tunnel / frag — not plain bypass. */
 static int wan_wire_is_encrypted(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
 {
@@ -64,8 +59,6 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     const struct crypto_policy *cp;
     crypto_option_id opt;
     uint8_t wire_id = 0;
-    uint8_t scratch[NE_FRAME];
-    uint32_t orig_len;
 
     if (!pkt || !len)
         return 0;
@@ -78,25 +71,9 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
         return -1;
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
-
-    orig_len = *len;
-    if (orig_len > NE_FRAME)
+    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) != 0)
         return -1;
-    memcpy(scratch, pkt, orig_len);
-
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_ipv4(pkt, *len))
-        return 0;
-
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_arp(pkt, *len))
-        return 0;
-
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
-    return -1;
+    return 0;
 }
 
 static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
@@ -230,7 +207,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
             crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx);
         if (need_backup && orig_len <= sizeof(scratch))
             memcpy(scratch, pkt, orig_len);
-        if (decrypt_l2(fwd, pkt, &len) != 0 || !wan_l2_plain_ok(pkt, len)) {
+        if (decrypt_l2(fwd, pkt, &len) != 0 || !wan_l2_plain_ipv4(pkt, len)) {
             if (need_backup)
                 memcpy(pkt, scratch, orig_len);
             len = orig_len;
@@ -530,6 +507,20 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 
+    if (dp_pkt_is_arp(pkt, job.len)) {
+        int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+        char bridge_to[IF_NAMESIZE] = "";
+
+        /* ARP bridges plain — never gated by crypto policy; MAC learn is separate. */
+        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+            return;
+        }
+        if (wan_dp >= 0)
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
+        goto drop;
+    }
+
     encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
     if (encrypted) {
         if (!fwd->cfg->crypto_enabled)
@@ -541,30 +532,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec != 0)
             goto drop;
-        if (dp_pkt_is_arp(pkt, job.len)) {
-            int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-            char bridge_to[IF_NAMESIZE] = "";
-
-            if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
-                return;
-            }
-            if (wan_dp >= 0)
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
-            goto drop;
-        }
         wan_clamp_tcp_mss(fwd, pkt, job.len);
-    } else if (dp_pkt_is_arp(pkt, job.len)) {
-        int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-        char bridge_to[IF_NAMESIZE] = "";
-
-        if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
-            return;
-        }
-        if (wan_dp >= 0)
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
-        goto drop;
     } else {
         /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */
         if (!wan_l2_plain_ipv4(pkt, job.len))
