@@ -8,6 +8,7 @@
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
+#include "../../../inc/core/arp_l2_overhead.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -184,6 +185,20 @@ static int pick_arp_l2_policy(struct forwarder *fwd, int local_idx,
     return 0;
 }
 
+static int wan_dp_for_local_arp(struct forwarder *fwd, int profile_idx, int local_idx)
+{
+    const struct profile_config *prof;
+
+    if (!fwd || !fwd->cfg || profile_idx < 0 || profile_idx >= fwd->cfg->profile_count)
+        return -1;
+    prof = &fwd->cfg->profiles[profile_idx];
+    for (int i = 0; i < prof->bridge_count; i++) {
+        if (prof->bridges[i].local_idx == local_idx)
+            return prof->bridges[i].wan_dp;
+    }
+    return -1;
+}
+
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
@@ -205,27 +220,29 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (dp_pkt_is_arp(pkt, job.len)) {
         char bridge_to[IF_NAMESIZE] = "";
         uint32_t spa = 0, tpa = 0;
-        int policy_db_id = -1;
-        int policy_pkt_tag = -1;
 
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
-        /*
-         * Prep: classify L2 ANY policy by SPA/TPA (log only).
-         * Always bridge plaintext until encrypt is wired.
-         */
+        /* Independent ARP overhead: DB match → attach policy_id → WAN. No cipher. */
         if (dp_parse_arp_ips(pkt, job.len, &spa, &tpa) == 0 &&
             pick_arp_l2_policy(fwd, li, spa, tpa, &profile_idx, &cp) == 0 &&
             fwd->cfg->crypto_enabled) {
-            policy_db_id = cp->db_id;
-            policy_pkt_tag = cp->id;
+            wan_dp = wan_dp_for_local_arp(fwd, profile_idx, li);
+            if (wan_dp >= 0 && wan_dp < fwd->wan_count && !fwd_wan_is_stopped(wan_dp) &&
+                fwd_wan_has_tx_room(fwd, wan_dp)) {
+                dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
+                                   cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
+                if (arp_l2_overhead_attach(pkt, &job.len, (uint8_t)cp->id) == 0) {
+                    (void)push_to_wan(fwd, &job, wan_dp);
+                    return;
+                }
+            }
         }
         if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
             dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to,
-                                 policy_db_id, policy_pkt_tag);
+                                 -1, -1);
             return;
         }
-        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL,
-                             policy_db_id, policy_pkt_tag);
+        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL, -1, -1);
         goto drop;
     }
 

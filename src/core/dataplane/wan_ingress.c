@@ -10,6 +10,7 @@
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
+#include "../../../inc/core/arp_l2_overhead.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -72,6 +73,18 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
         return 0;
     if (!crypto_eth_l2_has_marker(pkt, *len))
         return 0;
+
+    orig_len = *len;
+    if (orig_len > NE_FRAME)
+        return -1;
+    memcpy(scratch, pkt, orig_len);
+
+    /* Independent ARP overhead detach (no crypto_option). */
+    if (arp_l2_overhead_detach(pkt, len) == 0 && crypto_pkt_is_arp(pkt, *len))
+        return 0;
+    memcpy(pkt, scratch, orig_len);
+    *len = orig_len;
+
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_id) != 0)
         return 0;
     ctx = fwd_crypto_ctx_for_wire_id(wire_id);
@@ -80,19 +93,8 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
 
-    orig_len = *len;
-    if (orig_len > NE_FRAME)
-        return -1;
-    memcpy(scratch, pkt, orig_len);
-
     if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
         crypto_pkt_is_ipv4(pkt, *len))
-        return 0;
-
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_arp(pkt, *len))
         return 0;
 
     memcpy(pkt, scratch, orig_len);

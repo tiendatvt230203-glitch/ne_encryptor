@@ -251,7 +251,7 @@ void dp_log_arp_encrypt(const char *dir, const char *iface,
                         int policy_db_id, int policy_pkt_tag,
                         const char *egress_ifname)
 {
-    dp_log_arp_crypto("encrypt", dir, iface, pkt, len,
+    dp_log_arp_crypto("attach", dir, iface, pkt, len,
                       policy_db_id, policy_pkt_tag, egress_ifname);
 }
 
@@ -260,7 +260,7 @@ void dp_log_arp_decrypt(const char *dir, const char *iface,
                         int policy_db_id, int policy_pkt_tag,
                         const char *bridge_to)
 {
-    dp_log_arp_crypto("decrypt", dir, iface, pkt, len,
+    dp_log_arp_crypto("detach", dir, iface, pkt, len,
                       policy_db_id, policy_pkt_tag, bridge_to);
 }
 
