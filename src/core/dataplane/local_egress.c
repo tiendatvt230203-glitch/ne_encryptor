@@ -229,9 +229,12 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
             wan_dp = wan_dp_for_local_arp(fwd, profile_idx, li);
             if (wan_dp >= 0 && wan_dp < fwd->wan_count && !fwd_wan_is_stopped(wan_dp) &&
                 fwd_wan_has_tx_room(fwd, wan_dp)) {
-                dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
-                                   cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
                 if (crypto_option_from_policy(cp) == CRYPTO_OPT_L2_GCM256) {
+                    /* NE_L2_GCM256_ARP_ENABLE=0 → plain ARP, fall through to bridge. */
+                    if (!crypto_opt_l2_gcm256_arp_enabled())
+                        goto arp_bridge;
+                    dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
+                                       cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
                     pi = (int)(cp - fwd->cfg->policies);
                     if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && fwd_crypto_policy_ready(pi) &&
                         (pctx = fwd_crypto_policy_ctx(pi)) != NULL) {
@@ -247,12 +250,16 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                             return;
                     }
                     goto drop;
-                } else if (arp_l2_overhead_attach(pkt, &job.len, (uint8_t)cp->id) == 0) {
+                }
+                dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
+                                   cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
+                if (arp_l2_overhead_attach(pkt, &job.len, (uint8_t)cp->id) == 0) {
                     (void)push_to_wan(fwd, &job, wan_dp);
                     return;
                 }
             }
         }
+arp_bridge:
         if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
             dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to,
                                  -1, -1);

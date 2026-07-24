@@ -89,6 +89,9 @@ const struct crypto_option_ops *crypto_option_ops(crypto_option_id id, crypto_pr
 crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp);
 crypto_option_id crypto_option_from_action_mode_bits(int action, int mode, int aes_bits);
 
+/* L2 GCM-256 ARP: 0 when NE_L2_GCM256_ARP_ENABLE=0 in gcm_256/arp.c (plain ARP). */
+int crypto_opt_l2_gcm256_arp_enabled(void);
+
 uint32_t crypto_option_wire_overhead(crypto_option_id id);
 
 int crypto_option_need_split(crypto_option_id id, crypto_proto_class proto, uint32_t pkt_len);

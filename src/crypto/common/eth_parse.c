@@ -9,27 +9,24 @@ static uint16_t eth_read_et(const uint8_t *pkt, int off)
     return (uint16_t)(((uint16_t)pkt[off] << 8) | pkt[off + 1]);
 }
 
-static int eth_match_et(uint16_t et, uint16_t target, uint16_t fake)
-{
-    return et == target || (fake != 0 && et == fake);
-}
-
 int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len)
 {
-    const uint16_t fake = NE_L2_FAKE_ETHERTYPE;
+    uint16_t et;
 
     if (!pkt || pkt_len < 14)
         return -1;
 
-    if (eth_match_et(eth_read_et(pkt, 12), ETH_P_IP, fake))
+    et = eth_read_et(pkt, 12);
+    if (et == ETH_P_IP || et == NE_L2_FAKE_ETHERTYPE || et == NE_L2_FAKE_ETHERTYPE_ARP)
         return 12;
 
-    if (eth_read_et(pkt, 12) != ETH_P_8021Q)
+    if (et != ETH_P_8021Q)
         return -1;
     if (pkt_len < 18)
         return -1;
 
-    if (eth_match_et(eth_read_et(pkt, 16), ETH_P_IP, fake))
+    et = eth_read_et(pkt, 16);
+    if (et == ETH_P_IP || et == NE_L2_FAKE_ETHERTYPE || et == NE_L2_FAKE_ETHERTYPE_ARP)
         return 16;
 
     return -1;
@@ -117,7 +114,19 @@ int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len)
     if (et_off < 0)
         return 0;
     et = eth_read_et(pkt, et_off);
-    return et == NE_L2_FAKE_ETHERTYPE;
+    return et == NE_L2_FAKE_ETHERTYPE || et == NE_L2_FAKE_ETHERTYPE_ARP;
+}
+
+int crypto_eth_l2_is_arp_marker(const uint8_t *pkt, size_t pkt_len)
+{
+    int et_off;
+    uint16_t et;
+
+    et_off = crypto_eth_inner_et_off(pkt, pkt_len);
+    if (et_off < 0)
+        return 0;
+    et = eth_read_et(pkt, et_off);
+    return et == NE_L2_FAKE_ETHERTYPE_ARP;
 }
 
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len)

@@ -79,12 +79,6 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
         return -1;
     memcpy(scratch, pkt, orig_len);
 
-    /* Plaintext ARP overhead (non-GCM256 modes). */
-    if (arp_l2_overhead_detach(pkt, len) == 0 && crypto_pkt_is_arp(pkt, *len))
-        return 0;
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
-
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_id) != 0)
         return 0;
     ctx = fwd_crypto_ctx_for_wire_id(wire_id);
@@ -93,13 +87,22 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
 
-    /* GCM-256 ARP ciphertext (body+orig_et encrypted). */
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_arp(pkt, *len))
-        return 0;
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
+    /* 0x88B6 = ARP. Overhead detach is cheap fail on ciphertext; then GCM. */
+    if (crypto_eth_l2_is_arp_marker(pkt, *len)) {
+        if (arp_l2_overhead_detach(pkt, len) == 0 && crypto_pkt_is_arp(pkt, *len))
+            return 0;
+        memcpy(pkt, scratch, orig_len);
+        *len = orig_len;
+        if (crypto_opt_l2_gcm256_arp_enabled() &&
+            crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
+            crypto_pkt_is_arp(pkt, *len))
+            return 0;
+        memcpy(pkt, scratch, orig_len);
+        *len = orig_len;
+        return -1;
+    }
 
+    /* 0x88B5 = IPv4 L2 only. */
     if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
         crypto_pkt_is_ipv4(pkt, *len))
         return 0;

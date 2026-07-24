@@ -6,7 +6,8 @@
 
 #define ETH_L2_HDR_MAX  18
 #define ETH_HEADER_SIZE 14
-#define NE_L2_FAKE_ETHERTYPE  0x88B5u
+#define NE_L2_FAKE_ETHERTYPE      0x88B5u  /* L2 crypto IPv4 */
+#define NE_L2_FAKE_ETHERTYPE_ARP  0x88B6u  /* L2 crypto ARP  */
 
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1
@@ -32,6 +33,8 @@ void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off);
 void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off);
 
 int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len);
+/** 1 if ethertype is NE_L2_FAKE_ETHERTYPE_ARP (cleartext ARP wire). */
+int crypto_eth_l2_is_arp_marker(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len);
 int crypto_eth_l2_read_policy_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *policy_id_out);
 int crypto_eth_l2_core_id_off(const uint8_t *packet, size_t pkt_len);
