@@ -6,14 +6,13 @@
 #include <string.h>
 
 /*
- * Step: L2 ARP overhead only (no cipher yet).
+ * L2 ARP AES-GCM-256.
  *
  * Wire (same 0x88B5 marker as IPv4 L2):
- *   [dst|src|0x88B5|policy_id|core_id|nonce|ARP body|orig_et(2)]
+ *   [dst|src|0x88B5|policy_id|core_id|nonce|ciphertext(ARP body|orig_et)|tag16]
  *
- * orig_et (normally 0x0806) is appended at the end — same idea as L3
- * keeping orig_proto — so WAN can tell ARP vs IPv4 after detach.
- * Later cipher step will encrypt ARP body + orig_et trailer together.
+ * orig_et (normally 0x0806) is appended before encryption — same idea as L3
+ * keeping orig_proto — so after decrypt WAN can tell ARP vs IPv4.
  */
 
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
@@ -21,6 +20,7 @@
 #define unlikely(x)             __builtin_expect(!!(x), 0)
 
 #define OPT_FAKE_ETHERTYPE  0x88B5u
+#define OPT_AES_BITS            256
 #define L2_POLICY_LEN           1
 #define L2_CORE_ID_LEN          1
 #define L2_NONCE_SIZE           PACKET_CRYPTO_NONCE_BYTES
@@ -38,14 +38,34 @@ static void l2_write_wire_header(uint8_t *packet, int et_off, uint8_t policy_id,
     memcpy(packet + et_off + 4, nonce, (size_t)nonce_size);
 }
 
-static int l2_enc_start_off(const uint8_t *packet, size_t pkt_len)
+static int l2_policy_off(const uint8_t *packet, size_t pkt_len)
 {
-    int off = crypto_eth_l2_policy_off(packet, pkt_len);
+    return crypto_eth_l2_policy_off(packet, pkt_len);
+}
+
+static int l2_core_id_off(const uint8_t *packet, size_t pkt_len)
+{
+    int off = l2_policy_off(packet, pkt_len);
 
     if (off < 0)
         return -1;
-    off += L2_POLICY_LEN + L2_CORE_ID_LEN;
-    if (pkt_len < (size_t)(off + L2_NONCE_SIZE))
+    return off + L2_POLICY_LEN;
+}
+
+static int l2_nonce_off(const uint8_t *packet, size_t pkt_len)
+{
+    int off = l2_core_id_off(packet, pkt_len);
+
+    if (off < 0)
+        return -1;
+    return off + L2_CORE_ID_LEN;
+}
+
+static int l2_enc_start_off(const uint8_t *packet, size_t pkt_len)
+{
+    int off = l2_nonce_off(packet, pkt_len);
+
+    if (off < 0 || pkt_len < (size_t)(off + L2_NONCE_SIZE))
         return -1;
     return off + L2_NONCE_SIZE;
 }
@@ -80,15 +100,20 @@ static int l2_restore_plain_arp_packet(uint8_t *packet, size_t pkt_len,
     return arp_off + (int)payload_len;
 }
 
-/* Attach: fake ET + policy/core/nonce; ARP body plaintext; append orig_et. */
-static int l2_do_attach_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
+/* Encrypt: overhead + GCM over (ARP body | orig_et), append tag. */
+static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int arp_off = crypto_eth_arp_offset(packet, pkt_len);
     int et_off;
     size_t payload_len;
-    uint8_t nonce[PACKET_CRYPTO_NONCE_BYTES];
+    size_t plain_len;
+    uint32_t counter;
+    uint8_t nonce[16];
+    int nonce_len;
+    const uint8_t *key;
     int enc_start;
     uint16_t orig_et;
+    uint8_t tag[AES_GCM_TAG_SIZE];
 
     if (arp_off < 0)
         return -1;
@@ -100,30 +125,64 @@ static int l2_do_attach_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size
     enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
     if (pkt_len < (size_t)enc_start)
         return -1;
-    memset(nonce, 0, sizeof(nonce));
+
+    key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    if (!key)
+        return -1;
+
+    counter = packet_crypto_next_counter();
+    crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);
+    if (nonce_len != L2_NONCE_SIZE)
+        return -1;
+
     memmove(packet + enc_start, packet + arp_off, payload_len);
-    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
     packet[enc_start + (int)payload_len] = (uint8_t)(orig_et >> 8);
     packet[enc_start + (int)payload_len + 1] = (uint8_t)(orig_et & 0xFF);
-    return enc_start + (int)payload_len + L2_ORIG_ET_LEN;
+    plain_len = payload_len + L2_ORIG_ET_LEN;
+
+    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
+    if (unlikely(crypto_aes_gcm_encrypt(key, nonce, nonce_len, packet + enc_start,
+                                        (int)plain_len, tag, OPT_AES_BITS) != 0))
+        return -1;
+    memcpy(packet + enc_start + plain_len, tag, AES_GCM_TAG_SIZE);
+    return enc_start + (int)plain_len + AES_GCM_TAG_SIZE;
 }
 
-/* Detach: strip overhead + orig_et trailer, restore ethertype 0x0806. */
-static int l2_do_detach_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
+/* Decrypt: GCM unwrap, verify ARP + orig_et, restore ethertype 0x0806. */
+static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int enc_start = l2_enc_start_off(packet, pkt_len);
+    int nonce_off;
+    uint8_t nonce[16];
     size_t enc_len;
     size_t payload_len;
+    uint8_t tag[AES_GCM_TAG_SIZE];
+    const uint8_t *key;
     uint8_t *work_ptr;
     uint16_t orig_et;
 
-    (void)ctx;
     if (enc_start < 0)
         return -1;
-    enc_len = pkt_len - (size_t)enc_start;
+    nonce_off = l2_nonce_off(packet, pkt_len);
+    if (nonce_off < 0)
+        return -1;
+    key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    if (!key)
+        return -1;
+
+    memcpy(nonce, packet + nonce_off, (size_t)L2_NONCE_SIZE);
+    if (unlikely(pkt_len < (size_t)(enc_start + AES_GCM_TAG_SIZE)))
+        return -1;
+    enc_len = pkt_len - (size_t)enc_start - AES_GCM_TAG_SIZE;
     if (enc_len < 28 + L2_ORIG_ET_LEN)
         return -1;
+
+    memcpy(tag, packet + enc_start + enc_len, AES_GCM_TAG_SIZE);
     work_ptr = packet + enc_start;
+    if (unlikely(crypto_aes_gcm_decrypt(key, nonce, L2_NONCE_SIZE, work_ptr,
+                                        (int)enc_len, tag, OPT_AES_BITS) != 0))
+        return -1;
+
     orig_et = ((uint16_t)work_ptr[enc_len - 2] << 8) | work_ptr[enc_len - 1];
     if (orig_et != ETH_TYPE_ARP)
         return -1;
@@ -141,7 +200,7 @@ static int arp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
         return -1;
     if (!crypto_pkt_is_arp(pkt, *pkt_len))
         return 0;
-    n = l2_do_attach_arp(ctx, pkt, *pkt_len);
+    n = l2_do_encrypt_arp(ctx, pkt, *pkt_len);
     if (n < 0)
         return -1;
     *pkt_len = (uint32_t)n;
@@ -156,7 +215,7 @@ static int arp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t *pk
         return -1;
     if (!crypto_eth_l2_has_marker(pkt, *pkt_len))
         return 0;
-    n = l2_do_detach_arp(ctx, pkt, *pkt_len);
+    n = l2_do_decrypt_arp(ctx, pkt, *pkt_len);
     if (n < 0)
         return -1;
     *pkt_len = (uint32_t)n;
