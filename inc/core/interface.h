@@ -166,6 +166,8 @@ void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 uint32_t ne_frame_alloc_batch(struct ne_pair *p, uint64_t *addrs_out, uint32_t max_n);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
+/* Frames currently idle in the shared UMEM pool (leak watchdog metric). */
+uint32_t ne_pool_free_count(struct ne_pair *p);
 
 void interface_reset_redirect_maps(void);
 void interface_promisc_off_config(const struct app_config *cfg);

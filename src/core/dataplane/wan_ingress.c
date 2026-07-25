@@ -10,7 +10,6 @@
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
-#include "../../../inc/core/arp_l2_overhead.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -73,12 +72,6 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
         return 0;
     if (!crypto_eth_l2_has_marker(pkt, *len))
         return 0;
-
-    orig_len = *len;
-    if (orig_len > NE_FRAME)
-        return -1;
-    memcpy(scratch, pkt, orig_len);
-
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_id) != 0)
         return 0;
     ctx = fwd_crypto_ctx_for_wire_id(wire_id);
@@ -87,24 +80,19 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
 
-    /* 0x88B6 = ARP. Overhead detach is cheap fail on ciphertext; then GCM. */
-    if (crypto_eth_l2_is_arp_marker(pkt, *len)) {
-        if (arp_l2_overhead_detach(pkt, len) == 0 && crypto_pkt_is_arp(pkt, *len))
-            return 0;
-        memcpy(pkt, scratch, orig_len);
-        *len = orig_len;
-        if (crypto_opt_l2_gcm256_arp_enabled() &&
-            crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
-            crypto_pkt_is_arp(pkt, *len))
-            return 0;
-        memcpy(pkt, scratch, orig_len);
-        *len = orig_len;
+    orig_len = *len;
+    if (orig_len > NE_FRAME)
         return -1;
-    }
+    memcpy(scratch, pkt, orig_len);
 
-    /* 0x88B5 = IPv4 L2 only. */
     if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
         crypto_pkt_is_ipv4(pkt, *len))
+        return 0;
+
+    memcpy(pkt, scratch, orig_len);
+    *len = orig_len;
+    if (crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
+        crypto_pkt_is_arp(pkt, *len))
         return 0;
 
     memcpy(pkt, scratch, orig_len);
@@ -316,17 +304,37 @@ static int eth_dmac_is_unicast(const uint8_t *pkt)
     return (pkt[0] & 0x01u) == 0;
 }
 
-static int profile_owns_local(const struct app_config *cfg, int profile_pi, int local_idx)
+static int profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd_local_idx)
 {
     const struct profile_config *prof;
+    const char *ifname;
 
-    if (!cfg || profile_pi < 0 || profile_pi >= cfg->profile_count)
+    if (!fwd || !fwd->cfg || profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
         return 0;
-    prof = &cfg->profiles[profile_pi];
+    if (fwd_local_idx < 0 || fwd_local_idx >= fwd->local_count)
+        return 0;
+    if (!ne_pair_local_live(&fwd->pair, fwd_local_idx))
+        return 0;
+
+    prof = &fwd->cfg->profiles[profile_pi];
     if (!prof->enabled)
         return 0;
+
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
+        return 0;
+
     for (int i = 0; i < prof->local_count; i++) {
-        if (prof->local_indices[i] == local_idx)
+        int ci = prof->local_indices[i];
+        int li;
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        /* Prefer ifname match: cfg index space may differ from fwd pair slots. */
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
+            return 1;
+        li = mac_fwd_local_for_cfg_idx(fwd, ci);
+        if (li == fwd_local_idx)
             return 1;
     }
     return 0;
@@ -367,7 +375,7 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
     wi = dp_crypto_current_worker_idx();
 
     for (int i = 0; i < prof->local_count; i++) {
-        int li = prof->local_indices[i];
+        int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);
         struct ne_ring *ring;
 
         if (li < 0 || li >= fwd->local_count)
@@ -389,12 +397,14 @@ static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                 .dir = NE_DIR_LOCAL,
                 .local_idx = (uint8_t)li,
             };
+            /* Job already owned by first LAN ring — never fail the whole flood
+             * after that, or caller would double-free job.addr. */
             if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
-                return -1;
+                return 0;
             memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
             if (ne_ring_try_push(ring, &clone) != 0) {
                 ne_frame_free(&fwd->pair, clone.addr);
-                return -1;
+                return 0;
             }
         }
         if (li < (int)(sizeof(sent_mask) * 8))
@@ -517,7 +527,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
         return -1;
 
     li = mac_lookup(fwd, pkt);
-    if (li >= 0 && profile_owns_local(fwd->cfg, profile_pi, li)) {
+    if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
         return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
@@ -557,23 +567,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dp_pkt_is_arp(pkt, job.len)) {
             int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
             char bridge_to[IF_NAMESIZE] = "";
-            uint8_t wire_id = 0;
-            const struct crypto_policy *cp = NULL;
-            int policy_db_id = -1;
-
-            if (crypto_eth_l2_read_policy_id(wire_buf, wire_len, &wire_id) == 0)
-                cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
-            if (cp)
-                policy_db_id = cp->db_id;
 
             if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-                dp_log_arp_decrypt("wan", fwd->wans[wan_dp].ifname, pkt, job.len,
-                                   policy_db_id, (int)wire_id, bridge_to);
+                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
                 return;
             }
             if (wan_dp >= 0)
-                dp_log_arp_decrypt("wan", fwd->wans[wan_dp].ifname, pkt, job.len,
-                                   policy_db_id, (int)wire_id, NULL);
+                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
             goto drop;
         }
         wan_clamp_tcp_mss(fwd, pkt, job.len);
@@ -581,15 +581,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
         char bridge_to[IF_NAMESIZE] = "";
 
-        /* Plain ARP from WAN: no wire overhead yet → direction/bridge log only. */
         if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to,
-                                 -1, -1);
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
             return;
         }
         if (wan_dp >= 0)
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL,
-                                 -1, -1);
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
         goto drop;
     } else {
         /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */

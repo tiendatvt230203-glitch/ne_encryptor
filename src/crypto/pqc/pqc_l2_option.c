@@ -216,8 +216,6 @@ static int opt_policy_match(const struct app_config *cfg, int action, int mode,
 #define L2_FRAG_TAG_SIZE        4
 #define L2_FRAG_MAGIC           0x5B
 #define L2_NONCE_SIZE           CRYPTO_PQC_NONCE_BYTES
-#define ETH_TYPE_ARP            0x0806u
-#define OPT_FAKE_ETHERTYPE_ARP  NE_L2_FAKE_ETHERTYPE_ARP
 static int l2_policy_off(const uint8_t *packet, size_t pkt_len)
 {
     return crypto_eth_l2_policy_off(packet, pkt_len);
@@ -372,49 +370,50 @@ static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
     int arp_off = crypto_eth_arp_offset(packet, pkt_len);
     int et_off;
     size_t payload_len;
+    crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
+    int new_len = 0;
     int enc_start;
-    uint16_t et;
 
     if (arp_off < 0)
         return -1;
-    /* Overhead only: no PQC cipher yet. 0x88B6 marks ARP — no orig_et trailer. */
+    /* Plain ARP is not accepted by crypto_eth_l2_prefix_len (IPv4/fake only). */
     et_off = arp_off - 2;
-    et = ((uint16_t)packet[et_off] << 8) | packet[et_off + 1];
-    if (et != ETH_TYPE_ARP)
-        return -1;
     payload_len = pkt_len - (size_t)arp_off;
-    if (payload_len < 28)
-        return -1;
     enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
     if (pkt_len < (size_t)enc_start)
         return -1;
-    memset(nonce, 0, sizeof(nonce));
     memmove(packet + enc_start, packet + arp_off, payload_len);
-    packet[et_off] = (uint8_t)(OPT_FAKE_ETHERTYPE_ARP >> 8);
-    packet[et_off + 1] = (uint8_t)(OPT_FAKE_ETHERTYPE_ARP & 0xFF);
-    packet[et_off + 2] = ctx->wire_id;
-    packet[et_off + 3] = crypto_option_worker_idx();
-    memcpy(packet + et_off + 4, nonce, (size_t)L2_NONCE_SIZE);
-    return enc_start + (int)payload_len;
+    if (crypto_pqc_sess_load(ctx, &pqc) != 0)
+        return -1;
+    if (crypto_pqc_generate_nonce(nonce) != 0)
+        return -1;
+    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
+    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start, (int)payload_len, &new_len) != 0)
+        return -1;
+    return enc_start + new_len;
 }
 
 static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
+    crypto_pqc_sess_t pqc;
+    byte nonce[CRYPTO_PQC_NONCE_BYTES];
+    int dec_len = 0;
     int enc_start = l2_enc_start_off(packet, pkt_len);
-    size_t payload_len;
     uint8_t *work_ptr;
 
-    (void)ctx;
     if (enc_start < 0)
         return -1;
-    payload_len = pkt_len - (size_t)enc_start;
-    if (payload_len < 28)
+    if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
+    memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
     work_ptr = packet + enc_start;
-    if (!l2_verify_arp_after_decrypt(work_ptr, payload_len))
+    if (crypto_pqc_decrypt_payload(&pqc, nonce, work_ptr,
+                                   (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;
-    return l2_restore_plain_arp_packet(packet, pkt_len, work_ptr, payload_len);
+    if (!l2_verify_arp_after_decrypt(work_ptr, (size_t)dec_len))
+        return -1;
+    return l2_restore_plain_arp_packet(packet, pkt_len, work_ptr, (size_t)dec_len);
 }
 
 static int l2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
@@ -880,7 +879,7 @@ static int l2_arp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
 
     if (unlikely(!ctx || !ctx->initialized || !pkt))
         return -1;
-    if (!crypto_eth_l2_is_arp_marker(pkt, *pkt_len))
+    if (!crypto_eth_l2_has_marker(pkt, *pkt_len))
         return 0;
     n = l2_do_decrypt_arp(ctx, pkt, *pkt_len);
     if (n < 0)
@@ -907,4 +906,3 @@ const struct crypto_option_ops *crypto_opt_l2_pqc_udp_ops(void)
     };
     return &ops;
 }
-

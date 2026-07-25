@@ -6,8 +6,7 @@
 
 #define ETH_L2_HDR_MAX  18
 #define ETH_HEADER_SIZE 14
-#define NE_L2_FAKE_ETHERTYPE      0x88B5u  /* L2 crypto IPv4 */
-#define NE_L2_FAKE_ETHERTYPE_ARP  0x88B6u  /* L2 crypto ARP  */
+#define NE_L2_FAKE_ETHERTYPE  0x88B5u
 
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1
@@ -23,18 +22,10 @@ int crypto_eth_inner_et_off(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_prefix_len(const uint8_t *pkt, size_t pkt_len);
 /** Check xem gói tin có phải IPv4 không: 1 = Đúng (True), 0 = Sai (False) */
 int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len);
-/** Offset tới ARP body (sau ethertype 0x0806), -1 nếu không phải plain ARP */
-int crypto_eth_arp_offset(const uint8_t *pkt, size_t pkt_len);
-/** Check plain ARP frame (ethertype 0x0806) */
-int crypto_pkt_is_arp(const uint8_t *pkt, size_t pkt_len);
 /** Ghi đè mã EtherType chuẩn của IPv4 (0x0800) vào vị trí chỉ định sau khi giải mã xong*/
 void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off);
-/** Restore ethertype 0x0806 after L2 ARP decrypt */
-void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off);
 
 int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len);
-/** 1 if ethertype is NE_L2_FAKE_ETHERTYPE_ARP (cleartext ARP wire). */
-int crypto_eth_l2_is_arp_marker(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len);
 int crypto_eth_l2_read_policy_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *policy_id_out);
 int crypto_eth_l2_core_id_off(const uint8_t *packet, size_t pkt_len);
@@ -43,8 +34,10 @@ int crypto_eth_l2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8
 
 void crypto_ipv4_checksum_replace_word(uint8_t *ip_hdr, uint16_t old_word, uint16_t new_word);
 
-/* Clamp TCP MSS on SYN/SYN-ACK for path_mtu and crypto wire overhead.
- * Only lowers an existing MSS option; returns 1 if changed, 0 if unchanged, -1 on parse skip. */
+int crypto_eth_arp_offset(const uint8_t *pkt, size_t pkt_len);
+int crypto_pkt_is_arp(const uint8_t *pkt, size_t pkt_len);
+void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off);
+
 int crypto_tcp_clamp_mss(uint8_t *pkt, uint32_t pkt_len, uint32_t path_mtu, uint32_t wire_overhead);
 
 #endif

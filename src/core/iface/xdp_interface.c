@@ -361,6 +361,18 @@ void ne_frame_free(struct ne_pair *p, uint64_t addr)
         (void)pool_push(&p->pool, &addr, 1);
 }
 
+uint32_t ne_pool_free_count(struct ne_pair *p)
+{
+    uint32_t n;
+
+    if (!p || !p->pool.buf)
+        return 0;
+    pthread_spin_lock(&p->pool.lock);
+    n = p->pool.head - p->pool.tail;
+    pthread_spin_unlock(&p->pool.lock);
+    return n;
+}
+
 void *ne_packet_data(struct ne_pair *p, uint64_t addr)
 {
     return xsk_umem__get_data(p->bufs, addr);
@@ -1539,6 +1551,10 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 {   
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
+    uint32_t want;
+    uint32_t idx = 0;
+    uint32_t reserved;
+    uint32_t popped = 0;
 
     if (!free_slots) {
         if (tx_no_free)
@@ -1555,19 +1571,22 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
         return 0;
     }
 
-    uint32_t popped = 0;
-    uint32_t want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
-    while (popped < want && ne_ring_try_pop(src, &jobs[popped]) == 0)
-        popped++;
-    if (!popped)
+    /* Reserve TX slots BEFORE popping mid-ring frames so a failed reserve can
+     * never leave packet ownership stranded (UMEM frame leak → permanent stall). */
+    want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    reserved = xsk_ring_prod__reserve(&slot->tx, want, &idx);
+    if (!reserved)
         return 0;
 
-    uint32_t idx = 0;
-    if (xsk_ring_prod__reserve(&slot->tx, popped, &idx) != popped) {
-        for (uint32_t i = 0; i < popped; i++)
-            (void)ne_ring_try_push(src, &jobs[i]);
-        return 0;
+    while (popped < reserved && ne_ring_try_pop(src, &jobs[popped]) == 0)
+        popped++;
+
+    if (popped < reserved) {
+        /* Undo unused reservation (no xsk_ring_prod__cancel in this libxdp). */
+        slot->tx.cached_prod -= (reserved - popped);
     }
+    if (!popped)
+        return 0;
 
     for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);

@@ -8,7 +8,6 @@
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
-#include "../../../inc/core/arp_l2_overhead.h"
 #include "../../../inc/core/dataplane_stats.h"
 
 #include <netinet/in.h>
@@ -30,12 +29,17 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                             uint32_t l1, struct ne_packet *tail, uint32_t l2, int wan_dp)
 {
     struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
-    if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap)
+
+    if (!fwd || !job || !tail)
         return -1;
-    if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size)
+    if (wan_dp < 0 || wan_dp >= fwd->wan_count || ne_ring_count(tx) + 2 > tx->cap) {
+        ne_frame_free(&fwd->pair, tail->addr);
         return -1;
-    if (!tail)
+    }
+    if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size) {
+        ne_frame_free(&fwd->pair, tail->addr);
         return -1;
+    }
     tail->len = l2;
     tail->dir = NE_DIR_WAN;
     tail->wan_idx = (uint8_t)wan_dp;
@@ -46,8 +50,10 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
-    if (ne_ring_try_push(tx, tail) != 0)
+    if (ne_ring_try_push(tx, tail) != 0) {
+        /* Head already queued; drop only the tail fragment. */
         ne_frame_free(&fwd->pair, tail->addr);
+    }
     return 0;
 }
 
@@ -222,50 +228,37 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         uint32_t spa = 0, tpa = 0;
 
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
-        /* ARP L2 match: GCM-256 → crypto_option encrypt; other modes → overhead only. */
         if (dp_parse_arp_ips(pkt, job.len, &spa, &tpa) == 0 &&
             pick_arp_l2_policy(fwd, li, spa, tpa, &profile_idx, &cp) == 0 &&
             fwd->cfg->crypto_enabled) {
             wan_dp = wan_dp_for_local_arp(fwd, profile_idx, li);
             if (wan_dp >= 0 && wan_dp < fwd->wan_count && !fwd_wan_is_stopped(wan_dp) &&
                 fwd_wan_has_tx_room(fwd, wan_dp)) {
-                if (crypto_option_from_policy(cp) == CRYPTO_OPT_L2_GCM256) {
-                    /* NE_L2_GCM256_ARP_ENABLE=0 → plain ARP, fall through to bridge. */
-                    if (!crypto_opt_l2_gcm256_arp_enabled())
-                        goto arp_bridge;
-                    dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
-                                       cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
-                    pi = (int)(cp - fwd->cfg->policies);
-                    if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && fwd_crypto_policy_ready(pi) &&
-                        (pctx = fwd_crypto_policy_ctx(pi)) != NULL) {
+                pi = (int)(cp - fwd->cfg->policies);
+                if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && fwd_crypto_policy_ready(pi)) {
+                    pctx = fwd_crypto_policy_ctx(pi);
+                    if (pctx) {
                         pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
                         pctx->wire_id = (uint8_t)cp->id;
                         pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
-                        enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx, CRYPTO_PROTO_ARP, 1);
-                        if (enc == 0) {
-                            (void)push_to_wan(fwd, &job, wan_dp);
+                        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len,
+                                             fwd->wans[wan_dp].ifname);
+                        enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
+                                             CRYPTO_PROTO_ARP, 0);
+                        if (enc >= 0) {
+                            if (enc == 0)
+                                (void)push_to_wan(fwd, &job, wan_dp);
                             return;
                         }
-                        if (enc > 0)
-                            return;
                     }
-                    goto drop;
-                }
-                dp_log_arp_encrypt("local", fwd->locals[li].ifname, pkt, job.len,
-                                   cp->db_id, cp->id, fwd->wans[wan_dp].ifname);
-                if (arp_l2_overhead_attach(pkt, &job.len, (uint8_t)cp->id) == 0) {
-                    (void)push_to_wan(fwd, &job, wan_dp);
-                    return;
                 }
             }
         }
-arp_bridge:
         if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
-            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to,
-                                 -1, -1);
+            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
             return;
         }
-        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL, -1, -1);
+        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL);
         goto drop;
     }
 

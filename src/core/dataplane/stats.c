@@ -243,10 +243,12 @@ void ne_dp_stats_tick(struct forwarder *fwd)
         }
         fprintf(stderr,
                 "[DP-STATS] ring_depth lan_to_mid=%u wan_to_mid=%u "
-                "mid_to_wan=%u mid_to_local=%u tx_no_free(wan0)=%llu\n",
+                "mid_to_wan=%u mid_to_local=%u tx_no_free(wan0)=%llu "
+                "pool_free=%u\n",
                 lan_q, wan_q, mid_wan_q, mid_lan_q,
                 fwd->wan_count > 0
-                    ? (unsigned long long)fwd->pair.wans[0].tx_no_free : 0ULL);
+                    ? (unsigned long long)fwd->pair.wans[0].tx_no_free : 0ULL,
+                ne_pool_free_count(&fwd->pair));
     }
     fflush(stderr);
 }
