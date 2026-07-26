@@ -191,15 +191,25 @@ static int pick_arp_l2_policy(struct forwarder *fwd, int local_idx,
     return 0;
 }
 
-static int wan_dp_for_local_arp(struct forwarder *fwd, int profile_idx, int local_idx)
+static int wan_dp_for_local_arp(struct forwarder *fwd, int profile_idx, int fwd_local_idx)
 {
     const struct profile_config *prof;
+    const char *ifname;
 
     if (!fwd || !fwd->cfg || profile_idx < 0 || profile_idx >= fwd->cfg->profile_count)
         return -1;
+    if (fwd_local_idx < 0 || fwd_local_idx >= fwd->local_count)
+        return -1;
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
+        return -1;
     prof = &fwd->cfg->profiles[profile_idx];
     for (int i = 0; i < prof->bridge_count; i++) {
-        if (prof->bridges[i].local_idx == local_idx)
+        int ci = prof->bridges[i].local_idx;
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
             return prof->bridges[i].wan_dp;
     }
     return -1;
@@ -261,8 +271,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL);
         goto drop;
     }
-
-    mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_TRAFFIC);
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
                             &profile_idx, &cp) != 0)

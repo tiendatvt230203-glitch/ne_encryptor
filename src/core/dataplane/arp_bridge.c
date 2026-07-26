@@ -3,6 +3,7 @@
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/dataplane_util.h"
 #include "../../../inc/core/forwarder_wan.h"
+#include "../../../inc/core/mac_learn.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -62,32 +63,55 @@ static int profile_pi_for_wan_dp(struct forwarder *fwd, int wan_dp)
     return -1;
 }
 
-static int resolve_wan_dp_for_local_arp(const struct profile_config *prof,
-                                        int ingress_li, int *wan_dp_out)
+/* bridges[].local_idx is cfg locals[] index — map to live fwd pair slot by ifname. */
+static int bridge_fwd_local(struct forwarder *fwd, int cfg_local_idx)
 {
-    if (!prof || !wan_dp_out || ingress_li < 0)
+    return mac_fwd_local_for_cfg_idx(fwd, cfg_local_idx);
+}
+
+static int resolve_wan_dp_for_fwd_local(struct forwarder *fwd,
+                                        const struct profile_config *prof,
+                                        int fwd_local_idx, int *wan_dp_out)
+{
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || !prof || !wan_dp_out || fwd_local_idx < 0 ||
+        fwd_local_idx >= fwd->local_count)
+        return -1;
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
         return -1;
 
     for (int i = 0; i < prof->bridge_count; i++) {
-        if (prof->bridges[i].local_idx == ingress_li) {
-            *wan_dp_out = prof->bridges[i].wan_dp;
-            return 0;
-        }
+        int ci = prof->bridges[i].local_idx;
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) != 0)
+            continue;
+        *wan_dp_out = prof->bridges[i].wan_dp;
+        return 0;
     }
     return -1;
 }
 
-static int resolve_local_for_wan_arp(const struct profile_config *prof,
-                                     int ingress_wan_dp, int *local_idx_out)
+static int resolve_fwd_local_for_wan_dp(struct forwarder *fwd,
+                                        const struct profile_config *prof,
+                                        int ingress_wan_dp, int *fwd_local_out)
 {
-    if (!prof || !local_idx_out || ingress_wan_dp < 0)
+    if (!fwd || !prof || !fwd_local_out || ingress_wan_dp < 0)
         return -1;
 
     for (int i = 0; i < prof->bridge_count; i++) {
-        if (prof->bridges[i].wan_dp == ingress_wan_dp) {
-            *local_idx_out = prof->bridges[i].local_idx;
-            return 0;
-        }
+        int li;
+
+        if (prof->bridges[i].wan_dp != ingress_wan_dp)
+            continue;
+        li = bridge_fwd_local(fwd, prof->bridges[i].local_idx);
+        if (li < 0)
+            return -1;
+        *fwd_local_out = li;
+        return 0;
     }
     return -1;
 }
@@ -106,6 +130,33 @@ static const char *wan_ifname(struct forwarder *fwd, int wan_dp)
     return fwd->wans[wan_dp].ifname;
 }
 
+static int profile_pi_for_fwd_local(struct forwarder *fwd, int fwd_li)
+{
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || fwd_li < 0 || fwd_li >= fwd->local_count)
+        return -1;
+    ifname = fwd->locals[fwd_li].ifname;
+    if (!ifname[0])
+        return -1;
+
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        const struct profile_config *p = &fwd->cfg->profiles[pi];
+
+        if (!p->enabled)
+            continue;
+        for (int i = 0; i < p->local_count; i++) {
+            int ci = p->local_indices[i];
+
+            if (ci < 0 || ci >= fwd->cfg->local_count)
+                continue;
+            if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
+                return pi;
+        }
+    }
+    return -1;
+}
+
 int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                           const uint8_t *pkt, int ingress_li,
                           char egress_ifname[IF_NAMESIZE])
@@ -121,7 +172,7 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     if (!fwd || !fwd->cfg || !job || !pkt)
         return -1;
 
-    profile_pi = config_select_profile_for_local(fwd->cfg, ingress_li);
+    profile_pi = profile_pi_for_fwd_local(fwd, ingress_li);
     if (profile_pi < 0) {
         static uint64_t last_no_profile_ms;
 
@@ -132,7 +183,7 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
-    if (resolve_wan_dp_for_local_arp(prof, ingress_li, &wan_dp) != 0) {
+    if (resolve_wan_dp_for_fwd_local(fwd, prof, ingress_li, &wan_dp) != 0) {
         static uint64_t last_no_pair_ms;
 
         if (arp_log_fail_ratelimit(&last_no_pair_ms))
@@ -194,7 +245,7 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
-    if (resolve_local_for_wan_arp(prof, ingress_wan_dp, &local_idx) != 0) {
+    if (resolve_fwd_local_for_wan_dp(fwd, prof, ingress_wan_dp, &local_idx) != 0) {
         static uint64_t last_no_pair_ms;
 
         if (arp_log_fail_ratelimit(&last_no_pair_ms))
@@ -203,8 +254,6 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
                     wan_ifname(fwd, ingress_wan_dp), prof->name, prof->bridge_count);
         return -1;
     }
-    if (local_idx < 0 || local_idx >= fwd->local_count)
-        return -1;
 
     ring = arp_mid_to_local_ring(fwd, local_idx);
     job->dir = NE_DIR_LOCAL;

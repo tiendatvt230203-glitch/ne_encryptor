@@ -304,6 +304,22 @@ static int eth_dmac_is_unicast(const uint8_t *pkt)
     return (pkt[0] & 0x01u) == 0;
 }
 
+static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
+{
+    int profile_id;
+
+    if (!fwd || !fwd->cfg)
+        return -1;
+    profile_id = fwd_crypto_profile_id_for_wire_id(wire_id);
+    if (profile_id < 0)
+        return -1;
+    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
+        if (fwd->cfg->profiles[pi].id == profile_id)
+            return pi;
+    }
+    return -1;
+}
+
 static int profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd_local_idx)
 {
     const struct profile_config *prof;
@@ -326,36 +342,16 @@ static int profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd_loc
 
     for (int i = 0; i < prof->local_count; i++) {
         int ci = prof->local_indices[i];
-        int li;
 
         if (ci < 0 || ci >= fwd->cfg->local_count)
             continue;
-        /* Prefer ifname match: cfg index space may differ from fwd pair slots. */
         if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
-            return 1;
-        li = mac_fwd_local_for_cfg_idx(fwd, ci);
-        if (li == fwd_local_idx)
             return 1;
     }
     return 0;
 }
 
-static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
-{
-    int profile_id;
-
-    if (!fwd || !fwd->cfg)
-        return -1;
-    profile_id = fwd_crypto_profile_id_for_wire_id(wire_id);
-    if (profile_id < 0)
-        return -1;
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        if (fwd->cfg->profiles[pi].id == profile_id)
-            return pi;
-    }
-    return -1;
-}
-
+/* Data path only (tcp/udp/icmp/ospf) when dmac is not in the FDB yet. */
 static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                                    const uint8_t *pkt, int profile_pi)
 {
@@ -526,6 +522,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (profile_pi < 0)
         return -1;
 
+    /* Data path: FDB hit → that LAN only. ARP never reaches here (bridged earlier). */
     li = mac_lookup(fwd, pkt);
     if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
@@ -533,7 +530,6 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
         return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
     }
 
-    mac_flood_log(fwd, pkt, profile_pi);
     return flood_to_profile_locals(fwd, job, pkt, profile_pi);
 }
 

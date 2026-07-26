@@ -11,7 +11,7 @@ struct forwarder;
 #define MAC_LEARN_HASH_BUCKETS 256
 
 enum mac_learn_src {
-    MAC_LEARN_SRC_TRAFFIC = 0,
+    MAC_LEARN_SRC_TRAFFIC = 0, /* unused on BR path — ARP only */
     MAC_LEARN_SRC_ARP = 1,
 };
 
@@ -33,14 +33,12 @@ void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
 void mac_learn_tick(struct forwarder *fwd);
 
+/* BR userspace: learn SMAC from ARP on LAN only — never drives flooding. */
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);
 
 /* Map profile cfg local_indices[] entry → live fwd pair slot (by ifname). */
 int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li);
-
-/* Log rate-limited flood while dmac is unknown; silent once mac is in table. */
-void mac_flood_log(struct forwarder *fwd, const uint8_t dmac[MAC_LEN], int profile_pi);
 
 #endif

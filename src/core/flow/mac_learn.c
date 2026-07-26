@@ -7,13 +7,6 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef MAC_LEARN_CACHE_TTL_MIN
-#define MAC_LEARN_CACHE_TTL_MIN 5ull
-#endif
-
-#define MAC_LEARN_ENTRY_TTL_MS  (MAC_LEARN_CACHE_TTL_MIN * 60ull * 1000ull)
-#define MAC_FLOOD_LOG_INTERVAL_MS 10000ull
-#define MAC_FLOOD_TRACK_MAX 64
 #define MAC_PURGE_LOG_INTERVAL_MS 10000ull
 #define ETH_HEADER_SIZE         14u
 
@@ -23,13 +16,6 @@ enum mac_upsert_result {
     MAC_UPSERT_MOVE,
 };
 
-struct mac_flood_track {
-    uint8_t mac[MAC_LEN];
-    uint64_t last_log_ms;
-    uint8_t in_use;
-};
-
-static struct mac_flood_track g_flood_track[MAC_FLOOD_TRACK_MAX];
 static uint64_t g_last_purge_log_ms;
 static uint64_t g_last_mismatch_log_ms;
 
@@ -77,6 +63,7 @@ static void hash_rebuild_locked(struct mac_learn_table *t)
     memset(t->hash_next, -1, sizeof(t->hash_next));
     for (int i = 0; i < t->count; i++) {
         uint8_t b = mac_hash_key(t->list[i].mac);
+
         t->hash_next[i] = t->hash_head[b];
         t->hash_head[b] = i;
     }
@@ -94,9 +81,8 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
 }
 
 /*
- * Standard bridge FDB: key = MAC, value = ingress ifname.
- * Many MACs may share one LAN interface. Previous one-MAC-per-ifname
- * REPLACE semantics caused permanent flood under multi-host or L2 loops.
+ * Userspace BR FDB: key = MAC, value = LAN ifname learned from ARP on that BR.
+ * Forwarding itself uses BE bridge pairs only — this table does not drive flood.
  */
 static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const char *ifname,
                                             const uint8_t mac[MAC_LEN], uint64_t now_ms,
@@ -194,44 +180,54 @@ static int table_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
     return 0;
 }
 
-/* Keep MAC entries whose ifname is a live fwd LAN slot (pair index space). */
-static int ifname_is_live_fwd_local(const struct forwarder *fwd, const char *ifname)
+static int ifname_in_configured_locals(const struct forwarder *fwd, const char *ifname)
 {
     if (!fwd || !ifname || !ifname[0])
         return 0;
 
     for (int i = 0; i < fwd->local_count; i++) {
-        if (!ne_pair_local_live(&fwd->pair, i))
-            continue;
         if (fwd->locals[i].ifname[0] == '\0')
             continue;
         if (strcmp(fwd->locals[i].ifname, ifname) == 0)
             return 1;
+    }
+    if (fwd->cfg) {
+        for (int i = 0; i < fwd->cfg->local_count; i++) {
+            if (fwd->cfg->locals[i].ifname[0] == '\0')
+                continue;
+            if (strcmp(fwd->cfg->locals[i].ifname, ifname) == 0)
+                return 1;
+        }
     }
     return 0;
 }
 
 static void table_purge_orphan_locked(struct mac_learn_table *t, struct forwarder *fwd,
                                       uint8_t *purged_mac, char purged_ifname[IF_NAMESIZE],
-                                      int *did_purge)
+                                      int *purge_count)
 {
     int w = 0;
 
     if (!t || !fwd)
         return;
-    if (did_purge)
-        *did_purge = 0;
+    if (purge_count)
+        *purge_count = 0;
     if (purged_ifname)
         purged_ifname[0] = '\0';
 
     for (int i = 0; i < t->count; i++) {
-        if (ifname_is_live_fwd_local(fwd, t->list[i].ifname)) {
+        if (ifname_in_configured_locals(fwd, t->list[i].ifname)) {
             if (w != i)
                 t->list[w] = t->list[i];
             w++;
         } else {
-            if (did_purge && !*did_purge) {
-                *did_purge = 1;
+            fprintf(stderr,
+                    "[MAC] purge %02x:%02x:%02x:%02x:%02x:%02x iface=%s "
+                    "(LAN ifname left config)\n",
+                    t->list[i].mac[0], t->list[i].mac[1], t->list[i].mac[2],
+                    t->list[i].mac[3], t->list[i].mac[4], t->list[i].mac[5],
+                    t->list[i].ifname[0] ? t->list[i].ifname : "-");
+            if (purge_count && *purge_count == 0) {
                 if (purged_mac)
                     memcpy(purged_mac, t->list[i].mac, MAC_LEN);
                 if (purged_ifname) {
@@ -239,28 +235,8 @@ static void table_purge_orphan_locked(struct mac_learn_table *t, struct forwarde
                     purged_ifname[IF_NAMESIZE - 1] = '\0';
                 }
             }
-        }
-    }
-    if (w != t->count) {
-        t->count = w;
-        hash_rebuild_locked(t);
-    }
-}
-
-static void table_expire_stale_locked(struct mac_learn_table *t, uint64_t now_ms, uint64_t ttl_ms)
-{
-    int w = 0;
-
-    if (!t)
-        return;
-
-    for (int i = 0; i < t->count; i++) {
-        uint64_t idle_ms = now_ms - t->list[i].last_seen_ms;
-
-        if (idle_ms <= ttl_ms) {
-            if (w != i)
-                t->list[w] = t->list[i];
-            w++;
+            if (purge_count)
+                (*purge_count)++;
         }
     }
     if (w != t->count) {
@@ -302,62 +278,24 @@ static void log_index_space_mismatch(struct forwarder *fwd)
 
 static void table_maintain(struct forwarder *fwd)
 {
-    uint64_t now_ms;
     uint8_t purged_mac[MAC_LEN];
     char purged_ifname[IF_NAMESIZE];
-    int did_purge = 0;
+    int purge_count = 0;
 
     if (!fwd)
         return;
     log_index_space_mismatch(fwd);
-    now_ms = monotonic_ms();
     pthread_spin_lock(&fwd->mac_table.lock);
-    table_purge_orphan_locked(&fwd->mac_table, fwd, purged_mac, purged_ifname, &did_purge);
-    table_expire_stale_locked(&fwd->mac_table, now_ms, MAC_LEARN_ENTRY_TTL_MS);
+    table_purge_orphan_locked(&fwd->mac_table, fwd, purged_mac, purged_ifname, &purge_count);
     pthread_spin_unlock(&fwd->mac_table.lock);
 
-    if (did_purge) {
-        now_ms = monotonic_ms();
+    if (purge_count > 0) {
+        uint64_t now_ms = monotonic_ms();
+
         if (now_ms - g_last_purge_log_ms >= MAC_PURGE_LOG_INTERVAL_MS) {
             g_last_purge_log_ms = now_ms;
-            fprintf(stderr,
-                    "[MAC] purge orphan %02x:%02x:%02x:%02x:%02x:%02x iface=%s "
-                    "(not live in fwd locals)\n",
-                    purged_mac[0], purged_mac[1], purged_mac[2],
-                    purged_mac[3], purged_mac[4], purged_mac[5],
-                    purged_ifname[0] ? purged_ifname : "-");
-        }
-    }
-}
-
-static int table_has_mac_locked(const struct mac_learn_table *t, const uint8_t mac[MAC_LEN])
-{
-    return find_idx_by_mac_locked(t, mac) >= 0;
-}
-
-static int flood_track_slot(const uint8_t mac[MAC_LEN])
-{
-    int free_slot = -1;
-
-    for (int i = 0; i < MAC_FLOOD_TRACK_MAX; i++) {
-        if (!g_flood_track[i].in_use) {
-            if (free_slot < 0)
-                free_slot = i;
-            continue;
-        }
-        if (memcmp(g_flood_track[i].mac, mac, MAC_LEN) == 0)
-            return i;
-    }
-    return free_slot;
-}
-
-static void flood_track_clear_mac(const uint8_t mac[MAC_LEN])
-{
-    for (int i = 0; i < MAC_FLOOD_TRACK_MAX; i++) {
-        if (g_flood_track[i].in_use &&
-            memcmp(g_flood_track[i].mac, mac, MAC_LEN) == 0) {
-            g_flood_track[i].in_use = 0;
-            return;
+            fprintf(stderr, "[MAC] purge summary count=%d (first iface=%s)\n",
+                    purge_count, purged_ifname[0] ? purged_ifname : "-");
         }
     }
 }
@@ -379,55 +317,6 @@ int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li)
             return i;
     }
     return -1;
-}
-
-void mac_flood_log(struct forwarder *fwd, const uint8_t dmac[MAC_LEN], int profile_pi)
-{
-    const struct profile_config *prof;
-    uint64_t now_ms;
-    int slot;
-    int known;
-    int printed = 0;
-
-    if (!fwd || !fwd->cfg || !dmac)
-        return;
-    if (profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
-        return;
-    prof = &fwd->cfg->profiles[profile_pi];
-    if (!prof->enabled || prof->local_count <= 0)
-        return;
-
-    pthread_spin_lock(&fwd->mac_table.lock);
-    known = table_has_mac_locked(&fwd->mac_table, dmac);
-    pthread_spin_unlock(&fwd->mac_table.lock);
-    if (known)
-        return;
-
-    now_ms = monotonic_ms();
-    slot = flood_track_slot(dmac);
-    if (slot < 0)
-        return;
-    if (g_flood_track[slot].in_use &&
-        now_ms - g_flood_track[slot].last_log_ms < MAC_FLOOD_LOG_INTERVAL_MS)
-        return;
-
-    memcpy(g_flood_track[slot].mac, dmac, MAC_LEN);
-    g_flood_track[slot].in_use = 1;
-    g_flood_track[slot].last_log_ms = now_ms;
-
-    fprintf(stderr,
-            "[MAC] flood unknown dmac=%02x:%02x:%02x:%02x:%02x:%02x profile=%s lan=",
-            dmac[0], dmac[1], dmac[2], dmac[3], dmac[4], dmac[5], prof->name);
-    for (int i = 0; i < prof->local_count; i++) {
-        int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);
-
-        if (li < 0)
-            continue;
-        if (printed++ > 0)
-            fprintf(stderr, ",");
-        fprintf(stderr, "%s", fwd->locals[li].ifname);
-    }
-    fprintf(stderr, "\n");
 }
 
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname)
@@ -484,18 +373,15 @@ void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint3
         return;
     if (!ne_pair_local_live(&fwd->pair, ingress_idx))
         return;
+    /* BR path: only ARP populates FDB. */
+    if (src != MAC_LEARN_SRC_ARP)
+        return;
 
     eth_src = pkt + MAC_LEN;
     if (mac_is_zero(eth_src) || mac_is_multicast(eth_src))
         return;
 
-    {
-        enum mac_upsert_result r = MAC_UPSERT_REFRESH;
-
-        table_learn(&fwd->mac_table, fwd->locals[ingress_idx].ifname, eth_src, src, &r);
-        if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE)
-            flood_track_clear_mac(eth_src);
-    }
+    table_learn(&fwd->mac_table, fwd->locals[ingress_idx].ifname, eth_src, src, NULL);
 }
 
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
