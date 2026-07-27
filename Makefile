@@ -37,7 +37,8 @@ APP_OBJ = $(APP_SRC:.c=.o)
 DB_SRC = src/db/config.c \
          src/db/db_config.c \
          src/db/db_env.c \
-         src/db/db_runtime.c
+         src/db/db_runtime.c \
+         src/db/vault.c
 DB_OBJ = $(DB_SRC:.c=.o)
 
 BPF_OBJ = $(LIB_DIR)/lan.o \

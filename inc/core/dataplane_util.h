@@ -9,7 +9,7 @@ int dp_parse_flow(void *pkt, uint32_t len,
 
 int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len);
 
-/* Standard monitor line for every ARP frame reaching userspace. */
+/* Log plaintext ARP only (call after decrypt on WAN). Skips encrypted wire. */
 void dp_log_arp_userspace(const char *dir, const char *iface,
                           const uint8_t *pkt, uint32_t len,
                           const char *bridge_to);

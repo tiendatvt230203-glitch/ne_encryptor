@@ -181,20 +181,27 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
     uint32_t off;
     const uint8_t *arp;
     uint16_t op;
+    uint32_t spa_be = 0, tpa_be = 0;
     char sha[18], tha[18], spa[16], tpa[16];
     const char *bridge = bridge_to && bridge_to[0] ? bridge_to : "drop";
 
     if (!dir || !iface || !pkt)
         return;
+    if (crypto_eth_l2_has_arp_marker(pkt, len))
+        return;
+    if (!dp_pkt_is_arp(pkt, len))
+        return;
     if (arp_payload_offset(pkt, len, &off) != 0)
+        return;
+    if (dp_parse_arp_ips(pkt, len, &spa_be, &tpa_be) != 0)
         return;
 
     arp = pkt + off;
     op = ((uint16_t)arp[6] << 8) | arp[7];
     format_mac(arp + 8, sha, sizeof(sha));
     format_mac(arp + 18, tha, sizeof(tha));
-    format_ipv4_be32(*(const uint32_t *)(arp + 14), spa, sizeof(spa));
-    format_ipv4_be32(*(const uint32_t *)(arp + 24), tpa, sizeof(tpa));
+    format_ipv4_be32(spa_be, spa, sizeof(spa));
+    format_ipv4_be32(tpa_be, tpa, sizeof(tpa));
 
     fprintf(stderr,
             "[ARP] userspace dir=%s iface=%s len=%u op=%s "

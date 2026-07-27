@@ -322,7 +322,7 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
     return 1;
 }
 
-static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, uint8_t *pkt)
+int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, uint8_t *pkt)
 {
     uint8_t wire_id = 0;
     const struct arp_l2_pqc_entry *e;
