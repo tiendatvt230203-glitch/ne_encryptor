@@ -543,42 +543,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 
-    encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
-    if (encrypted) {
-        if (!fwd->cfg->crypto_enabled)
-            goto drop;
-        dec = decrypt_wan(fwd, &job);
-        if (dec == 1) {
-            ne_frame_free(&fwd->pair, job.addr);
-            return;
-        }
-        if (dec != 0) {
-            int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-            char bridge_to[IF_NAMESIZE] = "";
-
-            /* L2 IP decrypt failed — try ARP decrypt+bridge on original wire. */
-            memcpy(pkt, wire_buf, wire_len);
-            job.len = wire_len;
-            if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
-                return;
-            }
-            goto drop;
-        }
-        if (dp_pkt_is_arp(pkt, job.len)) {
-            int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-            char bridge_to[IF_NAMESIZE] = "";
-
-            if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
-                return;
-            }
-            if (wan_dp >= 0)
-                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
-            goto drop;
-        }
-        wan_clamp_tcp_mss(fwd, pkt, job.len);
-    } else if (dp_pkt_is_arp(pkt, job.len)) {
+    /* ARP path is isolated from IP channel-agg: encrypted (0x823E) or plain (0x0806). */
+    if (crypto_eth_l2_has_arp_marker(pkt, job.len) || dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
         char bridge_to[IF_NAMESIZE] = "";
 
@@ -589,6 +555,20 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (wan_dp >= 0)
             dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, NULL);
         goto drop;
+    }
+
+    encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
+    if (encrypted) {
+        if (!fwd->cfg->crypto_enabled)
+            goto drop;
+        dec = decrypt_wan(fwd, &job);
+        if (dec == 1) {
+            ne_frame_free(&fwd->pair, job.addr);
+            return;
+        }
+        if (dec != 0)
+            goto drop;
+        wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
         /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */
         if (!wan_l2_plain_ipv4(pkt, job.len))

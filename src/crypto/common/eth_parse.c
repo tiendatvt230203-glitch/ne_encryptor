@@ -122,7 +122,19 @@ int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len)
     if (et_off < 0)
         return 0;
     et = eth_read_et(pkt, et_off);
-    return et == NE_L2_FAKE_ETHERTYPE || et == NE_L2_FAKE_ETHERTYPE_ARP;
+    return et == NE_L2_FAKE_ETHERTYPE;
+}
+
+int crypto_eth_l2_has_arp_marker(const uint8_t *pkt, size_t pkt_len)
+{
+    int et_off;
+    uint16_t et;
+
+    et_off = crypto_eth_inner_et_off(pkt, pkt_len);
+    if (et_off < 0)
+        return 0;
+    et = eth_read_et(pkt, et_off);
+    return et == NE_L2_FAKE_ETHERTYPE_ARP;
 }
 
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len)

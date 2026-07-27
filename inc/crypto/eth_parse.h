@@ -27,7 +27,10 @@ int crypto_pkt_is_ipv4(const uint8_t *pkt, size_t pkt_len);
 /** Ghi đè mã EtherType chuẩn của IPv4 (0x0800) vào vị trí chỉ định sau khi giải mã xong*/
 void crypto_eth_set_ipv4_et(uint8_t *pkt, int inner_et_off);
 
+/** L2 IP encrypt marker (0x88B5) — not ARP. */
 int crypto_eth_l2_has_marker(const uint8_t *pkt, size_t pkt_len);
+/** L2 ARP encrypt marker (0x823E). */
+int crypto_eth_l2_has_arp_marker(const uint8_t *pkt, size_t pkt_len);
 int crypto_eth_l2_policy_off(const uint8_t *packet, size_t pkt_len);
 int crypto_eth_l2_read_policy_id(const uint8_t *packet, uint32_t pkt_len, uint8_t *policy_id_out);
 int crypto_eth_l2_core_id_off(const uint8_t *packet, size_t pkt_len);

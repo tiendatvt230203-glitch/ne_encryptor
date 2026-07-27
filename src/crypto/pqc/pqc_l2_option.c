@@ -343,59 +343,38 @@ static int l2_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
 
 }
 
-static int l2_restore_plain_arp_packet(uint8_t *packet, size_t pkt_len,
-                                       const uint8_t *payload, size_t payload_len)
-{
-    int et_off = crypto_eth_l2_prefix_len(packet, pkt_len);
-    int arp_off;
-
-    if (et_off < 0)
-        return -1;
-    arp_off = et_off + 2;
-    crypto_eth_set_arp_et(packet, et_off);
-    memmove(packet + arp_off, payload, payload_len);
-    return arp_off + (int)payload_len;
-}
-
-static int l2_verify_arp_after_decrypt(const uint8_t *arp_payload, size_t len)
-{
-    if (len < 28)
-        return 0;
-    if (arp_payload[0] != 0x00 || arp_payload[1] != 0x01)
-        return 0;
-    if (arp_payload[2] != 0x08 || arp_payload[3] != 0x00)
-        return 0;
-    if (arp_payload[4] != 6 || arp_payload[5] != 4)
-        return 0;
-    return 1;
-}
+/*
+ * ARP L2 PQC wire (overwrite ethertype only):
+ *   [dst][src][0x823E][policy_id:1][core_id:1][nonce:12][ciphertext(ARP 28B)+tag:16]
+ * Decrypt: see 0x823E → decrypt → write back 0x0806.
+ */
+#define ARP_ETH_IPV4_PAYLOAD 28
+#define ARP_WIRE_HDR_LEN     (L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE) /* 14 */
 
 static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
     int arp_off = crypto_eth_arp_offset(packet, pkt_len);
     int et_off;
-    size_t payload_len;
+    int enc_start;
+    int new_len = 0;
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
-    int new_len = 0;
-    int enc_start;
 
-    if (arp_off < 0)
+    if (arp_off < 0 || pkt_len < (size_t)arp_off + ARP_ETH_IPV4_PAYLOAD)
         return -1;
-    /* Plain ARP is not accepted by crypto_eth_l2_prefix_len (IPv4/fake only). */
     et_off = arp_off - 2;
-    payload_len = pkt_len - (size_t)arp_off;
-    enc_start = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
-    if (pkt_len < (size_t)enc_start)
-        return -1;
-    memmove(packet + enc_start, packet + arp_off, payload_len);
+    enc_start = et_off + 2 + ARP_WIRE_HDR_LEN;
+
+    memmove(packet + enc_start, packet + arp_off, ARP_ETH_IPV4_PAYLOAD);
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
     if (crypto_pqc_generate_nonce(nonce) != 0)
         return -1;
+    /* Overwrite 0x0806 → 0x823E + policy_id + core_id + nonce */
     l2_write_wire_header_et(packet, et_off, NE_L2_FAKE_ETHERTYPE_ARP,
                             ctx->wire_id, nonce, L2_NONCE_SIZE);
-    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start, (int)payload_len, &new_len) != 0)
+    if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start,
+                                   ARP_ETH_IPV4_PAYLOAD, &new_len) != 0)
         return -1;
     return enc_start + new_len;
 }
@@ -404,22 +383,30 @@ static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
 {
     crypto_pqc_sess_t pqc;
     byte nonce[CRYPTO_PQC_NONCE_BYTES];
+    int et_off;
+    int enc_start;
+    int arp_off;
     int dec_len = 0;
-    int enc_start = l2_enc_start_off(packet, pkt_len);
-    uint8_t *work_ptr;
 
-    if (enc_start < 0)
+    et_off = crypto_eth_inner_et_off(packet, pkt_len);
+    if (et_off < 0)
+        return -1;
+    enc_start = et_off + 2 + ARP_WIRE_HDR_LEN;
+    if (pkt_len < (size_t)enc_start)
         return -1;
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
-    memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
-    work_ptr = packet + enc_start;
-    if (crypto_pqc_decrypt_payload(&pqc, nonce, work_ptr,
+    memcpy(nonce, packet + et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN, (size_t)L2_NONCE_SIZE);
+    if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_start,
                                    (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;
-    if (!l2_verify_arp_after_decrypt(work_ptr, (size_t)dec_len))
+    if (dec_len < ARP_ETH_IPV4_PAYLOAD)
         return -1;
-    return l2_restore_plain_arp_packet(packet, pkt_len, work_ptr, (size_t)dec_len);
+    /* Restore ethertype 0x0806 and slide ARP body back. */
+    arp_off = et_off + 2;
+    crypto_eth_set_arp_et(packet, et_off);
+    memmove(packet + arp_off, packet + enc_start, (size_t)dec_len);
+    return arp_off + dec_len;
 }
 
 static int l2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
@@ -870,8 +857,6 @@ static int l2_arp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
         return -1;
     if (!crypto_pkt_is_arp(pkt, *pkt_len))
         return 0;
-    if (!OPT_FAKE_ETHERTYPE)
-        return 0;
     n = l2_do_encrypt_arp(ctx, pkt, *pkt_len);
     if (n < 0)
         return -1;
@@ -885,7 +870,8 @@ static int l2_arp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt, uint32_t 
 
     if (unlikely(!ctx || !ctx->initialized || !pkt))
         return -1;
-    if (!crypto_eth_l2_has_marker(pkt, *pkt_len))
+    /* 0x823E = encrypted ARP */
+    if (!crypto_eth_l2_has_arp_marker(pkt, *pkt_len))
         return 0;
     n = l2_do_decrypt_arp(ctx, pkt, *pkt_len);
     if (n < 0)

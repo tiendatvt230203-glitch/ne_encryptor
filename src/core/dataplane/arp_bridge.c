@@ -329,10 +329,17 @@ static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, 
     struct packet_crypto_ctx *pctx;
     uint32_t len;
 
-    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !job || !pkt)
+    if (!fwd || !job || !pkt)
         return -1;
-    if (!crypto_eth_l2_has_marker(pkt, job->len))
-        return 0;
+
+    if (crypto_pkt_is_arp(pkt, job->len))
+        return 0; /* plain ARP — bridge as-is */
+
+    if (!crypto_eth_l2_has_arp_marker(pkt, job->len))
+        return -1; /* not ARP wire */
+
+    if (!fwd->cfg || !fwd->cfg->crypto_enabled)
+        return -1;
     if (crypto_eth_l2_read_policy_id(pkt, job->len, &wire_id) != 0)
         return -1;
 
