@@ -250,15 +250,20 @@ static int l2_frag_magic_off(const uint8_t *packet, size_t pkt_len)
     return l2_enc_start_off(packet, pkt_len);
 }
 
-static void l2_write_wire_header(uint8_t *packet, int et_off, uint8_t policy_id,
-                                 const uint8_t *nonce, int nonce_size)
+static void l2_write_wire_header_et(uint8_t *packet, int et_off, uint16_t fake,
+                                    uint8_t policy_id, const uint8_t *nonce, int nonce_size)
 {
-    uint16_t fake = OPT_FAKE_ETHERTYPE;
     packet[et_off] = (uint8_t)(fake >> 8);
     packet[et_off + 1] = (uint8_t)(fake & 0xFF);
     packet[et_off + 2] = policy_id;
     packet[et_off + 3] = crypto_option_worker_idx();
     memcpy(packet + et_off + 4, nonce, (size_t)nonce_size);
+}
+
+static void l2_write_wire_header(uint8_t *packet, int et_off, uint8_t policy_id,
+                                 const uint8_t *nonce, int nonce_size)
+{
+    l2_write_wire_header_et(packet, et_off, OPT_FAKE_ETHERTYPE, policy_id, nonce, nonce_size);
 }
 
 static int l2_restore_plain_packet(uint8_t *packet, size_t pkt_len,
@@ -388,7 +393,8 @@ static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
         return -1;
     if (crypto_pqc_generate_nonce(nonce) != 0)
         return -1;
-    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
+    l2_write_wire_header_et(packet, et_off, NE_L2_FAKE_ETHERTYPE_ARP,
+                            ctx->wire_id, nonce, L2_NONCE_SIZE);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start, (int)payload_len, &new_len) != 0)
         return -1;
     return enc_start + new_len;

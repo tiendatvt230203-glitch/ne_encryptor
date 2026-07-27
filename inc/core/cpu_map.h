@@ -5,9 +5,9 @@
 
 
 static const uint8_t NE_CPU_RX_LAN[]  = { 0u };
-static const uint8_t NE_CPU_TX_LAN[]  = { 1u, 2u };
-static const uint8_t NE_CPU_CRYPTO[]  = { 3u, 4u, 5u, 6u, 7u, 8u };
-static const uint8_t NE_CPU_TX_WAN[]  = { 9u, 10u };
+static const uint8_t NE_CPU_TX_LAN[]  = { 1u, 2u, 8u };
+static const uint8_t NE_CPU_CRYPTO[]  = { 3u, 4u, 5u, 6u };
+static const uint8_t NE_CPU_TX_WAN[]  = { 9u, 10u, 7u };
 static const uint8_t NE_CPU_RX_WAN[]  = { 11u };
 
 #define NE_RX_LAN_SLOTS   ((uint32_t)(sizeof(NE_CPU_RX_LAN) / sizeof(NE_CPU_RX_LAN[0])))

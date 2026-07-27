@@ -1,12 +1,14 @@
 #define _POSIX_C_SOURCE 199309L
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/crypto_route.h"
+#include "../../../inc/core/arp_bridge.h"
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/traffic_crypto.h"
 
 #include <sched.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -208,8 +210,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     crypto_runtime_reset_indexes();
     memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
 
-    if (!cfg || !cfg->crypto_enabled)
+    if (!cfg || !cfg->crypto_enabled) {
+        arp_bridge_reload_policies(cfg);
         return 0;
+    }
 
     if (cfg->fake_ethertype_ipv4 == 0)
         cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
@@ -294,6 +298,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         }
     }
 
+    arp_bridge_reload_policies(cfg);
     return 0;
 }
 

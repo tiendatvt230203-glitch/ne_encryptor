@@ -24,6 +24,8 @@ struct {
 #define IPPROTO_UDP_VAL 17
 #define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
+/* Encrypted ARP L2 (IANA 0x823E — Advanced Encryption Systems). */
+#define ETH_P_NE_ARP_ENC 0x823E
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
@@ -38,6 +40,10 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 proto = eth->h_proto;
 
     if (proto == __constant_htons(ETH_P_ARP)) {
+        goto redirect;
+    }
+
+    if (proto == __constant_htons(ETH_P_NE_ARP_ENC)) {
         goto redirect;
     }
 

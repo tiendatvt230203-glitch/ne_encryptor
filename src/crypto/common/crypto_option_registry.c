@@ -26,6 +26,7 @@ extern const struct crypto_option_ops *crypto_opt_l2_pqc_tcp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l2_pqc_udp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l2_pqc_icmp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l2_pqc_ospf_ops(void);
+extern const struct crypto_option_ops *crypto_opt_l2_pqc_arp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l3_ctr128_tcp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l3_ctr128_udp_ops(void);
 extern const struct crypto_option_ops *crypto_opt_l3_ctr128_icmp_ops(void);
@@ -93,6 +94,7 @@ static void crypto_option_registry_init(void)
     g_ops[CRYPTO_OPT_L2_PQC][CRYPTO_PROTO_ICMP] = crypto_opt_l2_pqc_icmp_ops();
     g_ops[CRYPTO_OPT_L2_PQC][CRYPTO_PROTO_OSPF] = crypto_opt_l2_pqc_ospf_ops();
     g_ops[CRYPTO_OPT_L2_PQC][CRYPTO_PROTO_OTHER] = crypto_opt_l2_pqc_icmp_ops();
+    g_ops[CRYPTO_OPT_L2_PQC][CRYPTO_PROTO_ARP] = crypto_opt_l2_pqc_arp_ops();
     g_ops[CRYPTO_OPT_L3_CTR128][CRYPTO_PROTO_TCP] = crypto_opt_l3_ctr128_tcp_ops();
     g_ops[CRYPTO_OPT_L3_CTR128][CRYPTO_PROTO_UDP] = crypto_opt_l3_ctr128_udp_ops();
     g_ops[CRYPTO_OPT_L3_CTR128][CRYPTO_PROTO_ICMP] = crypto_opt_l3_ctr128_icmp_ops();

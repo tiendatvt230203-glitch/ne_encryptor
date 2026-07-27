@@ -2,8 +2,12 @@
 #include "../../../inc/core/config.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/dataplane_util.h"
+#include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/interface.h"
+#include "../../../inc/crypto/crypto_option.h"
+#include "../../../inc/crypto/eth_parse.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +15,25 @@
 #include <net/if.h>
 
 #define ARP_LOG_FAIL_INTERVAL_MS 30000ull
+
+struct arp_l2_pqc_entry {
+    int policy_index;
+    int priority;
+    int wire_id;
+    int db_id;
+    int profile_id;
+    int src_any;
+    int dst_any;
+    int src_negate;
+    int dst_negate;
+    uint32_t src_net;
+    uint32_t src_mask;
+    uint32_t dst_net;
+    uint32_t dst_mask;
+};
+
+static struct arp_l2_pqc_entry g_arp_l2_pqc[MAX_CRYPTO_POLICIES];
+static int g_arp_l2_pqc_count;
 
 static uint64_t arp_monotonic_ms(void)
 {
@@ -28,6 +51,104 @@ static int arp_log_fail_ratelimit(uint64_t *last_ms)
         return 0;
     *last_ms = now;
     return 1;
+}
+
+static int arp_cidr_match(int any_flag, int negate, uint32_t ip, uint32_t net, uint32_t mask)
+{
+    int in_cidr;
+
+    if (any_flag)
+        return 1;
+    in_cidr = ((ip & mask) == (net & mask));
+    return negate ? !in_cidr : in_cidr;
+}
+
+static int arp_entry_match_ips(const struct arp_l2_pqc_entry *e, uint32_t spa, uint32_t tpa)
+{
+    if (!e)
+        return 0;
+    if (!arp_cidr_match(e->src_any, e->src_negate, spa, e->src_net, e->src_mask))
+        return 0;
+    if (!arp_cidr_match(e->dst_any, e->dst_negate, tpa, e->dst_net, e->dst_mask))
+        return 0;
+    return 1;
+}
+
+void arp_bridge_reload_policies(struct app_config *cfg)
+{
+    g_arp_l2_pqc_count = 0;
+    if (!cfg || !cfg->crypto_enabled)
+        return;
+
+    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        if (!p->enabled)
+            continue;
+        for (int j = 0; j < p->policy_count && j < MAX_CRYPTO_POLICIES; j++) {
+            int idx = p->policy_indices[j];
+            const struct crypto_policy *cp;
+            struct arp_l2_pqc_entry *e;
+
+            if (idx < 0 || idx >= cfg->policy_count)
+                continue;
+            cp = &cfg->policies[idx];
+            if (cp->action != POLICY_ACTION_ENCRYPT_L2)
+                continue;
+            if (cp->crypto_mode != CRYPTO_MODE_PQC)
+                continue;
+            if (cp->protocol != POLICY_PROTO_ANY)
+                continue;
+            if (g_arp_l2_pqc_count >= MAX_CRYPTO_POLICIES)
+                break;
+
+            e = &g_arp_l2_pqc[g_arp_l2_pqc_count++];
+            e->policy_index = idx;
+            e->priority = cp->priority;
+            e->wire_id = cp->id;
+            e->db_id = cp->db_id;
+            e->profile_id = p->id;
+            e->src_any = cp->src_any;
+            e->dst_any = cp->dst_any;
+            e->src_negate = cp->src_negate;
+            e->dst_negate = cp->dst_negate;
+            e->src_net = cp->src_net;
+            e->src_mask = cp->src_mask;
+            e->dst_net = cp->dst_net;
+            e->dst_mask = cp->dst_mask;
+        }
+    }
+
+    fprintf(stderr, "[ARP] l2-pqc-any policies cached: %d\n", g_arp_l2_pqc_count);
+}
+
+static const struct arp_l2_pqc_entry *arp_bridge_match_policy(int profile_id,
+                                                             uint32_t spa, uint32_t tpa)
+{
+    const struct arp_l2_pqc_entry *best = NULL;
+
+    for (int i = 0; i < g_arp_l2_pqc_count; i++) {
+        const struct arp_l2_pqc_entry *e = &g_arp_l2_pqc[i];
+
+        if (profile_id > 0 && e->profile_id != profile_id)
+            continue;
+        if (!arp_entry_match_ips(e, spa, tpa))
+            continue;
+        if (!best ||
+            e->priority < best->priority ||
+            (e->priority == best->priority && e->wire_id < best->wire_id))
+            best = e;
+    }
+    return best;
+}
+
+static const struct arp_l2_pqc_entry *arp_bridge_entry_by_wire_id(uint8_t wire_id)
+{
+    for (int i = 0; i < g_arp_l2_pqc_count; i++) {
+        if (g_arp_l2_pqc[i].wire_id == (int)wire_id)
+            return &g_arp_l2_pqc[i];
+    }
+    return NULL;
 }
 
 static struct ne_ring *arp_mid_to_local_ring(struct forwarder *fwd, int li)
@@ -157,6 +278,81 @@ static int profile_pi_for_fwd_local(struct forwarder *fwd, int fwd_li)
     return -1;
 }
 
+static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
+                                  uint8_t *pkt, int profile_id)
+{
+    uint32_t spa = 0, tpa = 0;
+    const struct arp_l2_pqc_entry *e;
+    struct packet_crypto_ctx *pctx;
+    uint8_t scratch[NE_FRAME];
+    uint32_t orig_len;
+    uint32_t len;
+
+    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !job || !pkt)
+        return 0;
+    if (dp_parse_arp_ips(pkt, job->len, &spa, &tpa) != 0)
+        return 0;
+
+    e = arp_bridge_match_policy(profile_id, spa, tpa);
+    if (!e)
+        return 0;
+    if (!fwd_crypto_policy_ready(e->policy_index))
+        return 0;
+
+    pctx = fwd_crypto_policy_ctx(e->policy_index);
+    if (!pctx)
+        return 0;
+
+    orig_len = job->len;
+    if (orig_len > NE_FRAME)
+        return 0;
+    memcpy(scratch, pkt, orig_len);
+    len = orig_len;
+
+    pctx->profile_id = profile_id;
+    pctx->wire_id = (uint8_t)e->wire_id;
+    pctx->policy_id = e->db_id;
+
+    if (crypto_option_encrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP, pctx, pkt, &len) != 0) {
+        memcpy(pkt, scratch, orig_len);
+        job->len = orig_len;
+        return 0;
+    }
+    job->len = len;
+    return 1;
+}
+
+static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, uint8_t *pkt)
+{
+    uint8_t wire_id = 0;
+    const struct arp_l2_pqc_entry *e;
+    struct packet_crypto_ctx *pctx;
+    uint32_t len;
+
+    if (!fwd || !fwd->cfg || !fwd->cfg->crypto_enabled || !job || !pkt)
+        return -1;
+    if (!crypto_eth_l2_has_marker(pkt, job->len))
+        return 0;
+    if (crypto_eth_l2_read_policy_id(pkt, job->len, &wire_id) != 0)
+        return -1;
+
+    e = arp_bridge_entry_by_wire_id(wire_id);
+    if (!e)
+        return -1;
+
+    pctx = fwd_crypto_ctx_for_wire_id(wire_id);
+    if (!pctx)
+        return -1;
+
+    len = job->len;
+    if (crypto_option_decrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP, pctx, pkt, &len) != 0)
+        return -1;
+    if (!crypto_pkt_is_arp(pkt, len))
+        return -1;
+    job->len = len;
+    return 1;
+}
+
 int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                           const uint8_t *pkt, int ingress_li,
                           char egress_ifname[IF_NAMESIZE])
@@ -165,11 +361,16 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     const struct profile_config *prof;
     int wan_dp;
     struct ne_ring *ring;
+    uint8_t *mut;
 
     if (egress_ifname)
         egress_ifname[0] = '\0';
 
     if (!fwd || !fwd->cfg || !job || !pkt)
+        return -1;
+
+    mut = ne_packet_data(&fwd->pair, job->addr);
+    if (!mut)
         return -1;
 
     profile_pi = profile_pi_for_fwd_local(fwd, ingress_li);
@@ -203,6 +404,8 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
         return -1;
     }
 
+    (void)arp_try_encrypt_l2_pqc(fwd, job, mut, prof->id);
+
     ring = arp_mid_to_wan_ring(fwd, wan_dp);
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
@@ -227,11 +430,21 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     const struct profile_config *prof;
     int local_idx;
     struct ne_ring *ring;
+    uint8_t *mut;
+    int dec;
 
     if (egress_ifname)
         egress_ifname[0] = '\0';
 
     if (!fwd || !fwd->cfg || !job || !pkt)
+        return -1;
+
+    mut = ne_packet_data(&fwd->pair, job->addr);
+    if (!mut)
+        return -1;
+
+    dec = arp_try_decrypt_l2_pqc(fwd, job, mut);
+    if (dec < 0)
         return -1;
 
     profile_pi = profile_pi_for_wan_dp(fwd, ingress_wan_dp);

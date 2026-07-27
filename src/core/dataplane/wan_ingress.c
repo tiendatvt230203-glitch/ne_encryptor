@@ -91,12 +91,6 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
 
     memcpy(pkt, scratch, orig_len);
     *len = orig_len;
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_ARP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_arp(pkt, *len))
-        return 0;
-
-    memcpy(pkt, scratch, orig_len);
-    *len = orig_len;
     return -1;
 }
 
@@ -558,8 +552,19 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             ne_frame_free(&fwd->pair, job.addr);
             return;
         }
-        if (dec != 0)
+        if (dec != 0) {
+            int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+            char bridge_to[IF_NAMESIZE] = "";
+
+            /* L2 IP decrypt failed — try ARP decrypt+bridge on original wire. */
+            memcpy(pkt, wire_buf, wire_len);
+            job.len = wire_len;
+            if (wan_dp >= 0 && arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to) == 0) {
+                dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+                return;
+            }
             goto drop;
+        }
         if (dp_pkt_is_arp(pkt, job.len)) {
             int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
             char bridge_to[IF_NAMESIZE] = "";
