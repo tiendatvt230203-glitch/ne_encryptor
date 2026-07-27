@@ -157,40 +157,213 @@ static int ne_vault_run_silent(const struct ne_vault_cfg *cfg, const char *cmd)
     return (rc == 0) ? 0 : -1;
 }
 
-static int ne_vault_get_field(const struct ne_vault_cfg *cfg, const char *field,
-                              char *out, size_t outsz)
+static int ne_secret_metadata_key(const char *key)
 {
-    char cmd[VAULT_CMD_BUF];
-    char final_cmd[VAULT_CMD_BUF * 2];
-    FILE *fp;
-    size_t n;
+    static const char *meta[] = {
+        "created_time", "custom_metadata", "deletion_time", "destroyed", "version",
+        NULL
+    };
 
-    if (!cfg || !field || !out || outsz == 0)
+    if (!key)
+        return 1;
+    for (int i = 0; meta[i]; i++) {
+        if (strcmp(key, meta[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int ne_secret_key_wanted(const char *key)
+{
+    if (!key || !key[0])
+        return 0;
+    if (strncmp(key, "POSTGRES_", 9) == 0)
+        return 1;
+    if (strcmp(key, "LISTEN_PORT") == 0)
+        return 1;
+    return 0;
+}
+
+/* Parse "KEY    value" lines from `vault kv get` table output. */
+static int ne_vault_parse_table_line(const char *line, char *key, size_t keysz,
+                                     char *val, size_t valsz)
+{
+    const char *p = line;
+    const char *val_start = NULL;
+    size_t klen;
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '\0' || *p == '\n' || *p == '#')
+        return -1;
+    if (strncmp(p, "---", 3) == 0)
         return -1;
 
-    out[0] = '\0';
+    for (const char *q = p; *q; q++) {
+        if ((*q == ' ' && q[1] == ' ') || *q == '\t') {
+            val_start = q;
+            while (*val_start == ' ' || *val_start == '\t')
+                val_start++;
+            if (!*val_start || *val_start == '\n')
+                continue;
+            break;
+        }
+    }
+    if (!val_start)
+        return -1;
 
-    snprintf(cmd, sizeof(cmd),
-             "vault kv get -field=%s %s", field, NE_VAULT_SECRET_PATH);
+    klen = (size_t)(val_start - p);
+    while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t'))
+        klen--;
+    if (klen == 0 || klen >= keysz)
+        return -1;
+
+    memcpy(key, p, klen);
+    key[klen] = '\0';
+
+    strncpy(val, val_start, valsz - 1);
+    val[valsz - 1] = '\0';
+
+    {
+        size_t n = strlen(val);
+        while (n > 0 && (val[n - 1] == '\n' || val[n - 1] == '\r' ||
+                         val[n - 1] == ' ' || val[n - 1] == '\t'))
+            val[--n] = '\0';
+    }
+
+    strip_env_quotes(val);
+    return val[0] ? 0 : -1;
+}
+
+static int ne_vault_value_needs_quotes(const char *key)
+{
+    if (!key)
+        return 1;
+    if (strcmp(key, "LISTEN_PORT") == 0 || strcmp(key, "POSTGRES_PORT") == 0)
+        return 0;
+    return 1;
+}
+
+static void ne_vault_log_kv(const char *key, const char *val)
+{
+#if NE_VAULT_DEBUG_LOG
+    if (!key || !val)
+        return;
+    if (ne_vault_value_needs_quotes(key))
+        fprintf(stderr, "%s=\"%s\"\n", key, val);
+    else
+        fprintf(stderr, "%s=%s\n", key, val);
+#else
+    (void)key;
+    (void)val;
+#endif
+}
+
+static void ne_vault_log_loaded_secrets(void)
+{
+#if NE_VAULT_DEBUG_LOG
+    static const char *order[] = {
+        "LISTEN_PORT",
+        "POSTGRES_DB",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_PORT",
+        "POSTGRES_SERVER",
+        "POSTGRES_USER",
+        NULL
+    };
+
+    fprintf(stderr, "[VAULT] secrets from " NE_VAULT_SECRET_PATH ":\n");
+    for (int i = 0; order[i]; i++) {
+        const char *v = getenv(order[i]);
+        if (v && v[0])
+            ne_vault_log_kv(order[i], v);
+    }
+#endif
+}
+
+static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
+{
+    char final_cmd[VAULT_CMD_BUF * 2];
+    char line[4096];
+    char key[128];
+    char val[VAULT_VAL_BUF];
+    FILE *fp;
+    int loaded = 0;
+    int rc;
+
     snprintf(final_cmd, sizeof(final_cmd),
-             "export VAULT_ADDR=\"%s\" VAULT_TOKEN=\"%s\" && %s 2>/dev/null",
-             cfg->addr, cfg->token, cmd);
+             "export VAULT_ADDR=\"%s\" VAULT_TOKEN=\"%s\" && vault kv get %s",
+             cfg->addr, cfg->token, NE_VAULT_SECRET_PATH);
 
     fp = popen(final_cmd, "r");
-    if (!fp)
-        return -1;
-
-    if (!fgets(out, (int)outsz, fp)) {
-        pclose(fp);
+    if (!fp) {
+        fprintf(stderr, "[VAULT] popen vault kv get failed\n");
         return -1;
     }
-    pclose(fp);
 
-    n = strlen(out);
-    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
-        out[--n] = '\0';
+    while (fgets(line, sizeof(line), fp)) {
+        if (ne_vault_parse_table_line(line, key, sizeof(key), val, sizeof(val)) != 0)
+            continue;
+        if (ne_secret_metadata_key(key))
+            continue;
+        if (!ne_secret_key_wanted(key))
+            continue;
 
-    return out[0] ? 0 : -1;
+        setenv(key, val, 1);
+        loaded++;
+    }
+
+    rc = pclose(fp);
+    if (loaded == 0) {
+        fprintf(stderr, "[VAULT] vault kv get " NE_VAULT_SECRET_PATH
+                " returned no POSTGRES_* fields (exit=%d)\n", rc);
+        return -1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "[VAULT] warn: vault kv get exit=%d but %d field(s) parsed\n",
+                rc, loaded);
+    }
+    return 0;
+}
+
+static int ne_vault_verify_postgres_env(void)
+{
+    const char *host = getenv("POSTGRES_SERVER");
+    const char *port = getenv("POSTGRES_PORT");
+    const char *user = getenv("POSTGRES_USER");
+    const char *dbname = getenv("POSTGRES_DB");
+    const char *pass = getenv("POSTGRES_PASSWORD");
+
+    if (!host || !host[0])
+        host = getenv("POSTGRES_HOST");
+    if ((!host || !host[0]) && getenv("POSTGRES_HOST"))
+        setenv("POSTGRES_SERVER", getenv("POSTGRES_HOST"), 1);
+
+    host = getenv("POSTGRES_SERVER");
+    if (!host || !host[0])
+        host = getenv("POSTGRES_HOST");
+
+    if (!host || !host[0]) {
+        fprintf(stderr, "[VAULT] missing POSTGRES_SERVER in " NE_VAULT_SECRET_PATH "\n");
+        return -1;
+    }
+    if (!port || !port[0]) {
+        fprintf(stderr, "[VAULT] missing POSTGRES_PORT in " NE_VAULT_SECRET_PATH "\n");
+        return -1;
+    }
+    if (!user || !user[0]) {
+        fprintf(stderr, "[VAULT] missing POSTGRES_USER in " NE_VAULT_SECRET_PATH "\n");
+        return -1;
+    }
+    if (!dbname || !dbname[0]) {
+        fprintf(stderr, "[VAULT] missing POSTGRES_DB in " NE_VAULT_SECRET_PATH "\n");
+        return -1;
+    }
+    if (!pass || !pass[0]) {
+        fprintf(stderr, "[VAULT] missing POSTGRES_PASSWORD in " NE_VAULT_SECRET_PATH "\n");
+        return -1;
+    }
+    return 0;
 }
 
 int ne_vault_unseal_and_login(void)
@@ -239,16 +412,6 @@ int ne_vault_unseal_and_login(void)
 int ne_vault_load_secrets(void)
 {
     struct ne_vault_cfg cfg;
-    static const char *required[] = {
-        "POSTGRES_SERVER",
-        "POSTGRES_PORT",
-        "POSTGRES_USER",
-        "POSTGRES_DB",
-        "POSTGRES_PASSWORD",
-        NULL
-    };
-    char val[VAULT_VAL_BUF];
-    int loaded = 0;
 
     if (ne_vault_load_cfg(&cfg) != 0)
         return -1;
@@ -258,17 +421,15 @@ int ne_vault_load_secrets(void)
         return -1;
     }
 
-    fprintf(stderr, "[VAULT] loading secrets from " NE_VAULT_SECRET_PATH "\n");
+    fprintf(stderr, "[VAULT] vault kv get " NE_VAULT_SECRET_PATH "\n");
 
-    for (int i = 0; required[i]; i++) {
-        if (ne_vault_get_field(&cfg, required[i], val, sizeof(val)) != 0) {
-            fprintf(stderr, "[VAULT] missing field: %s\n", required[i]);
-            return -1;
-        }
-        setenv(required[i], val, 1);
-        loaded++;
-    }
+    if (ne_vault_kv_get_and_apply(&cfg) != 0)
+        return -1;
 
-    fprintf(stderr, "[VAULT] loaded %d secret field(s) into environment\n", loaded);
+    if (ne_vault_verify_postgres_env() != 0)
+        return -1;
+
+    ne_vault_log_loaded_secrets();
+    fprintf(stderr, "[VAULT] POSTGRES_* loaded from " NE_VAULT_SECRET_PATH "\n");
     return 0;
 }

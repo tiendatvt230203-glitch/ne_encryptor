@@ -3,6 +3,9 @@
 
 #define NE_VAULT_SECRET_PATH "kv/secret"
 
+/* 1 = print kv/secret KEY=VALUE to stderr (debug). Set 0 before production. */
+#define NE_VAULT_DEBUG_LOG 1
+
 /* Unseal Vault (3 keys) and login using VAULT_* from NE_ENV_FILE.
  * Returns 0 on success or when Vault config is absent (skipped).
  * Returns -1 on failure. */
