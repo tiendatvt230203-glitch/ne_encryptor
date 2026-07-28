@@ -19,9 +19,18 @@ OPT_SRCS = $(wildcard src/crypto/options/common/*.c) \
 
 PQC_SRCS = $(wildcard src/crypto/pqc/*.c)
 
+IFACE_SRCS = $(wildcard src/core/iface/validate/*.c) \
+             $(wildcard src/core/iface/umem/*.c) \
+             $(wildcard src/core/iface/dp/*.c) \
+             $(wildcard src/core/iface/xdp/*.c) \
+             $(wildcard src/core/iface/lifecycle/*.c) \
+             $(wildcard src/core/iface/ops/*.c) \
+             $(wildcard src/core/iface/ops/profile/*.c) \
+             $(wildcard src/core/iface/ops/interface/*.c)
+
 CORE_SRCS = $(wildcard src/core/forwarder/*.c) \
             $(wildcard src/core/dataplane/*.c) \
-            $(wildcard src/core/iface/*.c) \
+            $(IFACE_SRCS) \
             $(wildcard src/core/flow/*.c) \
             $(wildcard src/core/util/*.c)
 
@@ -38,6 +47,8 @@ DB_SRC = src/db/config.c \
          src/db/db_config.c \
          src/db/db_env.c \
          src/db/db_runtime.c \
+         src/db/db_profile_crud.c \
+         src/db/db_crud_cli.c \
          src/db/vault.c
 DB_OBJ = $(DB_SRC:.c=.o)
 
@@ -58,7 +69,8 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/common/*.o \
+	rm -rf network-encryptor src/*.o src/core/*/*.o src/core/iface/*/*.o \
+		src/core/iface/ops/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
 		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
 		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)

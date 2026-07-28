@@ -1,8 +1,8 @@
-#include "../../../inc/core/profile_iface_lifecycle.h"
+#include "../../../../inc/core/profile_iface_lifecycle.h"
 
-#include "../../../inc/core/forwarder_wan.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/profile_iface_xdp.h"
+#include "../../../../inc/core/forwarder_wan.h"
+#include "../../../../inc/core/interface.h"
+#include "../../../../inc/core/xdp_attach.h"
 
 #include <net/if.h>
 #include <stdio.h>
@@ -45,7 +45,6 @@ static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname
     return -1;
 }
 
-/* Prefer non-UMEM holes, then grow, then UMEM hole last. */
 static int fwd_alloc_local_slot(struct forwarder *fwd)
 {
     int n;
@@ -156,6 +155,18 @@ void profile_iface_life_reconcile_counts(struct forwarder *fwd)
     fwd->pair.wan_count = max_di;
 }
 
+static void life_xdp_detach_all_live(struct forwarder *fwd)
+{
+    for (int i = 0; i < fwd->pair.local_count; i++) {
+        if (ne_pair_local_live(&fwd->pair, i))
+            ne_xdp_attach_detach_local(&fwd->pair, i);
+    }
+    for (int i = 0; i < fwd->pair.wan_count; i++) {
+        if (ne_pair_wan_live(&fwd->pair, i))
+            ne_xdp_attach_detach_wan(&fwd->pair, i);
+    }
+}
+
 int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int profile_id)
 {
     int li;
@@ -173,11 +184,11 @@ int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int
 
     fprintf(stderr, "[PROFILE-LIFE] umem-rehome path for %s slot %d\n", ifname, li);
     fflush(stderr);
+    life_xdp_detach_all_live(fwd);
     rc = ne_pair_unplumb_local_rehome(&fwd->pair, li, fwd->cfg);
     if (rc < 0)
         return -1;
     if (rc == 1) {
-        /* UMEM was rebuilt onto a surviving LAN — re-attach XDP on keepers. */
         fprintf(stderr,
                 "[PROFILE-LIFE] profile %d: UMEM rehomed after drop %s — rebind XDP keepers\n",
                 profile_id, ifname);
@@ -185,7 +196,7 @@ int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int
         for (int i = 0; i < fwd->pair.local_count; i++) {
             if (!ne_pair_local_live(&fwd->pair, i))
                 continue;
-            if (profile_iface_xdp_bind_local(&fwd->pair, fwd->cfg, i) != 0) {
+            if (ne_xdp_attach_bind_local(&fwd->pair, fwd->cfg, i) != 0) {
                 fprintf(stderr, "[PROFILE-LIFE] rebind LAN %s failed\n",
                         fwd->pair.locals[i].ifname);
                 return -1;
@@ -198,7 +209,7 @@ int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int
         for (int i = 0; i < fwd->pair.wan_count; i++) {
             if (!ne_pair_wan_live(&fwd->pair, i))
                 continue;
-            if (profile_iface_xdp_bind_wan(&fwd->pair, fwd->cfg, i,
+            if (ne_xdp_attach_bind_wan(&fwd->pair, fwd->cfg, i,
                                           fwd->cfg->fake_ethertype_ipv4) != 0) {
                 fprintf(stderr, "[PROFILE-LIFE] rebind WAN %s failed\n",
                         fwd->pair.wans[i].ifname);
@@ -229,6 +240,7 @@ int profile_iface_life_detach_wan(struct forwarder *fwd, const char *ifname, int
             "[PROFILE-LIFE] profile %d REMOVE WAN %s — detach xdp/xsk (dp slot %d)\n",
             profile_id, ifname, di);
     fflush(stderr);
+    ne_xdp_attach_detach_wan(&fwd->pair, di);
     ne_pair_unplumb_wan_dp(&fwd->pair, di);
     fwd->wan_cfg_idx[di] = -1;
     fwd_wan_mark_stopped(di);
@@ -312,7 +324,6 @@ int profile_iface_life_detach_profile_rows(struct forwarder *fwd,
                     old_cfg->wans[oci].dataplane ? "" : " old_not_dataplane");
             continue;
         }
-        /* Detach live WAN even if old row lost the dataplane flag. */
         (void)profile_iface_life_detach_wan(fwd, ifname, trigger_profile_id);
     }
 
@@ -325,9 +336,12 @@ void profile_iface_life_attach_rollback(struct forwarder *fwd,
 {
     if (!fwd || !sess)
         return;
-    for (int i = sess->lan_n - 1; i >= 0; i--)
+    for (int i = sess->lan_n - 1; i >= 0; i--) {
+        ne_xdp_attach_detach_local(&fwd->pair, sess->lan_added[i]);
         ne_pair_unplumb_local(&fwd->pair, sess->lan_added[i]);
+    }
     for (int i = sess->wan_n - 1; i >= 0; i--) {
+        ne_xdp_attach_detach_wan(&fwd->pair, sess->wan_added[i]);
         ne_pair_unplumb_wan_dp(&fwd->pair, sess->wan_added[i]);
         fwd->wan_cfg_idx[sess->wan_added[i]] = -1;
         fwd_wan_mark_stopped(sess->wan_added[i]);
@@ -391,6 +405,7 @@ void profile_iface_life_attach_lan_rows(struct forwarder *fwd,
         fprintf(stderr, "[PROFILE-LIFE] profile %d ADD LAN %s (slot %d)\n",
                 trigger_profile_id, ifname, li);
         fflush(stderr);
+        ne_xdp_attach_detach_ifname(ifname);
         if (ne_pair_plumb_local(&fwd->pair, new_cfg, ci, li) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip LAN %s (plumb/XSK failed)\n",
@@ -398,10 +413,11 @@ void profile_iface_life_attach_lan_rows(struct forwarder *fwd,
             sess->validate_failed = 1;
             continue;
         }
-        if (profile_iface_xdp_bind_local(&fwd->pair, new_cfg, li) != 0) {
+        if (ne_xdp_attach_bind_local(&fwd->pair, new_cfg, li) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip LAN %s (xdp attach/xsk map failed)\n",
                     trigger_profile_id, ifname);
+            ne_xdp_attach_detach_local(&fwd->pair, li);
             ne_pair_unplumb_local(&fwd->pair, li);
             sess->validate_failed = 1;
             continue;
@@ -472,6 +488,7 @@ void profile_iface_life_attach_wan_rows(struct forwarder *fwd,
         fprintf(stderr, "[PROFILE-LIFE] profile %d ADD WAN %s (dp slot %d)\n",
                 trigger_profile_id, ifname, di);
         fflush(stderr);
+        ne_xdp_attach_detach_ifname(ifname);
         if (ne_pair_plumb_wan_dp(&fwd->pair, new_cfg, ci, di) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip WAN %s (plumb/XSK failed)\n",
@@ -479,11 +496,12 @@ void profile_iface_life_attach_wan_rows(struct forwarder *fwd,
             sess->validate_failed = 1;
             continue;
         }
-        if (profile_iface_xdp_bind_wan(&fwd->pair, new_cfg, di,
+        if (ne_xdp_attach_bind_wan(&fwd->pair, new_cfg, di,
                                        new_cfg->fake_ethertype_ipv4) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip WAN %s (xdp attach/xsk map failed)\n",
                     trigger_profile_id, ifname);
+            ne_xdp_attach_detach_wan(&fwd->pair, di);
             ne_pair_unplumb_wan_dp(&fwd->pair, di);
             sess->validate_failed = 1;
             continue;
