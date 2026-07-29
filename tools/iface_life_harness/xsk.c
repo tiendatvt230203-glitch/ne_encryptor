@@ -3,6 +3,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
+#include <limits.h>
 #include <linux/if_link.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,41 @@
 #ifndef XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
 #endif
+
+static int resolve_bpf_path(const char *rel, char *out, size_t outsz)
+{
+    char exe[PATH_MAX];
+    ssize_t n;
+
+    if (!rel || !rel[0])
+        return -1;
+    if (rel[0] == '/') {
+        if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
+            return -1;
+        return access(out, R_OK) == 0 ? 0 : -1;
+    }
+    if (access(rel, R_OK) == 0) {
+        if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
+            return -1;
+        return 0;
+    }
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        char *slash;
+
+        exe[n] = '\0';
+        slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            if (snprintf(out, outsz, "%s/%s", exe, rel) < (int)outsz &&
+                access(out, R_OK) == 0)
+                return 0;
+        }
+    }
+    if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
+        return -1;
+    return -1;
+}
 
 static void xdp_off(const char *name)
 {
@@ -170,11 +206,19 @@ static int make_xdp(struct hx_if *x, const char *path,
 int hx_open(struct hx *h, const char *bpf_lan, const char *bpf_wan)
 {
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+    const char *lan_in = bpf_lan ? bpf_lan : "bpf/lan.o";
+    const char *wan_in = bpf_wan ? bpf_wan : "bpf/wan.o";
 
     memset(h, 0, sizeof(*h));
     h->umem_i = -1;
-    strncpy(h->bpf_lan, bpf_lan, sizeof(h->bpf_lan) - 1);
-    strncpy(h->bpf_wan, bpf_wan, sizeof(h->bpf_wan) - 1);
+    if (resolve_bpf_path(lan_in, h->bpf_lan, sizeof(h->bpf_lan)) != 0) {
+        fprintf(stderr, "[HX] missing %s (run: cd tools && make)\n", lan_in);
+        return -1;
+    }
+    if (resolve_bpf_path(wan_in, h->bpf_wan, sizeof(h->bpf_wan)) != 0) {
+        fprintf(stderr, "[HX] missing %s (run: cd tools && make)\n", wan_in);
+        return -1;
+    }
     setrlimit(RLIMIT_MEMLOCK, &rl);
 
     h->bufsize = (size_t)HX_FRAMES * HX_FRAME;
