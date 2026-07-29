@@ -7,18 +7,37 @@
 
 static const uint8_t k_static_key[32] = { L4PQC_STATIC_KEY };
 
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* Parse aa:bb:cc:dd:ee:ff without sscanf (avoids glibc __isoc23_sscanf mismatch). */
 static int parse_mac(const char *s, uint8_t mac_out[6])
 {
-    unsigned int b[6];
+    int hi, lo;
 
     if (!s || !mac_out)
         return -1;
-    if (sscanf(s, "%x:%x:%x:%x:%x:%x",
-               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
-        return -1;
-    for (int i = 0; i < 6; i++)
-        mac_out[i] = (uint8_t)b[i];
-    return 0;
+    for (int i = 0; i < 6; i++) {
+        if (i > 0) {
+            if (*s != ':')
+                return -1;
+            s++;
+        }
+        hi = hex_nibble(*s++);
+        lo = hex_nibble(*s++);
+        if (hi < 0 || lo < 0)
+            return -1;
+        mac_out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return (*s == '\0') ? 0 : -1;
 }
 
 static void usage(const char *prog)
