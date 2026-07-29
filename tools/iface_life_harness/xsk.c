@@ -14,27 +14,19 @@
 #ifndef XDP_FLAGS_DRV_MODE
 #define XDP_FLAGS_DRV_MODE (1U << 2)
 #endif
-#ifndef XDP_FLAGS_SKB_MODE
-#define XDP_FLAGS_SKB_MODE (1U << 1)
-#endif
 #ifndef XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
 #endif
 
 static void xdp_off(const char *name)
 {
-    unsigned int idx = if_nametoindex(name);
-    char cmd[128];
+    char cmd[160];
+    static const char *const modes[] = { "xdp", "xdpgeneric", "xdpoffload" };
 
-    if (idx) {
-        bpf_xdp_detach((int)idx, 0, NULL);
-        bpf_xdp_detach((int)idx, XDP_FLAGS_SKB_MODE, NULL);
-        bpf_xdp_detach((int)idx, XDP_FLAGS_DRV_MODE, NULL);
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        snprintf(cmd, sizeof(cmd), "ip link set dev %s %s off 2>/dev/null", name, modes[i]);
+        if (system(cmd) < 0) {}
     }
-    snprintf(cmd, sizeof(cmd), "ip link set dev %s xdp off 2>/dev/null", name);
-    if (system(cmd) < 0) {}
-    snprintf(cmd, sizeof(cmd), "ip link set dev %s xdpgeneric off 2>/dev/null", name);
-    if (system(cmd) < 0) {}
 }
 
 static int find(const struct hx *h, const char *name)
@@ -97,14 +89,14 @@ static int make_umem(struct hx *h, int i)
     return 0;
 }
 
-static int make_xsk(struct hx *h, int i, uint32_t mode)
+static int make_xsk(struct hx *h, int i)
 {
     struct hx_if *x = &h->ifs[i];
     struct xsk_socket_config c = {
         .rx_size = HX_RING,
         .tx_size = HX_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = mode,
+        .xdp_flags = XDP_FLAGS_DRV_MODE,
         .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
     };
     int keep = (h->umem_i == i);
@@ -120,11 +112,10 @@ static int make_xsk(struct hx *h, int i, uint32_t mode)
     rc = xsk_socket__create_shared(&x->xsk, x->name, 0, h->umem,
                                    &x->rx, &x->tx, &x->fq, &x->cq, &c);
     if (rc) {
-        fprintf(stderr, "[HX] xsk %s mode=0x%x fail: %s\n",
-                x->name, mode, strerror(-rc));
+        fprintf(stderr, "[HX] xsk %s DRV fail: %s\n", x->name, strerror(-rc));
         return -1;
     }
-    x->flags = mode;
+    x->flags = XDP_FLAGS_DRV_MODE;
     return 0;
 }
 
@@ -134,7 +125,6 @@ static int make_xdp(struct hx_if *x, const char *path,
     struct bpf_program *prog;
     struct bpf_map *map;
     int key = 0, fd, rc;
-    uint32_t mode;
 
     x->bpf = bpf_object__open_file(path, NULL);
     if (libbpf_get_error(x->bpf)) {
@@ -158,27 +148,22 @@ static int make_xdp(struct hx_if *x, const char *path,
     }
 
     xdp_off(x->name);
-    mode = x->flags ? x->flags : XDP_FLAGS_DRV_MODE;
-    rc = bpf_xdp_attach(x->ifindex, bpf_program__fd(prog), mode, NULL);
-    if (rc && mode == XDP_FLAGS_DRV_MODE) {
-        mode = XDP_FLAGS_SKB_MODE;
-        rc = bpf_xdp_attach(x->ifindex, bpf_program__fd(prog), mode, NULL);
-    }
+    rc = bpf_xdp_attach(x->ifindex, bpf_program__fd(prog), XDP_FLAGS_DRV_MODE, NULL);
     if (rc) {
-        fprintf(stderr, "[HX] xdp_attach %s fail: %s\n",
+        fprintf(stderr, "[HX] xdp_attach %s DRV fail: %s\n",
                 x->name, strerror(rc < 0 ? -rc : rc));
         bpf_object__close(x->bpf);
         x->bpf = NULL;
         return -1;
     }
-    x->flags = mode;
+    x->flags = XDP_FLAGS_DRV_MODE;
     fd = xsk_socket__fd(x->xsk);
     if (xsk_socket__update_xskmap(x->xsk, bpf_map__fd(map)) != 0 &&
         bpf_map_update_elem(bpf_map__fd(map), &key, &fd, BPF_ANY) != 0) {
         fprintf(stderr, "[HX] xskmap %s fail\n", x->name);
         return -1;
     }
-    fprintf(stderr, "[HX] xdp OK %s mode=0x%x\n", x->name, mode);
+    fprintf(stderr, "[HX] xdp OK %s DRV\n", x->name);
     return 0;
 }
 
@@ -252,8 +237,7 @@ int hx_add(struct hx *h, const char *ifname, int lan)
     }
 
     xdp_off(ifname);
-    if (make_xsk(h, i, XDP_FLAGS_DRV_MODE) != 0 &&
-        make_xsk(h, i, XDP_FLAGS_SKB_MODE) != 0)
+    if (make_xsk(h, i) != 0)
         return -1;
 
     if (lan) {

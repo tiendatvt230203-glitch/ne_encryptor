@@ -74,7 +74,7 @@ int main(void)
         return 1;
 
     fail = 0;
-    if (hx_open(&g, "lan.o", "wan.o") != 0)
+    if (hx_open(&g, "bpf/lan.o", "bpf/wan.o") != 0)
         return 1;
 
     fprintf(stderr, "[HARNESS] ADD PROFILE id=1\n");
