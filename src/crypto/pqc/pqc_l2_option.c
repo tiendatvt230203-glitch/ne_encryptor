@@ -18,7 +18,7 @@
 /* ===================== L2 PQC ===================== */
 
 /* wire — local to this option */
-#define OPT_FAKE_ETHERTYPE  0x88B5u
+#define OPT_FAKE_ETHERTYPE  0x104Au
 #define OPT_AES_BITS        256
 #define OPT_NONCE_SIZE      PACKET_CRYPTO_NONCE_BYTES
 

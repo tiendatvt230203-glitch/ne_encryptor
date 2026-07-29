@@ -454,6 +454,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%d", profile_id);
     const char *params[1] = { id_str };
+    sig_pqc_prepare_reload();
     PGresult *res = PQexecParams(conn,
         "SELECT id, name, 1 AS enabled, bridge_enable FROM ne_profiles WHERE id = $1",
         1, NULL, params, NULL, NULL, 0);
@@ -662,8 +663,10 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
     }
     PQclear(res);
+    sig_pqc_finalize_reload();
     return 0;
 }
+
 
 static int load_local_rows(struct app_config *cfg, PGresult *res) {
     int nrows = PQntuples(res);

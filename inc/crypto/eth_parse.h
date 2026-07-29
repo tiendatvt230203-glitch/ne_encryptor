@@ -6,9 +6,9 @@
 
 #define ETH_L2_HDR_MAX  18
 #define ETH_HEADER_SIZE 14
-#define NE_L2_FAKE_ETHERTYPE      0x88B5u
+#define NE_L2_FAKE_ETHERTYPE      0x104Au
 /* Encrypted ARP L2 wire (IANA 823E–8240: Advanced Encryption Systems, Inc.). */
-#define NE_L2_FAKE_ETHERTYPE_ARP  0x823Eu
+#define NE_L2_FAKE_ETHERTYPE_ARP  0x1048u
 
 #define CRYPTO_L2_POLICY_OFF     ETH_HEADER_SIZE
 #define CRYPTO_L2_POLICY_LEN     1

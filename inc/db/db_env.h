@@ -4,9 +4,7 @@
 #define NE_ENV_FILE "/opt/SEP/be/.env"
 #define NE_STATE_DIR  "/var/lib/network-encryptor"
 
-/* .env format (VAULT bootstrap only):
- *   VAULT_ADDR, VAULT_TOKEN, UNSEAL_KEY_1/2/3
- * POSTGRES_* are fetched from Vault kv/secret at runtime. */
+
 
 struct ne_postgres_conn {
     const char *keywords[7];

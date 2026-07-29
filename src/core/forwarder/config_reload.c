@@ -2,7 +2,7 @@
 #include "../../../inc/core/forwarder.h"
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
-#include "../../../inc/core/iface_reload.h"
+#include "../../../inc/core/profile_iface_xdp.h"
 #include "pqc_l2_handshake.h"
 
 #include <pthread.h>
@@ -148,7 +148,7 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     const struct app_config *old_cfg = fwd->cfg;
 
     fwd_wan_configure_live_drains(fwd, old_cfg, cfg);
-    if (ne_iface_reload_sync_wan_live(fwd, cfg, old_cfg) != 0)
+    if (profile_iface_xdp_sync_wan_live(fwd, cfg, old_cfg) != 0)
         return -1;
 
     fwd->cfg = cfg;
@@ -255,7 +255,7 @@ int forwarder_reload_wan_removal(struct forwarder *fwd, struct app_config *cfg)
 }
 
 int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *cfg,
-                                      enum ne_iface_reload_mode mode,
+                                      enum profile_iface_xdp_reload_mode mode,
                                       int trigger_profile_id)
 {
     if (!fwd || !cfg || !fwd->cfg)
@@ -264,13 +264,11 @@ int forwarder_queue_profile_iface_xdp(struct forwarder *fwd, struct app_config *
         return -1;
     if (trigger_profile_id <= 0)
         return -1;
-    if (mode == NE_IFACE_RELOAD_ADD && !ne_iface_reload_can_add(fwd->cfg, cfg))
+    if (mode == PROFILE_IFACE_XDP_ADD && !profile_iface_xdp_can_add(fwd->cfg, cfg))
         return -1;
-    if (mode == NE_IFACE_RELOAD_REMOVE && !ne_iface_reload_can_remove(fwd->cfg, cfg))
+    if (mode == PROFILE_IFACE_XDP_REMOVE && !profile_iface_xdp_can_remove(fwd->cfg, cfg))
         return -1;
-    if (mode == NE_IFACE_RELOAD_DELTA && !ne_iface_reload_can_delta(fwd->cfg, cfg))
-        return -1;
-    if (mode == NE_IFACE_RELOAD_EDIT && !ne_iface_reload_is_edit_only(fwd->cfg, cfg))
+    if (mode == PROFILE_IFACE_XDP_DELTA && !profile_iface_xdp_can_delta(fwd->cfg, cfg))
         return -1;
     return forwarder_queue_reload(fwd, cfg, (int)mode, trigger_profile_id);
 }
@@ -301,15 +299,12 @@ int fwd_reload_apply_if_pending(void)
     case RELOAD_WAN_DRAIN:
         reload_rc = forwarder_reload_wan_removal_impl(fwd, cfg);
         break;
-    case NE_IFACE_RELOAD_ADD:
-    case NE_IFACE_RELOAD_REMOVE:
-    case NE_IFACE_RELOAD_DELTA:
-        reload_rc = ne_iface_reload_impl(fwd, cfg,
-                                         (enum ne_iface_reload_mode)reload_mode,
-                                         reload_trigger_profile_id);
-        break;
-    case NE_IFACE_RELOAD_EDIT:
-        reload_rc = ne_iface_reload_edit_impl(fwd, cfg, reload_trigger_profile_id);
+    case PROFILE_IFACE_XDP_ADD:
+    case PROFILE_IFACE_XDP_REMOVE:
+    case PROFILE_IFACE_XDP_DELTA:
+        reload_rc = profile_iface_xdp_reload_impl(fwd, cfg,
+                                                  (enum profile_iface_xdp_reload_mode)reload_mode,
+                                                  reload_trigger_profile_id);
         break;
     default:
         reload_rc = forwarder_reload_config_impl(fwd, cfg);

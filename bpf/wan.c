@@ -24,8 +24,7 @@ struct {
 #define IPPROTO_UDP_VAL 17
 #define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
-/* Encrypted ARP L2 (IANA 0x823E — Advanced Encryption Systems). */
-#define ETH_P_NE_ARP_ENC 0x823E
+#define ETH_P_NE_ARP_ENC 0x1048
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)

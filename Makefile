@@ -2,8 +2,8 @@ CC     = gcc
 CLANG  = clang
 
 CFLAGS = -D_GNU_SOURCE -I. -Iinc -Iinc/core -Iinc/crypto -Iinc/db -I./include -Isrc/crypto/pqc/include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
-# LDFLAGS = -L./lib -Wl,-rpath,'lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+LDFLAGS = -Wl,-rpath,'$$ORIGIN/lib' -lbpf -lelf -lz -lpthread \
+          ./lib/libxdp.so.1.6.0 ./lib/libssl.so.3 ./lib/libcrypto.so.3 ./lib/libpq.so.5.14 ./lib/libscrypt.so
 
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
@@ -19,18 +19,9 @@ OPT_SRCS = $(wildcard src/crypto/options/common/*.c) \
 
 PQC_SRCS = $(wildcard src/crypto/pqc/*.c)
 
-IFACE_SRCS = $(wildcard src/core/iface/validate/*.c) \
-             $(wildcard src/core/iface/umem/*.c) \
-             $(wildcard src/core/iface/dp/*.c) \
-             $(wildcard src/core/iface/xdp/*.c) \
-             $(wildcard src/core/iface/lifecycle/*.c) \
-             $(wildcard src/core/iface/ops/*.c) \
-             $(wildcard src/core/iface/ops/profile/*.c) \
-             $(wildcard src/core/iface/ops/interface/*.c)
-
 CORE_SRCS = $(wildcard src/core/forwarder/*.c) \
             $(wildcard src/core/dataplane/*.c) \
-            $(IFACE_SRCS) \
+            $(wildcard src/core/iface/*.c) \
             $(wildcard src/core/flow/*.c) \
             $(wildcard src/core/util/*.c)
 
@@ -47,8 +38,6 @@ DB_SRC = src/db/config.c \
          src/db/db_config.c \
          src/db/db_env.c \
          src/db/db_runtime.c \
-         src/db/db_profile_crud.c \
-         src/db/db_crud_cli.c \
          src/db/vault.c
 DB_OBJ = $(DB_SRC:.c=.o)
 
@@ -56,9 +45,6 @@ BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
 .PHONY: all clean dirs
-
-dirs:
-	mkdir -p $(LIB_DIR)
 
 all: dirs $(BPF_OBJ) $(TARGET)
 
@@ -72,9 +58,7 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor src/*.o src/core/*/*.o src/core/iface/*/*.o \
-		src/core/iface/ops/*/*.o src/crypto/common/*.o \
+	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
 		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
-		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o \
-		*.o $(BPF_OBJ)
+		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)

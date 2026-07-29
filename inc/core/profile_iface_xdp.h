@@ -1,32 +1,45 @@
 #ifndef PROFILE_IFACE_XDP_H
 #define PROFILE_IFACE_XDP_H
 
-#include "xdp_attach.h"
-#include "iface_reload.h"
+#include "config.h"
+#include "forwarder.h"
 
-typedef enum ne_iface_reload_mode profile_iface_xdp_reload_mode;
+enum profile_iface_xdp_reload_mode {
+    PROFILE_IFACE_XDP_ADD = 10,
+    PROFILE_IFACE_XDP_REMOVE = 11,
+    PROFILE_IFACE_XDP_DELTA = 12,
+};
 
-#define PROFILE_IFACE_XDP_ADD     NE_IFACE_RELOAD_ADD
-#define PROFILE_IFACE_XDP_REMOVE  NE_IFACE_RELOAD_REMOVE
-#define PROFILE_IFACE_XDP_DELTA   NE_IFACE_RELOAD_DELTA
+void profile_iface_xdp_prepare_init(const struct app_config *cfg);
 
-#define profile_iface_xdp_prepare_init       ne_xdp_attach_prepare_init
-#define profile_iface_xdp_attach_init        ne_xdp_attach_attach_init
-#define profile_iface_xdp_bind_local         ne_xdp_attach_bind_local
-#define profile_iface_xdp_bind_wan           ne_xdp_attach_bind_wan
-#define profile_iface_xdp_detach_local       ne_xdp_attach_detach_local
-#define profile_iface_xdp_detach_wan         ne_xdp_attach_detach_wan
-#define profile_iface_xdp_detach_ifname      ne_xdp_attach_detach_ifname
-#define profile_iface_xdp_detach_config      ne_xdp_attach_detach_config
+int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cfg);
 
-#define profile_iface_xdp_can_add            ne_iface_reload_can_add
-#define profile_iface_xdp_can_remove         ne_iface_reload_can_remove
-#define profile_iface_xdp_can_delta          ne_iface_reload_can_delta
-#define profile_iface_xdp_is_add_only        ne_iface_reload_is_add_only
-#define profile_iface_xdp_apply_add          ne_iface_reload_apply_add
-#define profile_iface_xdp_apply_remove       ne_iface_reload_apply_remove
-#define profile_iface_xdp_apply_delta        ne_iface_reload_apply_delta
-#define profile_iface_xdp_reload_impl        ne_iface_reload_impl
-#define profile_iface_xdp_sync_wan_live      ne_iface_reload_sync_wan_live
+int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new);
+int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_config *new);
+int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_config *new);
+int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app_config *new);
+
+int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg,
+                                int trigger_profile_id);
+int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg,
+                                   int trigger_profile_id);
+int profile_iface_xdp_apply_delta(struct forwarder *fwd, struct app_config *cfg,
+                                    int trigger_profile_id);
+
+int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg, int pair_li);
+int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, int dp_slot,
+                               uint16_t fake_ethertype_ipv4);
+
+void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li);
+void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot);
+void profile_iface_xdp_detach_ifname(const char *ifname);
+void profile_iface_xdp_detach_config(const struct app_config *cfg);
+
+int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
+                                  enum profile_iface_xdp_reload_mode mode,
+                                  int trigger_profile_id);
+
+int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
+                                    const struct app_config *old_cfg);
 
 #endif

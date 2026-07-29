@@ -14,7 +14,7 @@
 #define unlikely(x)             __builtin_expect(!!(x), 0)
 
 /* wire — local to this option */
-#define OPT_FAKE_ETHERTYPE  0x88B5u
+#define OPT_FAKE_ETHERTYPE  0x104Au
 #define OPT_AES_BITS        256
 
 struct opt_entry {

@@ -8,7 +8,7 @@
 
 #include "../../../inc/core/main_diag.h"
 #include "../../../inc/core/interface.h"
-#include "../../../inc/core/xdp_attach.h"
+#include "../../../inc/core/profile_iface_xdp.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/dataplane_stats.h"
 #include "../../../inc/crypto/pqc_l2_handshake.h"
@@ -402,7 +402,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         init_iface_meta(&fwd->wans[di], cfg->wans[ci].ifname);
     }
 
-    ne_xdp_attach_prepare_init(cfg);
+    profile_iface_xdp_prepare_init(cfg);
 
     if (forwarder_should_stop())
         return -1;
@@ -420,7 +420,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     if (ne_pair_open(&fwd->pair, cfg) != 0)
         return -1;
-    if (ne_xdp_attach_attach_init(&fwd->pair, cfg) != 0) {
+    if (profile_iface_xdp_attach_init(&fwd->pair, cfg) != 0) {
         forwarder_cleanup(fwd);
         return -1;
     }
@@ -481,10 +481,6 @@ void forwarder_cleanup(struct forwarder *fwd)
             ne_ring_destroy(&fwd->mid_to_local[i][w]);
     }
     fwd_crypto_cleanup_all_profile_slots();
-    for (int i = 0; i < fwd->pair.local_count; i++)
-        ne_xdp_attach_detach_local(&fwd->pair, i);
-    for (int i = 0; i < fwd->pair.wan_count; i++)
-        ne_xdp_attach_detach_wan(&fwd->pair, i);
     ne_pair_close(&fwd->pair);
 }
 

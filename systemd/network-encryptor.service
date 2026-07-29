@@ -19,3 +19,4 @@ WantedBy=multi-user.target
 # ethtool -K <interface> tso off gso off
 # ethtool -k eno2 | grep generic-receive-offload
 # ethtool -K eno2 gro on
+# ln -s libxdp.so.1.6.0 lib/libxdp.so
