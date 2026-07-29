@@ -3,7 +3,6 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
-#include <limits.h>
 #include <linux/if_link.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,40 +18,10 @@
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
 #endif
 
-static int resolve_bpf_path(const char *rel, char *out, size_t outsz)
-{
-    char exe[PATH_MAX];
-    ssize_t n;
-
-    if (!rel || !rel[0])
-        return -1;
-    if (rel[0] == '/') {
-        if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
-            return -1;
-        return access(out, R_OK) == 0 ? 0 : -1;
-    }
-    if (access(rel, R_OK) == 0) {
-        if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
-            return -1;
-        return 0;
-    }
-    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n > 0) {
-        char *slash;
-
-        exe[n] = '\0';
-        slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            if (snprintf(out, outsz, "%s/%s", exe, rel) < (int)outsz &&
-                access(out, R_OK) == 0)
-                return 0;
-        }
-    }
-    if (snprintf(out, outsz, "%s", rel) >= (int)outsz)
-        return -1;
-    return -1;
-}
+extern char _binary_lan_o_start[];
+extern char _binary_lan_o_end[];
+extern char _binary_wan_o_start[];
+extern char _binary_wan_o_end[];
 
 static void xdp_off(const char *name)
 {
@@ -155,21 +124,27 @@ static int make_xsk(struct hx *h, int i)
     return 0;
 }
 
-static int make_xdp(struct hx_if *x, const char *path,
-                    const char *prog_name, const char *map_name)
+static int make_xdp(struct hx_if *x, const void *blob, size_t blob_sz,
+                    const char *obj_name, const char *prog_name,
+                    const char *map_name)
 {
     struct bpf_program *prog;
     struct bpf_map *map;
     int key = 0, fd, rc;
 
-    x->bpf = bpf_object__open_file(path, NULL);
+    struct bpf_object_open_opts opts = {
+        .sz = sizeof(opts),
+        .object_name = obj_name,
+    };
+
+    x->bpf = bpf_object__open_mem(blob, blob_sz, &opts);
     if (libbpf_get_error(x->bpf)) {
-        fprintf(stderr, "[HX] bpf open %s fail\n", path);
+        fprintf(stderr, "[HX] bpf open %s fail\n", obj_name);
         x->bpf = NULL;
         return -1;
     }
     if (bpf_object__load(x->bpf)) {
-        fprintf(stderr, "[HX] bpf load %s fail\n", path);
+        fprintf(stderr, "[HX] bpf load %s fail\n", obj_name);
         bpf_object__close(x->bpf);
         x->bpf = NULL;
         return -1;
@@ -177,7 +152,7 @@ static int make_xdp(struct hx_if *x, const char *path,
     prog = bpf_object__find_program_by_name(x->bpf, prog_name);
     map = bpf_object__find_map_by_name(x->bpf, map_name);
     if (!prog || !map) {
-        fprintf(stderr, "[HX] bpf missing prog/map %s\n", path);
+        fprintf(stderr, "[HX] bpf missing prog/map %s\n", obj_name);
         bpf_object__close(x->bpf);
         x->bpf = NULL;
         return -1;
@@ -203,22 +178,12 @@ static int make_xdp(struct hx_if *x, const char *path,
     return 0;
 }
 
-int hx_open(struct hx *h, const char *bpf_lan, const char *bpf_wan)
+int hx_open(struct hx *h)
 {
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
-    const char *lan_in = bpf_lan ? bpf_lan : "bpf/lan.o";
-    const char *wan_in = bpf_wan ? bpf_wan : "bpf/wan.o";
 
     memset(h, 0, sizeof(*h));
     h->umem_i = -1;
-    if (resolve_bpf_path(lan_in, h->bpf_lan, sizeof(h->bpf_lan)) != 0) {
-        fprintf(stderr, "[HX] missing %s (run: cd tools && make)\n", lan_in);
-        return -1;
-    }
-    if (resolve_bpf_path(wan_in, h->bpf_wan, sizeof(h->bpf_wan)) != 0) {
-        fprintf(stderr, "[HX] missing %s (run: cd tools && make)\n", wan_in);
-        return -1;
-    }
     setrlimit(RLIMIT_MEMLOCK, &rl);
 
     h->bufsize = (size_t)HX_FRAMES * HX_FRAME;
@@ -285,12 +250,18 @@ int hx_add(struct hx *h, const char *ifname, int lan)
         return -1;
 
     if (lan) {
-        if (make_xdp(x, h->bpf_lan, "xdp_redirect_prog", "xsks_map") != 0) {
+        size_t sz = (size_t)(_binary_lan_o_end - _binary_lan_o_start);
+
+        if (make_xdp(x, _binary_lan_o_start, sz, "lan.o",
+                     "xdp_redirect_prog", "xsks_map") != 0) {
             kill_if(x);
             return -1;
         }
     } else {
-        if (make_xdp(x, h->bpf_wan, "xdp_wan_redirect_prog", "wan_xsks_map") != 0) {
+        size_t sz = (size_t)(_binary_wan_o_end - _binary_wan_o_start);
+
+        if (make_xdp(x, _binary_wan_o_start, sz, "wan.o",
+                     "xdp_wan_redirect_prog", "wan_xsks_map") != 0) {
             kill_if(x);
             return -1;
         }

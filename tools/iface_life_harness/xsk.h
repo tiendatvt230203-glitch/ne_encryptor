@@ -29,11 +29,9 @@ struct hx {
     int umem_i;
     struct hx_if ifs[HX_MAX];
     int n;
-    char bpf_lan[256];
-    char bpf_wan[256];
 };
 
-int hx_open(struct hx *h, const char *bpf_lan, const char *bpf_wan);
+int hx_open(struct hx *h);
 void hx_close(struct hx *h);
 int hx_add(struct hx *h, const char *ifname, int lan);
 int hx_del(struct hx *h, const char *ifname);
