@@ -6,7 +6,7 @@ CFLAGS = -D_GNU_SOURCE -I./include -Iiface_life_harness -Wall -O2
 LDFLAGS = -Wl,-rpath,'$$ORIGIN/../lib' -lbpf -lelf -lz \
           ./lib/libxdp.so.1.6.0
 
-BPF_CFLAGS     = -O2 -target bpf -g
+BPF_CFLAGS     = -O2 -target bpf -g0
 KERNEL_HEADERS = /usr/include
 
 DIR   = iface_life_harness

@@ -1,12 +1,12 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-struct {
-    __uint(type, BPF_MAP_TYPE_XSKMAP);
-    __uint(max_entries, 64);
-    __type(key, __u32);
-    __type(value, __u32);
-} wan_xsks_map SEC(".maps");
+struct bpf_map_def SEC("maps") wan_xsks_map = {
+    .type = BPF_MAP_TYPE_XSKMAP,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u32),
+    .max_entries = 64,
+};
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
