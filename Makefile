@@ -55,13 +55,7 @@ DB_OBJ = $(DB_SRC:.c=.o)
 BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
-HARNESS_SRCS = tools/iface_life_harness/main.c \
-               tools/iface_life_harness/xsk.c
-HARNESS_OBJ = $(HARNESS_SRCS:.c=.o)
-HARNESS_CFLAGS = -D_GNU_SOURCE -I./include -Itools/iface_life_harness -Wall -O2
-HARNESS_LDFLAGS = -L./lib -Wl,-rpath,'$$ORIGIN/lib' -lxdp -lbpf -lelf -lz
-
-.PHONY: all clean dirs iface-life-harness
+.PHONY: all clean dirs
 
 dirs:
 	mkdir -p $(LIB_DIR)
@@ -71,12 +65,6 @@ all: dirs $(BPF_OBJ) $(TARGET)
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
 
-iface-life-harness: dirs $(BPF_OBJ) $(HARNESS_OBJ)
-	$(CC) -o $@ $(HARNESS_OBJ) $(HARNESS_LDFLAGS)
-
-tools/iface_life_harness/%.o: tools/iface_life_harness/%.c
-	$(CC) $(HARNESS_CFLAGS) -c $< -o $@
-
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -84,9 +72,9 @@ $(LIB_DIR)/%.o: bpf/%.c
 	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) -I./include -c $< -o $@
 
 clean:
-	rm -rf network-encryptor iface-life-harness src/*.o src/core/*/*.o src/core/iface/*/*.o \
+	rm -rf network-encryptor src/*.o src/core/*/*.o src/core/iface/*/*.o \
 		src/core/iface/ops/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
 		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
 		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o \
-		tools/iface_life_harness/*.o *.o $(BPF_OBJ)
+		*.o $(BPF_OBJ)
