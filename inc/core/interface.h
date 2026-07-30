@@ -20,14 +20,8 @@
 
 #define NE_FQ_PREFILL   16384u
 
-#ifndef XDP_FLAGS_SKB_MODE
-#define XDP_FLAGS_SKB_MODE (1U << 1)
-#endif
 #ifndef XDP_FLAGS_DRV_MODE
 #define XDP_FLAGS_DRV_MODE (1U << 2)
-#endif
-#ifndef XDP_FLAGS_HW_MODE
-#define XDP_FLAGS_HW_MODE (1U << 3)
 #endif
 #ifndef XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
@@ -85,7 +79,6 @@ struct ne_iface {
     int queue_count;
     struct ne_xsk_queue queues[MAX_QUEUES];
     uint64_t tx_no_free;
-    /* XDP mode used for AF_XDP bind + bpf_xdp_attach (DRV or SKB). */
     uint32_t xdp_flags;
 };
 

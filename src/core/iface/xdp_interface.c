@@ -757,7 +757,7 @@ static void open_iface_queues_rollback(struct ne_pair *p, struct ne_iface *iface
 static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
                              const char *ifname, int queue_count)
 {
-    uint32_t mode = p->xdp_flags ? p->xdp_flags : XDP_FLAGS_DRV_MODE;
+    const uint32_t mode = XDP_FLAGS_DRV_MODE;
     int q;
     int ret = 0;
 

@@ -41,29 +41,17 @@ static void profile_iface_xdp_link_off(const char *ifname)
 {
     char cmd[160];
     unsigned int ifindex;
-    static const __u32 bpf_modes[] = {
-        XDP_FLAGS_DRV_MODE,
-        XDP_FLAGS_SKB_MODE,
-        XDP_FLAGS_HW_MODE,
-        0,
-    };
-    static const char *const ip_modes[] = { "xdp", "xdpgeneric", "xdpoffload" };
 
     if (!profile_iface_ifname_safe(ifname))
         return;
 
-    /* libbpf detach first — more reliable than ip alone after AF_XDP teardown. */
     ifindex = if_nametoindex(ifname);
-    if (ifindex != 0) {
-        for (size_t i = 0; i < sizeof(bpf_modes) / sizeof(bpf_modes[0]); i++)
-            (void)bpf_xdp_detach((int)ifindex, bpf_modes[i], NULL);
-    }
+    if (ifindex != 0)
+        (void)bpf_xdp_detach((int)ifindex, XDP_FLAGS_DRV_MODE, NULL);
 
-    for (size_t i = 0; i < sizeof(ip_modes) / sizeof(ip_modes[0]); i++) {
-        snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s %s off >/dev/null 2>&1",
-                 ifname, ip_modes[i]);
-        (void)system(cmd);
-    }
+    snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off >/dev/null 2>&1",
+             ifname);
+    (void)system(cmd);
 }
 
 void profile_iface_xdp_detach_ifname(const char *ifname)
@@ -277,19 +265,17 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
     return (int)idx;
 }
 
-static int xdp_attach_prog(int ifindex, int prog_fd, uint32_t flags,
-                           const char *ifname, const char *role)
+static int xdp_attach_prog(int ifindex, int prog_fd, const char *ifname, const char *role)
 {
-    uint32_t mode = flags ? flags : XDP_FLAGS_DRV_MODE;
-    int rc = bpf_xdp_attach(ifindex, prog_fd, mode, NULL);
+    int rc = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL);
 
     if (rc) {
-        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s mode=0x%x: %s\n",
-                role, ifname, mode, strerror(rc < 0 ? -rc : rc));
+        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s drv: %s\n",
+                role, ifname, strerror(rc < 0 ? -rc : rc));
         fflush(stderr);
         return -1;
     }
-    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (mode=0x%x)\n", role, ifname, mode);
+    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (drv)\n", role, ifname);
     fflush(stderr);
     return 0;
 }
@@ -408,8 +394,6 @@ int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg
         return -1;
     profile_iface_xdp_link_off(ifname);
     if (xdp_attach_prog(p->locals[pair_li].ifindex, bpf_program__fd(prog),
-                        p->locals[pair_li].xdp_flags ? p->locals[pair_li].xdp_flags
-                                                     : p->xdp_flags,
                         ifname, "LAN") != 0) {
         bpf_object__close(p->bpf_locals[pair_li]);
         p->bpf_locals[pair_li] = NULL;
@@ -435,8 +419,6 @@ int profile_iface_xdp_bind_wan(struct ne_pair *p, const struct app_config *cfg, 
     update_wan_fake_ethertype(p->bpf_wans[dp_slot], fake_ethertype_ipv4);
     profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (xdp_attach_prog(p->wans[dp_slot].ifindex, bpf_program__fd(prog),
-                        p->wans[dp_slot].xdp_flags ? p->wans[dp_slot].xdp_flags
-                                                   : p->xdp_flags,
                         p->wans[dp_slot].ifname, "WAN") != 0) {
         bpf_object__close(p->bpf_wans[dp_slot]);
         p->bpf_wans[dp_slot] = NULL;
