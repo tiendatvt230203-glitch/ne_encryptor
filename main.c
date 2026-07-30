@@ -575,114 +575,21 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
 
     if (!topo_ok) {
-        struct app_config *new_cfg = &rt->cfg_slots[next_slot];
-        int incremental_ok = 0;
-
-        if (profile_iface_xdp_is_add_only(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — incremental LAN/WAN attach (add-only)\n",
-                    trigger_id);
-            fflush(stderr);
-            /* #region agent log */
-            fprintf(stderr, "[RELOAD-DBG] C path_add_only trigger=%d\n", trigger_id);
-            fflush(stderr);
-            /* #endregion */
-            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
-                incremental_ok = 1;
-            else
-                fprintf(stderr,
-                        "[RELOAD] incremental attach failed — keeping current dataplane\n");
-        } else if (profile_iface_xdp_can_delta(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — incremental LAN/WAN delta\n",
-                    trigger_id);
-            fflush(stderr);
-            /* #region agent log */
-            fprintf(stderr, "[RELOAD-DBG] C path_delta trigger=%d\n", trigger_id);
-            fflush(stderr);
-            /* #endregion */
-            if (profile_iface_xdp_apply_delta(&rt->fwd, new_cfg, trigger_id) == 0)
-                incremental_ok = 1;
-            else
-                fprintf(stderr,
-                        "[RELOAD] incremental delta failed — keeping current dataplane\n");
-        } else if (profile_iface_xdp_can_add(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — incremental LAN/WAN attach\n",
-                    trigger_id);
-            fflush(stderr);
-            /* #region agent log */
-            fprintf(stderr, "[RELOAD-DBG] C path_add trigger=%d\n", trigger_id);
-            fflush(stderr);
-            /* #endregion */
-            if (profile_iface_xdp_apply_add(&rt->fwd, new_cfg, trigger_id) == 0)
-                incremental_ok = 1;
-            else
-                fprintf(stderr,
-                        "[RELOAD] incremental attach failed — keeping current dataplane\n");
-        } else if (profile_iface_xdp_can_remove(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — incremental LAN/WAN detach\n",
-                    trigger_id);
-            fflush(stderr);
-            /* #region agent log */
-            fprintf(stderr, "[RELOAD-DBG] C path_remove trigger=%d\n", trigger_id);
-            fflush(stderr);
-            /* #endregion */
-            if (profile_iface_xdp_apply_remove(&rt->fwd, new_cfg, trigger_id) == 0)
-                incremental_ok = 1;
-            else
-                fprintf(stderr,
-                        "[RELOAD] incremental detach failed — keeping current dataplane\n");
-        } else if (forwarder_is_wan_only_removal(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — WAN removed, drain %.1fs then detach (no hard cut)\n",
-                    trigger_id, (double)FORWARDER_WAN_DRAIN_SEC);
-            fflush(stderr);
-            if (forwarder_reload_wan_removal(&rt->fwd, new_cfg) == 0)
-                incremental_ok = 1;
-            else
-                fprintf(stderr,
-                        "[RELOAD] WAN drain reload failed — keeping current dataplane\n");
-        }
-
-        if (incremental_ok) {
-            rt->active_slot = next_slot;
-            fprintf(stderr, "[RELOAD] OK profile %d — applied (incremental)\n", trigger_id);
-            main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
-            fflush(stderr);
-            return 0;
-        }
-
-        if (profile_iface_xdp_can_add(prev_cfg, new_cfg) ||
-            profile_iface_xdp_can_remove(prev_cfg, new_cfg) ||
-            profile_iface_xdp_can_delta(prev_cfg, new_cfg) ||
-            forwarder_is_wan_only_removal(prev_cfg, new_cfg)) {
-            fprintf(stderr,
-                    "[ERR] profile %d: incremental reload failed — running dataplane unchanged\n",
-                    trigger_id);
-            fflush(stderr);
-            return -1;
-        }
-
-        /*
-         * Last resort: topology change that did not match add/remove/delta
-         * predicates (should be rare in single-profile mode). Full restart
-         * of the dataplane thread — systemd unit stays up.
-         */
         fprintf(stderr,
-                "[RELOAD] profile %d — unmatched LAN/WAN topology change — "
-                "full dataplane restart (single-profile last resort)\n",
+                "[RELOAD] profile %d — LAN/WAN change — full dataplane restart "
+                "(clean UMEM; service stays up)\n",
                 trigger_id);
         fflush(stderr);
-        rt->active_slot = next_slot;
         if (runtime_stop_forwarder(rt) != 0)
             return -1;
         if (g_stop_requested)
             return -1;
+        rt->active_slot = next_slot;
         if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
             return -1;
-        fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
+        fprintf(stderr,
+                "[RELOAD] OK profile %d — applied (full dataplane restart)\n",
+                trigger_id);
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
         fflush(stderr);
         return 0;
