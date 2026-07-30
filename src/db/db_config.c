@@ -357,6 +357,11 @@ static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_co
 
     p->bridges[p->bridge_count].local_idx = local_idx;
     p->bridges[p->bridge_count].wan_dp = wan_dp;
+    if (bridge_name && bridge_name[0])
+        snprintf(p->bridges[p->bridge_count].ifname,
+                 sizeof(p->bridges[p->bridge_count].ifname), "%s", bridge_name);
+    else
+        p->bridges[p->bridge_count].ifname[0] = '\0';
     p->bridge_count++;
 
     fprintf(stderr, "[DB] bridge pair profile=%s br=%s LAN %s <-> WAN %s (dp=%d)\n",

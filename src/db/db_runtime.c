@@ -394,6 +394,9 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
 
             dp->bridges[dp->bridge_count].local_idx = merged_li;
             dp->bridges[dp->bridge_count].wan_dp = merged_wan_dp;
+            snprintf(dp->bridges[dp->bridge_count].ifname,
+                     sizeof(dp->bridges[dp->bridge_count].ifname), "%s",
+                     sp->bridges[bi].ifname);
             dp->bridge_count++;
         }
 

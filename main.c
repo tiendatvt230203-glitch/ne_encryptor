@@ -395,7 +395,8 @@ static int profile_db_unchanged(const struct profile_config *old,
     }
     for (int i = 0; i < old->bridge_count; i++) {
         if (old->bridges[i].local_idx != new->bridges[i].local_idx ||
-            old->bridges[i].wan_dp != new->bridges[i].wan_dp)
+            old->bridges[i].wan_dp != new->bridges[i].wan_dp ||
+            strcmp(old->bridges[i].ifname, new->bridges[i].ifname) != 0)
             return 0;
     }
     return 1;

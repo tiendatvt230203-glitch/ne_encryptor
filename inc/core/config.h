@@ -58,6 +58,7 @@ struct crypto_policy {
 struct bridge_pair {
     int local_idx;
     int wan_dp;
+    char ifname[IF_NAMESIZE];
 };
 
 struct profile_config {

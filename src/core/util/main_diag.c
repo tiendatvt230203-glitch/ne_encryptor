@@ -110,32 +110,67 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
+static const char *diag_bridge_for_local(const struct app_config *cfg, int local_idx)
+{
+    if (!cfg || local_idx < 0)
+        return "-";
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int bi = 0; bi < p->bridge_count; bi++) {
+            if (p->bridges[bi].local_idx == local_idx && p->bridges[bi].ifname[0])
+                return p->bridges[bi].ifname;
+        }
+    }
+    return "-";
+}
+
+static const char *diag_bridge_for_wan(const struct app_config *cfg, int wan_cfg_idx)
+{
+    int wan_dp;
+
+    if (!cfg || wan_cfg_idx < 0)
+        return "-";
+    wan_dp = config_wan_cfg_to_dp(cfg, wan_cfg_idx);
+    if (wan_dp < 0)
+        return "-";
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int bi = 0; bi < p->bridge_count; bi++) {
+            if (p->bridges[bi].wan_dp == wan_dp && p->bridges[bi].ifname[0])
+                return p->bridges[bi].ifname;
+        }
+    }
+    return "-";
+}
+
 static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 14, 12, 0, 0, 0, 0, 0, 0 };
+    static const int w[DIAG_TBL_N] = { 14, 12, 12, 0, 0, 0, 0, 0 };
     static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "", "", "", "", "", ""
+        "role", "interface", "bridge", "", "", "", "", ""
     };
 
     fprintf(stderr, "\n  [interfaces]\n");
-    tbl_hline(w, 2);
-    tbl_row(w, 2, hdr);
-    tbl_hline(w, 2);
+    tbl_hline(w, 3);
+    tbl_row(w, 3, hdr);
+    tbl_hline(w, 3);
 
     for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32];
+        char c0[32], c1[32], c2[32];
         snprintf(c0, sizeof(c0), "lan");
         snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        const char *row[DIAG_TBL_N] = { c0, c1, "", "", "", "", "", "" };
-        tbl_row(w, 2, row);
+        snprintf(c2, sizeof(c2), "%s", diag_bridge_for_local(cfg, i));
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
+        tbl_row(w, 3, row);
     }
     for (int i = 0; i < cfg->wan_count; i++) {
-        char c0[32], c1[32];
+        char c0[32], c1[32], c2[32];
         snprintf(c0, sizeof(c0), cfg->wans[i].dataplane ? "wan" : "wan(hs)");
         snprintf(c1, sizeof(c1), "%s", cfg->wans[i].ifname);
-        const char *row[DIAG_TBL_N] = { c0, c1, "", "", "", "", "", "" };
-        tbl_row(w, 2, row);
+        snprintf(c2, sizeof(c2), "%s", diag_bridge_for_wan(cfg, i));
+        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
+        tbl_row(w, 3, row);
     }
-    tbl_hline(w, 2);
+    tbl_hline(w, 3);
 }
 
 static void print_policy_table(const struct app_config *cfg) {
