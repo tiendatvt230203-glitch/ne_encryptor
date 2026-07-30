@@ -34,6 +34,10 @@ int profile_iface_life_attach_profile_rows(struct forwarder *fwd,
 void profile_iface_life_attach_rollback(struct forwarder *fwd,
                                        struct profile_attach_sess *sess);
 
+int profile_iface_life_rebuild_from_cfg(struct forwarder *fwd,
+                                        const struct app_config *new_cfg,
+                                        int trigger_profile_id);
+
 void profile_iface_life_reconcile_counts(struct forwarder *fwd);
 
 #endif

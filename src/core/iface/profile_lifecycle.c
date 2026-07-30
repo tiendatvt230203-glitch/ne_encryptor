@@ -194,7 +194,6 @@ void profile_iface_life_reconcile_counts(struct forwarder *fwd)
 int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int profile_id)
 {
     int li;
-    int rc;
 
     if (!fwd || !ifname)
         return -1;
@@ -205,48 +204,8 @@ int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int
             "[PROFILE-LIFE] profile %d REMOVE LAN %s — detach xdp/xsk (slot %d)\n",
             profile_id, ifname, li);
     fflush(stderr);
-
-    fprintf(stderr, "[PROFILE-LIFE] umem-rehome path for %s slot %d\n", ifname, li);
-    fflush(stderr);
-    rc = ne_pair_unplumb_local_rehome(&fwd->pair, li, fwd->cfg);
-    if (rc < 0)
-        return -1;
-    if (rc == 1) {
-        /* UMEM was rebuilt onto a surviving LAN — re-attach XDP on keepers. */
-        fprintf(stderr,
-                "[PROFILE-LIFE] profile %d: UMEM rehomed after drop %s — rebind XDP keepers\n",
-                profile_id, ifname);
-        fflush(stderr);
-        for (int i = 0; i < fwd->pair.local_count; i++) {
-            if (!ne_pair_local_live(&fwd->pair, i))
-                continue;
-            if (profile_iface_xdp_bind_local(&fwd->pair, fwd->cfg, i) != 0) {
-                fprintf(stderr, "[PROFILE-LIFE] rebind LAN %s failed\n",
-                        fwd->pair.locals[i].ifname);
-                return -1;
-            }
-            fwd->pair.xdp_local_on[i] = 1;
-            strncpy(fwd->locals[i].ifname, fwd->pair.locals[i].ifname,
-                    sizeof(fwd->locals[i].ifname) - 1);
-            fwd->locals[i].ifindex = fwd->pair.locals[i].ifindex;
-        }
-        for (int i = 0; i < fwd->pair.wan_count; i++) {
-            if (!ne_pair_wan_live(&fwd->pair, i))
-                continue;
-            if (profile_iface_xdp_bind_wan(&fwd->pair, fwd->cfg, i,
-                                          fwd->cfg->fake_ethertype_ipv4) != 0) {
-                fprintf(stderr, "[PROFILE-LIFE] rebind WAN %s failed\n",
-                        fwd->pair.wans[i].ifname);
-                return -1;
-            }
-            fwd->pair.xdp_wan_on[i] = 1;
-            strncpy(fwd->wans[i].ifname, fwd->pair.wans[i].ifname,
-                    sizeof(fwd->wans[i].ifname) - 1);
-            fwd->wans[i].ifindex = fwd->pair.wans[i].ifindex;
-        }
-        fwd->local_count = fwd->pair.local_count;
-        fwd->wan_count = fwd->pair.wan_count;
-    }
+    ne_pair_unplumb_local(&fwd->pair, li);
+    memset(&fwd->locals[li], 0, sizeof(fwd->locals[li]));
     return 0;
 }
 
@@ -286,37 +245,6 @@ int profile_iface_life_detach_profile_rows(struct forwarder *fwd,
         return 0;
     new_prof = profile_by_id(new_cfg, trigger_profile_id);
 
-    for (int pi = 0; pi < old_prof->local_count; pi++) {
-        int oci = old_prof->local_indices[pi];
-        const char *ifname;
-        int li;
-
-        if (oci < 0 || oci >= old_cfg->local_count)
-            continue;
-        ifname = old_cfg->locals[oci].ifname;
-
-        if (new_prof && profile_lists_local_ifname(new_prof, new_cfg, ifname)) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] profile %d skip LAN %s (still_in_new profile)\n",
-                    trigger_profile_id, ifname);
-            continue;
-        }
-        if (config_local_ifname_in_cfg(new_cfg, ifname)) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] profile %d skip LAN %s (still_in_new cfg)\n",
-                    trigger_profile_id, ifname);
-            continue;
-        }
-        li = pair_local_slot_live(fwd, ifname);
-        if (li < 0) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] profile %d skip LAN %s (not_live)\n",
-                    trigger_profile_id, ifname);
-            continue;
-        }
-        (void)profile_iface_life_detach_lan(fwd, ifname, trigger_profile_id);
-    }
-
     for (int pi = 0; pi < old_prof->wan_count; pi++) {
         int oci = old_prof->wan_indices[pi];
         const char *ifname;
@@ -349,6 +277,37 @@ int profile_iface_life_detach_profile_rows(struct forwarder *fwd,
         }
         /* Detach live WAN even if old row lost the dataplane flag. */
         (void)profile_iface_life_detach_wan(fwd, ifname, trigger_profile_id);
+    }
+
+    for (int pi = 0; pi < old_prof->local_count; pi++) {
+        int oci = old_prof->local_indices[pi];
+        const char *ifname;
+        int li;
+
+        if (oci < 0 || oci >= old_cfg->local_count)
+            continue;
+        ifname = old_cfg->locals[oci].ifname;
+
+        if (new_prof && profile_lists_local_ifname(new_prof, new_cfg, ifname)) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] profile %d skip LAN %s (still_in_new profile)\n",
+                    trigger_profile_id, ifname);
+            continue;
+        }
+        if (config_local_ifname_in_cfg(new_cfg, ifname)) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] profile %d skip LAN %s (still_in_new cfg)\n",
+                    trigger_profile_id, ifname);
+            continue;
+        }
+        li = pair_local_slot_live(fwd, ifname);
+        if (li < 0) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] profile %d skip LAN %s (not_live)\n",
+                    trigger_profile_id, ifname);
+            continue;
+        }
+        (void)profile_iface_life_detach_lan(fwd, ifname, trigger_profile_id);
     }
 
     profile_iface_life_reconcile_counts(fwd);
@@ -562,4 +521,53 @@ int profile_iface_life_attach_profile_rows(struct forwarder *fwd,
             "[VALIDATE] profile %d: skip all policies (LAN/WAN validation failed)\n",
             trigger_profile_id);
     return -1;
+}
+
+int profile_iface_life_rebuild_from_cfg(struct forwarder *fwd,
+                                        const struct app_config *new_cfg,
+                                        int trigger_profile_id)
+{
+    if (!fwd || !new_cfg || trigger_profile_id <= 0)
+        return -1;
+
+    fprintf(stderr,
+            "[PROFILE-LIFE] profile %d: full UMEM rebuild (teardown → fresh plumb)\n",
+            trigger_profile_id);
+    fflush(stderr);
+
+    for (int di = 0; di < MAX_INTERFACES; di++) {
+        if (ne_pair_wan_live(&fwd->pair, di))
+            (void)fwd_wan_flush_queue(fwd, di);
+    }
+
+    if (ne_pair_teardown_live(&fwd->pair) != 0) {
+        fprintf(stderr, "[PROFILE-LIFE] profile %d: teardown failed\n",
+                trigger_profile_id);
+        return -1;
+    }
+
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        memset(&fwd->locals[i], 0, sizeof(fwd->locals[i]));
+        memset(&fwd->wans[i], 0, sizeof(fwd->wans[i]));
+        fwd->wan_cfg_idx[i] = -1;
+        fwd_wan_mark_stopped(i);
+    }
+    fwd->local_count = 0;
+    fwd->wan_count = 0;
+
+    if (!profile_by_id(new_cfg, trigger_profile_id)) {
+        profile_iface_life_reconcile_counts(fwd);
+        return 0;
+    }
+
+    if (profile_iface_life_attach_profile_rows(fwd, new_cfg, trigger_profile_id) != 0)
+        return -1;
+
+    profile_iface_life_reconcile_counts(fwd);
+    fprintf(stderr,
+            "[PROFILE-LIFE] profile %d: rebuild done (lan=%d wan=%d umem_slot=%d)\n",
+            trigger_profile_id, fwd->local_count, fwd->wan_count,
+            fwd->pair.umem_fq_li);
+    fflush(stderr);
+    return 0;
 }

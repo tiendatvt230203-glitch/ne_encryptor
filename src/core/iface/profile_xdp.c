@@ -548,19 +548,19 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
     case PROFILE_IFACE_XDP_REMOVE:
         if (!profile_iface_xdp_can_remove(old, cfg))
             return -1;
-        (void)profile_iface_life_detach_profile_rows(fwd, cfg, old, trigger_profile_id);
+        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
+            return -1;
         break;
     case PROFILE_IFACE_XDP_ADD:
         if (!profile_iface_xdp_can_add(old, cfg))
             return -1;
-        if (profile_iface_life_attach_profile_rows(fwd, cfg, trigger_profile_id) != 0)
+        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
             return -1;
         break;
     case PROFILE_IFACE_XDP_DELTA:
         if (!profile_iface_xdp_can_delta(old, cfg))
             return -1;
-        (void)profile_iface_life_detach_profile_rows(fwd, cfg, old, trigger_profile_id);
-        if (profile_iface_life_attach_profile_rows(fwd, cfg, trigger_profile_id) != 0)
+        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
             return -1;
         break;
     default:
