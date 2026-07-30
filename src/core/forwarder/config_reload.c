@@ -188,6 +188,16 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg,
         return -1;
 
     pthread_mutex_lock(&reload_wait_mtx);
+    if (atomic_load_explicit(&reload_pending, memory_order_acquire) &&
+        !atomic_load_explicit(&reload_done, memory_order_acquire)) {
+        pthread_mutex_unlock(&reload_wait_mtx);
+        fprintf(stderr,
+                "[RELOAD] busy — another reload already in flight "
+                "(single pending slot; serialize profile edits and retry)\n");
+        fflush(stderr);
+        return -1;
+    }
+
     reload_fwd = fwd;
     reload_cfg = cfg;
     reload_rc = -1;
@@ -221,7 +231,8 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg,
         int wr = pthread_cond_timedwait(&reload_wait_cv, &reload_wait_mtx, &ts);
         if (have_deadline && wr == ETIMEDOUT) {
             fprintf(stderr,
-                    "[RELOAD] timed out waiting for mid core (60s) — cancel pending reload\n");
+                    "[RELOAD] timed out waiting for mid core (60s) — cancel pending reload "
+                    "(dataplane unchanged; retry -id notify)\n");
             fflush(stderr);
             atomic_store_explicit(&reload_pending, 0, memory_order_release);
             break;
@@ -229,11 +240,12 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg,
     }
 
     int rc = reload_rc;
+    int finished = atomic_load_explicit(&reload_done, memory_order_acquire);
     pthread_mutex_unlock(&reload_wait_mtx);
 
     if (forwarder_should_stop())
         return -1;
-    if (!atomic_load_explicit(&reload_done, memory_order_acquire)) {
+    if (!finished) {
         fprintf(stderr, "[RELOAD] mid core did not finish reload (timeout/busy)\n");
         fflush(stderr);
         return -1;

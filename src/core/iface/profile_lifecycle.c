@@ -8,6 +8,41 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Hot-add may grow past forwarder_init ring coverage — init before traffic. */
+static int fwd_ensure_mid_local_rings(struct forwarder *fwd, int li)
+{
+    if (!fwd || li < 0 || li >= MAX_INTERFACES)
+        return -1;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        if (fwd->mid_to_local[li][w].cap != 0)
+            continue;
+        if (ne_ring_init(&fwd->mid_to_local[li][w], NE_RING, 1) != 0) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] mid_to_local ring init failed slot %d worker %d\n",
+                    li, w);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int fwd_ensure_mid_wan_rings(struct forwarder *fwd, int di)
+{
+    if (!fwd || di < 0 || di >= MAX_INTERFACES)
+        return -1;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        if (fwd->mid_to_wan[di][w].cap != 0)
+            continue;
+        if (ne_ring_init(&fwd->mid_to_wan[di][w], NE_RING, 1) != 0) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] mid_to_wan ring init failed slot %d worker %d\n",
+                    di, w);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static const struct profile_config *profile_by_id(const struct app_config *cfg, int profile_id)
 {
     if (!cfg || profile_id <= 0)
@@ -391,6 +426,13 @@ void profile_iface_life_attach_lan_rows(struct forwarder *fwd,
         fprintf(stderr, "[PROFILE-LIFE] profile %d ADD LAN %s (slot %d)\n",
                 trigger_profile_id, ifname, li);
         fflush(stderr);
+        if (fwd_ensure_mid_local_rings(fwd, li) != 0) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: skip LAN %s (egress ring init failed)\n",
+                    trigger_profile_id, ifname);
+            sess->validate_failed = 1;
+            continue;
+        }
         if (ne_pair_plumb_local(&fwd->pair, new_cfg, ci, li) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip LAN %s (plumb/XSK failed)\n",
@@ -472,6 +514,13 @@ void profile_iface_life_attach_wan_rows(struct forwarder *fwd,
         fprintf(stderr, "[PROFILE-LIFE] profile %d ADD WAN %s (dp slot %d)\n",
                 trigger_profile_id, ifname, di);
         fflush(stderr);
+        if (fwd_ensure_mid_wan_rings(fwd, di) != 0) {
+            fprintf(stderr,
+                    "[VALIDATE] profile %d: skip WAN %s (egress ring init failed)\n",
+                    trigger_profile_id, ifname);
+            sess->validate_failed = 1;
+            continue;
+        }
         if (ne_pair_plumb_wan_dp(&fwd->pair, new_cfg, ci, di) != 0) {
             fprintf(stderr,
                     "[VALIDATE] profile %d: skip WAN %s (plumb/XSK failed)\n",

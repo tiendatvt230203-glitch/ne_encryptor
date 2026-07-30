@@ -227,6 +227,8 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     rt->active_slot = 0;
     rt->cfg_slots[rt->active_slot] = *cfg;
     rt->running = 0;
+    /* Previous delete/stop left running=0; clear so init is not treated as abort. */
+    forwarder_clear_stop();
     if (pthread_create(&rt->thread, NULL, forwarder_thread_main, rt) != 0) {
         fprintf(stderr, "[FATAL] failed to create forwarder thread\n");
         return -1;
@@ -662,8 +664,14 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
             return -1;
         }
 
+        /*
+         * Last resort: topology change that did not match add/remove/delta
+         * predicates (should be rare in single-profile mode). Full restart
+         * of the dataplane thread — systemd unit stays up.
+         */
         fprintf(stderr,
-                "[RELOAD] profile %d — LAN/WAN topology changed — full dataplane restart\n",
+                "[RELOAD] profile %d — unmatched LAN/WAN topology change — "
+                "full dataplane restart (single-profile last resort)\n",
                 trigger_id);
         fflush(stderr);
         rt->active_slot = next_slot;
@@ -680,41 +688,32 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     if (!policy_only) {
-        if (runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot])) {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — LAN/WAN tuning only (hot reload, traffic continues)\n",
-                    trigger_id);
-            fflush(stderr);
-            if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
-                rt->active_slot = next_slot;
-                fprintf(stderr,
-                        "[RELOAD] OK profile %d — applied (tuning hot reload)\n",
-                        trigger_id);
-                main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot],
-                                             trigger_id, 1, 0);
-                fflush(stderr);
-                return 0;
-            }
-            fprintf(stderr,
-                    "[RELOAD] tuning hot reload failed; full dataplane restart\n");
-            fflush(stderr);
-        } else {
-            fprintf(stderr,
-                    "[RELOAD] profile %d — LAN/WAN settings changed — full dataplane restart\n",
-                    trigger_id);
-            fflush(stderr);
-        }
-        rt->active_slot = next_slot;
-        if (runtime_stop_forwarder(rt) != 0)
-            return -1;
-        if (g_stop_requested)
-            return -1;
-        if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
-            return -1;
-        fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
-        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
+        /*
+         * Same ifname set: window/dst_ip/dataplane/profile metadata — hot
+         * reload only. Single-profile mode never full-restarts here; keep
+         * the running dataplane if mid-core apply fails.
+         */
+        int tuning = runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot]);
+        fprintf(stderr,
+                "[RELOAD] profile %d — same LAN/WAN ifnames (%s, hot reload)\n",
+                trigger_id, tuning ? "tuning" : "settings/profile fields");
         fflush(stderr);
-        return 0;
+        if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
+            rt->active_slot = next_slot;
+            fprintf(stderr,
+                    "[RELOAD] OK profile %d — applied (same-topology hot reload)\n",
+                    trigger_id);
+            main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot],
+                                         trigger_id, 1, 0);
+            fflush(stderr);
+            return 0;
+        }
+        fprintf(stderr,
+                "[ERR] profile %d: same-topology hot reload failed — "
+                "running dataplane unchanged (no full restart)\n",
+                trigger_id);
+        fflush(stderr);
+        return -1;
     }
 
     fprintf(stderr,
@@ -734,46 +733,79 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         return 0;
     }
     fprintf(stderr,
-            "[RELOAD] hot reload failed (see lines above); full dataplane restart\n");
+            "[ERR] profile %d: policy hot reload failed — "
+            "running dataplane unchanged (no full restart)\n",
+            trigger_id);
     fflush(stderr);
-    if (runtime_stop_forwarder(rt) != 0)
-        return -1;
-    if (g_stop_requested)
-        return -1;
-    rt->active_slot = next_slot;
-    if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
-        return -1;
-    fprintf(stderr, "[RELOAD] OK profile %d — applied (full restart)\n", trigger_id);
-    main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
-    fflush(stderr);
-    return 0;
-}
-
-static const struct app_config *runtime_active_cfg(struct runtime_state *rt)
-{
-    if (rt->fwd.cfg)
-        return rt->fwd.cfg;
-    return &rt->cfg_slots[rt->active_slot];
+    return -1;
 }
 
 static int runtime_stop_forwarder(struct runtime_state *rt) {
+    char lan_names[MAX_INTERFACES][IF_NAMESIZE];
+    char wan_names[MAX_INTERFACES][IF_NAMESIZE];
+    int nlan = 0;
+    int nwan = 0;
+
     if (!rt->has_thread)
         return 0;
 
-    const struct app_config *cfg = runtime_active_cfg(rt);
-    fprintf(stderr, "[STOP] profile-xdp detach (all LAN/WAN)...\n");
-    fflush(stderr);
-    profile_iface_xdp_detach_config(cfg);
+    /*
+     * Snapshot ifnames from the active slot before cleanup. Do NOT detach XDP
+     * while RX/TX workers still touch AF_XDP — that leaves NICs "dirty" and the
+     * next create often fails with EINVAL (-22) until process restart.
+     */
+    {
+        const struct app_config *cfg = &rt->cfg_slots[rt->active_slot];
 
-    fprintf(stderr, "[STOP] stopping dataplane...\n");
+        for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++) {
+            snprintf(lan_names[nlan], sizeof(lan_names[nlan]), "%s",
+                     cfg->locals[i].ifname);
+            nlan++;
+        }
+        for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++) {
+            snprintf(wan_names[nwan], sizeof(wan_names[nwan]), "%s",
+                     cfg->wans[i].ifname);
+            nwan++;
+        }
+    }
+
+    fprintf(stderr, "[STOP] stopping dataplane (XSK/UMEM first, then XDP scrub)...\n");
     fflush(stderr);
     forwarder_stop();
     forwarder_shutdown_resources();
     pthread_join(rt->thread, NULL);
     forwarder_cleanup(&rt->fwd);
-    profile_iface_xdp_detach_config(cfg);
-    interface_promisc_off_config(cfg);
-    fprintf(stderr, "[STOP] done\n");
+
+    fprintf(stderr, "[STOP] scrub XDP leftover on %d LAN + %d WAN...\n", nlan, nwan);
+    fflush(stderr);
+    for (int i = 0; i < nlan; i++)
+        profile_iface_xdp_detach_ifname(lan_names[i]);
+    for (int i = 0; i < nwan; i++)
+        profile_iface_xdp_detach_ifname(wan_names[i]);
+    {
+        struct app_config scrub;
+
+        memset(&scrub, 0, sizeof(scrub));
+        for (int i = 0; i < nlan; i++) {
+            strncpy(scrub.locals[i].ifname, lan_names[i],
+                    sizeof(scrub.locals[i].ifname) - 1);
+        }
+        scrub.local_count = nlan;
+        for (int i = 0; i < nwan; i++) {
+            strncpy(scrub.wans[i].ifname, wan_names[i],
+                    sizeof(scrub.wans[i].ifname) - 1);
+        }
+        scrub.wan_count = nwan;
+        interface_promisc_off_config(&scrub);
+    }
+    /* Settle so immediate recreate (delete→create) does not hit EINVAL -22. */
+    usleep(250000);
+    for (int i = 0; i < nlan; i++)
+        profile_iface_xdp_detach_ifname(lan_names[i]);
+    for (int i = 0; i < nwan; i++)
+        profile_iface_xdp_detach_ifname(wan_names[i]);
+
+    fprintf(stderr, "[STOP] done (ifaces scrubbed; daemon still running)\n");
     fflush(stderr);
     rt->has_thread = 0;
     rt->running = 0;
@@ -787,6 +819,32 @@ static int load_profile_and_run(struct runtime_state *rt,
                                 int profile_id) {
     if (!rt->has_thread)
         *active_id_count = 0;
+
+    /*
+     * Phase 1 single-profile mode: one process shares one UMEM across all
+     * live XSKs. Reject activating a second profile; edit the active one via
+     * the same -id notify. Multi-profile UMEM isolation is deferred.
+     */
+    if (*active_id_count > 1) {
+        fprintf(stderr,
+                "[VALIDATE] REJECT: %d profiles in active set — single-profile mode "
+                "allows exactly 1 (ids:",
+                *active_id_count);
+        for (int i = 0; i < *active_id_count; i++)
+            fprintf(stderr, " %d", active_ids[i]);
+        fprintf(stderr, "). Stop dataplane / delete extras first.\n");
+        fflush(stderr);
+        return -1;
+    }
+    if (*active_id_count == 1 && active_ids[0] != profile_id) {
+        fprintf(stderr,
+                "[VALIDATE] REJECT: cannot load profile %d — profile %d already running "
+                "(single-profile mode). Delete/stop profile %d first, then create/load "
+                "the new one (daemon stays up; dataplane will restart).\n",
+                profile_id, active_ids[0], active_ids[0]);
+        fflush(stderr);
+        return -1;
+    }
 
     int added = active_ids_add(active_ids, active_id_count, profile_id);
     if (added < 0)
@@ -808,6 +866,14 @@ static int handle_profile_notify(struct runtime_state *rt,
         return 0;
 
     if (ne_profile_id_exists(profile_id) == 0) {
+        if (*active_id_count >= 1 && active_ids[0] != profile_id) {
+            fprintf(stderr,
+                    "[VALIDATE] REJECT load profile %d: profile %d is active "
+                    "(only one profile allowed). Delete profile %d before loading another.\n",
+                    profile_id, active_ids[0], active_ids[0]);
+            fflush(stderr);
+            return -1;
+        }
         int lr = load_profile_and_run(rt, active_ids, active_id_count, profile_id);
         if (lr != 0) {
             fprintf(stderr, "[ERR] profile %d: load failed\n", profile_id);
@@ -817,20 +883,25 @@ static int handle_profile_notify(struct runtime_state *rt,
     }
 
     if (!active_ids_remove(active_ids, active_id_count, profile_id)) {
-        fprintf(stderr, "[DELETE] profile %d (not in DB)\n", profile_id);
+        fprintf(stderr, "[DELETE] profile %d (not in DB, not active — nothing to stop)\n",
+                profile_id);
         return 0;
     }
 
-    fprintf(stderr, "[DELETE] profile %d removed\n", profile_id);
+    fprintf(stderr, "[DELETE] profile %d removed — stopping dataplane (scrub XDP)\n",
+            profile_id);
+    fflush(stderr);
 
     if (*active_id_count == 0)
         return runtime_stop_forwarder(rt);
 
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
-        fprintf(stderr, "[ERR] profile %d: unload reload failed\n", profile_id);
-        return -1;
-    }
-    return 0;
+    /* Should not happen in single-profile mode; refuse multi leftover. */
+    fprintf(stderr,
+            "[VALIDATE] REJECT: delete left %d other active profile(s) — "
+            "single-profile mode unexpected state\n",
+            *active_id_count);
+    fflush(stderr);
+    return runtime_stop_forwarder(rt);
 }
 static void handle_shutdown_signal(int sig) {
     (void)sig;

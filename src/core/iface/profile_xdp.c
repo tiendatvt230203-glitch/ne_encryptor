@@ -40,20 +40,29 @@ static int profile_iface_ifname_safe(const char *ifname)
 static void profile_iface_xdp_link_off(const char *ifname)
 {
     char cmd[160];
-    char js[160];
-    static const char *const modes[] = { "xdp", "xdpgeneric", "xdpoffload" };
+    unsigned int ifindex;
+    static const __u32 bpf_modes[] = {
+        XDP_FLAGS_DRV_MODE,
+        XDP_FLAGS_SKB_MODE,
+        XDP_FLAGS_HW_MODE,
+        0,
+    };
+    static const char *const ip_modes[] = { "xdp", "xdpgeneric", "xdpoffload" };
 
     if (!profile_iface_ifname_safe(ifname))
         return;
-    /* #region agent log */
-    snprintf(js, sizeof(js), "{\"ifname\":\"%s\"}", ifname);
-    agent_dbg("D", "profile_iface_xdp.c:link_off", "ip_link_xdp_off", js);
-    /* #endregion */
-    /* Clear all attach modes; do not touch bridge/master. */
-    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
-        snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s %s off", ifname, modes[i]);
-        if (system(cmd) != 0)
-            fprintf(stderr, "[PROFILE-XDP] warning: failed to run: %s\n", cmd);
+
+    /* libbpf detach first — more reliable than ip alone after AF_XDP teardown. */
+    ifindex = if_nametoindex(ifname);
+    if (ifindex != 0) {
+        for (size_t i = 0; i < sizeof(bpf_modes) / sizeof(bpf_modes[0]); i++)
+            (void)bpf_xdp_detach((int)ifindex, bpf_modes[i], NULL);
+    }
+
+    for (size_t i = 0; i < sizeof(ip_modes) / sizeof(ip_modes[0]); i++) {
+        snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s %s off >/dev/null 2>&1",
+                 ifname, ip_modes[i]);
+        (void)system(cmd);
     }
 }
 
@@ -114,8 +123,11 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
     if (!cfg)
         return;
-    fprintf(stderr, "[PROFILE-XDP] prepare: detach xdp on configured LAN/WAN\n");
+    fprintf(stderr, "[PROFILE-XDP] prepare: scrub leftover XDP on configured LAN/WAN\n");
     fflush(stderr);
+    profile_iface_xdp_detach_config(cfg);
+    /* Kernel needs a beat after detach+AF_XDP close before rebinding (EINVAL -22). */
+    usleep(200000);
     profile_iface_xdp_detach_config(cfg);
     interface_reset_redirect_maps();
 }
@@ -195,26 +207,6 @@ static int cfg_has_iface_removal(const struct app_config *old, const struct app_
     return cfg_has_lan_row_removal(old, new) || cfg_has_wan_row_removal(old, new);
 }
 
-static const struct local_config *local_by_ifname(const struct app_config *cfg,
-                                                  const char *ifname)
-{
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (strcmp(cfg->locals[i].ifname, ifname) == 0)
-            return &cfg->locals[i];
-    }
-    return NULL;
-}
-
-static const struct wan_config *wan_by_ifname(const struct app_config *cfg, const char *ifname)
-{
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (strcmp(cfg->wans[i].ifname, ifname) == 0)
-            return &cfg->wans[i];
-    }
-    return NULL;
-}
-
-
 static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname)
 {
     if (!fwd || !ifname)
@@ -226,36 +218,6 @@ static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname
             return di;
     }
     return -1;
-}
-
-static int local_db_equal(const struct local_config *a, const struct local_config *b)
-{
-    return strcmp(a->ifname, b->ifname) == 0;
-}
-
-static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
-{
-    return strcmp(a->ifname, b->ifname) == 0 &&
-           a->dst_ip == b->dst_ip &&
-           a->window_size == b->window_size &&
-           a->dataplane == b->dataplane;
-}
-
-static int cfg_shared_ifaces_unchanged(const struct app_config *old, const struct app_config *new)
-{
-    for (int i = 0; i < old->local_count; i++) {
-        const char *ifn = old->locals[i].ifname;
-        const struct local_config *nl = local_by_ifname(new, ifn);
-        if (nl && !local_db_equal(&old->locals[i], nl))
-            return 0;
-    }
-    for (int i = 0; i < old->wan_count; i++) {
-        const char *ifn = old->wans[i].ifname;
-        const struct wan_config *nw = wan_by_ifname(new, ifn);
-        if (nw && !wan_db_equal(&old->wans[i], nw))
-            return 0;
-    }
-    return 1;
 }
 
 int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new)
@@ -282,8 +244,11 @@ int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_c
         return 0;
     if (!cfg_has_iface_addition(old, new) && !cfg_has_iface_removal(old, new))
         return 0;
-    if (!cfg_shared_ifaces_unchanged(old, new))
-        return 0;
+    /*
+     * Kept ifaces may change WAN window/dst_ip/dataplane; those fields are
+     * applied after plumb via sync_wan_live + crypto rebuild. Do not require
+     * field equality (that previously forced a full dataplane restart).
+     */
     return 1;
 }
 
@@ -619,6 +584,11 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
     default:
         return -1;
     }
+
+    /* Apply dataplane flag / new live WAN rows on kept ifaces. */
+    fwd_wan_configure_live_drains(fwd, old, cfg);
+    if (profile_iface_xdp_sync_wan_live(fwd, cfg, old) != 0)
+        return -1;
 
     profile_iface_life_reconcile_counts(fwd);
     fwd->cfg = cfg;

@@ -1,6 +1,7 @@
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/profile_iface_xdp.h"
 #include "../../../inc/core/dataplane_stats.h"
+#include <bpf/libbpf.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <net/if.h>
@@ -879,6 +880,17 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         NE_TRY(interface_set_promisc(cfg->wans[ci].ifname));
     }
 
+    /* Scrub stale XDP before AF_XDP bind (delete→create EINVAL -22). */
+    for (int i = 0; i < p->local_count; i++)
+        profile_iface_xdp_detach_ifname(cfg->locals[i].ifname);
+    for (int di = 0; di < p->wan_count; di++) {
+        int ci = config_wan_dp_to_cfg(cfg, di);
+        if (ci < 0)
+            goto fail;
+        profile_iface_xdp_detach_ifname(cfg->wans[ci].ifname);
+    }
+    usleep(50000);
+
     struct xsk_umem_config ucfg = {
         .fill_size = NE_RING,
         .comp_size = NE_RING,
@@ -893,15 +905,40 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->umem_fq_li = 0;
     p->umem_fq_q = 0;
 
-    for (int i = 0; i < p->local_count; i++)
-        NE_TRY(open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
-                                 p->locals[i].queue_count));
+    for (int i = 0; i < p->local_count; i++) {
+        int rc = open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
+                                   p->locals[i].queue_count);
+        if (rc) {
+            /* One scrub+retry — common after rapid delete/recreate. */
+            fprintf(stderr,
+                    "[DP] LAN %s XSK bind failed — scrub XDP and retry once\n",
+                    cfg->locals[i].ifname);
+            fflush(stderr);
+            profile_iface_xdp_detach_ifname(cfg->locals[i].ifname);
+            usleep(150000);
+            rc = open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
+                                   p->locals[i].queue_count);
+        }
+        NE_TRY(rc);
+    }
     for (int di = 0; di < p->wan_count; di++) {
         int ci = config_wan_dp_to_cfg(cfg, di);
+        int rc;
         if (ci < 0)
             goto fail;
-        NE_TRY(open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
-                                 p->wans[di].queue_count));
+        rc = open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
+                               p->wans[di].queue_count);
+        if (rc) {
+            fprintf(stderr,
+                    "[DP] WAN %s XSK bind failed — scrub XDP and retry once\n",
+                    cfg->wans[ci].ifname);
+            fflush(stderr);
+            profile_iface_xdp_detach_ifname(cfg->wans[ci].ifname);
+            usleep(150000);
+            rc = open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
+                                   p->wans[di].queue_count);
+        }
+        NE_TRY(rc);
     }
 
     uint32_t prefill = NE_FQ_PREFILL;
@@ -927,30 +964,65 @@ fail:
 
 void ne_pair_close(struct ne_pair *p)
 {
+    char ifnames[MAX_INTERFACES * 2][IF_NAMESIZE];
+    int nif = 0;
+
     if (!p)
         return;
-    for (int i = 0; i < p->local_count; i++)
-        profile_iface_xdp_detach_local(p, i);
-    for (int i = 0; i < p->wan_count; i++)
-        profile_iface_xdp_detach_wan(p, i);
+
+    /* Snapshot names before clearing sockets / memset. */
+    for (int i = 0; i < p->local_count && nif < (int)(sizeof(ifnames) / sizeof(ifnames[0])); i++) {
+        if (p->locals[i].ifname[0])
+            snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->locals[i].ifname);
+    }
+    for (int i = 0; i < p->wan_count && nif < (int)(sizeof(ifnames) / sizeof(ifnames[0])); i++) {
+        if (p->wans[i].ifname[0])
+            snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->wans[i].ifname);
+    }
+
+    /*
+     * Close AF_XDP / UMEM first, then scrub XDP. Detaching XDP while sockets
+     * are still mapped contributed to EINVAL (-22) on the next bind.
+     */
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->bpf_locals[i]) {
+            bpf_object__close(p->bpf_locals[i]);
+            p->bpf_locals[i] = NULL;
+        }
+        p->xdp_local_on[i] = 0;
+    }
+    for (int i = 0; i < p->wan_count; i++) {
+        if (p->bpf_wans[i]) {
+            bpf_object__close(p->bpf_wans[i]);
+            p->bpf_wans[i] = NULL;
+        }
+        p->xdp_wan_on[i] = 0;
+    }
     for (int i = 0; i < p->wan_count; i++) {
         for (int q = 0; q < p->wans[i].queue_count; q++) {
             if (p->wans[i].queues[q].xsk)
                 xsk_socket__delete(p->wans[i].queues[q].xsk);
+            p->wans[i].queues[q].xsk = NULL;
         }
     }
     for (int i = 0; i < p->local_count; i++) {
         for (int q = 0; q < p->locals[i].queue_count; q++) {
             if (p->locals[i].queues[q].xsk)
                 xsk_socket__delete(p->locals[i].queues[q].xsk);
+            p->locals[i].queues[q].xsk = NULL;
         }
     }
-    if (p->umem)
+    if (p->umem) {
         xsk_umem__delete(p->umem);
+        p->umem = NULL;
+    }
     pool_destroy(&p->pool);
     if (p->bufs && p->bufs != MAP_FAILED)
         munmap(p->bufs, p->bufsize);
     memset(p, 0, sizeof(*p));
+
+    for (int i = 0; i < nif; i++)
+        profile_iface_xdp_detach_ifname(ifnames[i]);
 }
 
 int ne_pair_local_live(const struct ne_pair *p, int pair_local_idx)

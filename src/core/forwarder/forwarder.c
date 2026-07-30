@@ -604,6 +604,11 @@ void forwarder_stop(void)
     atomic_store_explicit(&running, 0, memory_order_release);
 }
 
+void forwarder_clear_stop(void)
+{
+    atomic_store_explicit(&running, 1, memory_order_release);
+}
+
 void forwarder_shutdown_resources(void)
 {
     fwd_reload_shutdown();

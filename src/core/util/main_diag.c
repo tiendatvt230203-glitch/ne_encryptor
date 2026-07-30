@@ -268,6 +268,8 @@ void main_diag_log_dataplane_ready(struct app_config *cfg) {
         return;
 
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
+    fprintf(stderr,
+            "| mode: single-profile (1 UMEM/process; multi-profile UMEM later) |\n");
     print_iface_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);

@@ -55,6 +55,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg);
 void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
 void forwarder_stop(void);
+void forwarder_clear_stop(void);
 void forwarder_shutdown_resources(void);
 int forwarder_should_stop(void);
 
