@@ -28,6 +28,9 @@ void fwd_wan_mark_stopped(int dp);
 void fwd_wan_mark_live(int dp);
 void fwd_wan_refresh_active(struct forwarder *fwd);
 
+void fwd_wan_admin_hold_set(int dp, int held);
+int fwd_wan_admin_is_held(int dp);
+
 uint32_t fwd_wan_flush_queue(struct forwarder *fwd, int wan_idx);
 int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx);
 

@@ -45,6 +45,7 @@ typedef struct {
 static wan_drain_slot wan_drains[MAX_INTERFACES];
 static int wan_active_dp_count;
 static uint8_t wan_stopped[MAX_INTERFACES];
+static uint8_t wan_admin_hold[MAX_INTERFACES];
 static wan_weight_blend wan_weight_blends[MAX_PROFILES];
 static wan_join_ramp wan_joins[MAX_INTERFACES];
 
@@ -89,6 +90,8 @@ int fwd_wan_dp_ok_for_new_traffic(int dp)
 {
     if (dp < 0 || dp >= MAX_INTERFACES || wan_stopped[dp])
         return 0;
+    if (wan_admin_hold[dp])
+        return 0;
     if (wan_drains[dp].active)
         return 0;
     if (wan_failover_dp_excluded(dp))
@@ -100,7 +103,7 @@ int fwd_wan_is_stopped(int dp)
 {
     if (dp < 0 || dp >= MAX_INTERFACES)
         return 1;
-    return wan_stopped[dp] != 0;
+    return wan_stopped[dp] != 0 || wan_admin_hold[dp] != 0;
 }
 
 void fwd_wan_mark_stopped(int dp)
@@ -115,6 +118,20 @@ void fwd_wan_mark_live(int dp)
     if (dp < 0 || dp >= MAX_INTERFACES)
         return;
     wan_stopped[dp] = 0;
+}
+
+void fwd_wan_admin_hold_set(int dp, int held)
+{
+    if (dp < 0 || dp >= MAX_INTERFACES)
+        return;
+    wan_admin_hold[dp] = held ? 1 : 0;
+}
+
+int fwd_wan_admin_is_held(int dp)
+{
+    if (dp < 0 || dp >= MAX_INTERFACES)
+        return 1;
+    return wan_admin_hold[dp] != 0;
 }
 
 void fwd_wan_refresh_active(struct forwarder *fwd)
@@ -191,6 +208,7 @@ void fwd_wan_reset_on_init(struct forwarder *fwd)
     wan_active_dp_count = fwd ? fwd->wan_count : 0;
     memset(wan_drains, 0, sizeof(wan_drains));
     memset(wan_stopped, 0, sizeof(wan_stopped));
+    memset(wan_admin_hold, 0, sizeof(wan_admin_hold));
     memset(wan_joins, 0, sizeof(wan_joins));
 }
 
@@ -652,7 +670,7 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     int dp = fwd_wan_live_dp_for_cfg(fwd, wan_cfg);
     if (dp < 0)
         dp = fwd_wan_dp_for_legacy_cfg(fwd, wan_cfg);
-    if (dp < 0 || dp >= fwd->wan_count || fwd_wan_is_stopped(dp))
+    if (dp < 0 || dp >= fwd->wan_count || !fwd_wan_dp_ok_for_new_traffic(dp))
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
     return dp;
