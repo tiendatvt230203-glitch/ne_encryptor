@@ -128,7 +128,7 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
     return 0;
 }
 
-/* 1 = newly added, 0 = already in set, -1 = error (set full) */
+
 static int active_ids_add(int *active_ids, int *active_id_count, int id) {
     for (int i = 0; i < *active_id_count; i++) {
         if (active_ids[i] == id)
@@ -227,7 +227,7 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     rt->active_slot = 0;
     rt->cfg_slots[rt->active_slot] = *cfg;
     rt->running = 0;
-    /* Previous delete/stop left running=0; clear so init is not treated as abort. */
+
     forwarder_clear_stop();
     if (pthread_create(&rt->thread, NULL, forwarder_thread_main, rt) != 0) {
         fprintf(stderr, "[FATAL] failed to create forwarder thread\n");
@@ -475,7 +475,7 @@ static int profiles_fully_unchanged(const struct app_config *old,
     return 1;
 }
 
-/* LAN/WAN rows from Postgres unchanged (client MAC is not stored in DB). */
+
 static int lan_wan_db_unchanged(const struct app_config *old,
                                 const struct app_config *new)
 {
@@ -499,7 +499,7 @@ static int lan_wan_db_unchanged(const struct app_config *old,
     return 1;
 }
 
-/* Same ifnames; only WAN window tuning changed — no policy/profile traffic change. */
+
 static int runtime_tuning_only_change(const struct app_config *old,
                                       const struct app_config *new)
 {
@@ -596,11 +596,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     }
 
     if (!policy_only) {
-        /*
-         * Same ifname set: window/dst_ip/dataplane/profile metadata — hot
-         * reload only. Single-profile mode never full-restarts here; keep
-         * the running dataplane if mid-core apply fails.
-         */
+
         int tuning = runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot]);
         fprintf(stderr,
                 "[RELOAD] profile %d — same LAN/WAN ifnames (%s, hot reload)\n",
@@ -657,11 +653,6 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     if (!rt->has_thread)
         return 0;
 
-    /*
-     * Snapshot ifnames from the active slot before cleanup. Do NOT detach XDP
-     * while RX/TX workers still touch AF_XDP — that leaves NICs "dirty" and the
-     * next create often fails with EINVAL (-22) until process restart.
-     */
     {
         const struct app_config *cfg = &rt->cfg_slots[rt->active_slot];
 
@@ -706,7 +697,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         scrub.wan_count = nwan;
         interface_promisc_off_config(&scrub);
     }
-    /* Settle so immediate recreate (delete→create) does not hit EINVAL -22. */
+
     usleep(250000);
     for (int i = 0; i < nlan; i++)
         profile_iface_xdp_detach_ifname(lan_names[i]);
@@ -728,11 +719,7 @@ static int load_profile_and_run(struct runtime_state *rt,
     if (!rt->has_thread)
         *active_id_count = 0;
 
-    /*
-     * Phase 1 single-profile mode: one process shares one UMEM across all
-     * live XSKs. Reject activating a second profile; edit the active one via
-     * the same -id notify. Multi-profile UMEM isolation is deferred.
-     */
+
     if (*active_id_count > 1) {
         fprintf(stderr,
                 "[VALIDATE] REJECT: %d profiles in active set — single-profile mode "
@@ -757,7 +744,7 @@ static int load_profile_and_run(struct runtime_state *rt,
     int added = active_ids_add(active_ids, active_id_count, profile_id);
     if (added < 0)
         return -1;
-    /* Even if profile is already active, force rebuild to apply DB updates. */
+
     if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
         if (added == 1)
             active_ids_remove(active_ids, active_id_count, profile_id);
@@ -803,7 +790,6 @@ static int handle_profile_notify(struct runtime_state *rt,
     if (*active_id_count == 0)
         return runtime_stop_forwarder(rt);
 
-    /* Should not happen in single-profile mode; refuse multi leftover. */
     fprintf(stderr,
             "[VALIDATE] REJECT: delete left %d other active profile(s) — "
             "single-profile mode unexpected state\n",

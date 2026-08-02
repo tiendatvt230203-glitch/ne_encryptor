@@ -114,7 +114,7 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     fprintf(stderr, "[PROFILE-XDP] prepare: scrub leftover XDP on configured LAN/WAN\n");
     fflush(stderr);
     profile_iface_xdp_detach_config(cfg);
-    /* Kernel needs a beat after detach+AF_XDP close before rebinding (EINVAL -22). */
+
     usleep(200000);
     profile_iface_xdp_detach_config(cfg);
     interface_reset_redirect_maps();
@@ -455,8 +455,6 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
     }
     return 0;
 }
-
-/* --- forwarder slot helpers --- */
 
 static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
                                 const struct app_config *old)

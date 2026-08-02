@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Hot-add may grow past forwarder_init ring coverage — init before traffic. */
 static int fwd_ensure_mid_local_rings(struct forwarder *fwd, int li)
 {
     if (!fwd || li < 0 || li >= MAX_INTERFACES)
@@ -80,7 +79,7 @@ static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname
     return -1;
 }
 
-/* Prefer non-UMEM holes, then grow, then UMEM hole last. */
+
 static int fwd_alloc_local_slot(struct forwarder *fwd)
 {
     int n;

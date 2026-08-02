@@ -533,6 +533,37 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
     return best;
 }
 
+const struct crypto_policy *config_select_policy_for_arp(struct app_config *cfg, int profile_idx, uint32_t spa, uint32_t tpa) {
+    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        return NULL;
+    }
+
+    const struct profile_config *p = &cfg->profiles[profile_idx];
+    const struct crypto_policy *best = NULL;
+    int best_priority = 0x7fffffff;
+    int best_id = 0x7fffffff;
+
+    for (int i = 0; i < p->policy_count; i++) {
+        int pi = p->policy_indices[i];
+        const struct crypto_policy *cp;
+        if (pi < 0 || pi >= cfg->policy_count) {
+            continue;
+        }
+
+        cp = &cfg->policies[pi];
+        if (!crypto_policy_match_arp_ips(cp, spa, tpa)) {
+            continue;
+        }
+
+        if (!best || cp->priority < best_priority || (cp->priority == best_priority && cp->id < best_id)) {
+            best = cp;
+            best_priority = cp->priority;
+            best_id = cp->id;
+        }
+    }
+    return best;
+}
+
 const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t spa, uint32_t tpa)
 {

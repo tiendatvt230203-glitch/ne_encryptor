@@ -13,7 +13,4 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
                         const uint8_t *pkt, int ingress_wan_dp,
                         char egress_ifname[IF_NAMESIZE]);
 
-
-int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, uint8_t *pkt);
-
 #endif

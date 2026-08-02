@@ -543,24 +543,18 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 
-    /* ARP path is isolated from IP channel-agg: encrypted (0x823E) or plain (0x0806). */
     if (crypto_eth_l2_has_arp_marker(pkt, job.len) || dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
         char bridge_to[IF_NAMESIZE] = "";
-        int dec;
         int bridged = -1;
-
-        dec = arp_try_decrypt_l2_pqc(fwd, &job, pkt);
 
         if (wan_dp >= 0)
             bridged = arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to);
 
-        if (wan_dp >= 0 && dec >= 0)
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len,
-                                 bridged == 0 ? bridge_to : NULL);
-
-        if (bridged == 0)
+        if (bridged == 0) {
+            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
             return;
+        }
         goto drop;
     }
 
@@ -577,7 +571,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
-        /* Plain IPv4 = channel-agg bypass only: no decrypt / policy_id / L2-3-4. */
+
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
     }

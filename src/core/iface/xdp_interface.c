@@ -1012,7 +1012,7 @@ void ne_pair_close(struct ne_pair *p)
     if (!p)
         return;
 
-    /* Snapshot names before clearing sockets / memset. */
+    
     for (int i = 0; i < p->local_count && nif < (int)(sizeof(ifnames) / sizeof(ifnames[0])); i++) {
         if (p->locals[i].ifname[0])
             snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->locals[i].ifname);
@@ -1022,10 +1022,7 @@ void ne_pair_close(struct ne_pair *p)
             snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->wans[i].ifname);
     }
 
-    /*
-     * Close AF_XDP / UMEM first, then scrub XDP. Detaching XDP while sockets
-     * are still mapped contributed to EINVAL (-22) on the next bind.
-     */
+
     for (int i = 0; i < p->local_count; i++) {
         if (p->bpf_locals[i]) {
             bpf_object__close(p->bpf_locals[i]);
@@ -1096,7 +1093,7 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
     if (interface_preflight(ifname) != 0)
         return -1;
 
-    /* Ensure leftover XDP modes are cleared; Br membership stays. */
+    
     profile_iface_xdp_detach_ifname(ifname);
 
     int nq = resolve_iface_queue_count(ifname);
@@ -1146,7 +1143,6 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
     if (interface_preflight(ifname) != 0)
         return -1;
 
-    /* Ensure leftover XDP modes are cleared; Br membership stays. */
     profile_iface_xdp_detach_ifname(ifname);
 
     int nq = resolve_iface_queue_count(ifname);
@@ -1563,8 +1559,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
         return 0;
     }
 
-    /* Reserve TX slots BEFORE popping mid-ring frames so a failed reserve can
-     * never leave packet ownership stranded (UMEM frame leak → permanent stall). */
+
     want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
     reserved = xsk_ring_prod__reserve(&slot->tx, want, &idx);
     if (!reserved)
@@ -1574,7 +1569,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
         popped++;
 
     if (popped < reserved) {
-        /* Undo unused reservation (no xsk_ring_prod__cancel in this libxdp). */
+        
         slot->tx.cached_prod -= (reserved - popped);
     }
     if (!popped)
@@ -1601,7 +1596,6 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     }
     return (int)popped;
 }
-
 
 static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint32_t max_frame,
                                int tx_slot)
