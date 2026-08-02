@@ -39,6 +39,16 @@ void forwarder_pin_cpu(void)
     pin_cpu(ne_cpu_rx_lan(0));
 }
 
+void forwarder_runtime_lock(void)
+{
+    pthread_mutex_lock(&runtime_lock);
+}
+
+void forwarder_runtime_unlock(void)
+{
+    pthread_mutex_unlock(&runtime_lock);
+}
+
 #define DP_BURST_ROUNDS   8
 #define DP_TX_BURST_MAX   8
 

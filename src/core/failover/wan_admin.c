@@ -235,7 +235,31 @@ int wan_admin_kick(struct forwarder *fwd, const char *ifname)
 
 int wan_admin_restore(struct forwarder *fwd, const char *ifname)
 {
-    return wan_admin_queue(fwd, WAN_ADMIN_OP_RESTORE, ifname);
+    int rc;
+    int ci;
+    int target_w = 1;
+
+    if (!fwd || !ifname || !ifname[0])
+        return -1;
+    if (!fwd->threads_started) {
+        fprintf(stderr, "[WAN-ADMIN] dataplane not running yet\n");
+        fflush(stderr);
+        return -1;
+    }
+
+    forwarder_runtime_lock();
+    rc = wan_admin_apply_restore(fwd, ifname);
+    if (rc == 0 && fwd->cfg) {
+        ci = find_cfg_wan_idx(fwd->cfg, ifname);
+        if (ci >= 0)
+            target_w = config_wan_profile_weight(fwd->cfg, ci);
+        if (target_w <= 0)
+            target_w = 1;
+        if (ci >= 0)
+            fwd_wan_join_ramp_begin(ci, target_w);
+    }
+    forwarder_runtime_unlock();
+    return rc;
 }
 
 int fwd_wan_admin_apply_if_pending(void)
@@ -258,9 +282,6 @@ int fwd_wan_admin_apply_if_pending(void)
     switch (op) {
     case WAN_ADMIN_OP_KICK:
         admin_rc = wan_admin_apply_kick(fwd, ifname);
-        break;
-    case WAN_ADMIN_OP_RESTORE:
-        admin_rc = wan_admin_apply_restore(fwd, ifname);
         break;
     default:
         admin_rc = -1;

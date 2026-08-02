@@ -34,10 +34,19 @@ typedef struct {
     uint64_t until_ms;
 } wan_weight_blend;
 
+typedef struct {
+    int active;
+    int cfg_wan;
+    int target_w;
+    uint64_t start_ms;
+    uint64_t until_ms;
+} wan_join_ramp;
+
 static wan_drain_slot wan_drains[MAX_INTERFACES];
 static int wan_active_dp_count;
 static uint8_t wan_stopped[MAX_INTERFACES];
 static wan_weight_blend wan_weight_blends[MAX_PROFILES];
+static wan_join_ramp wan_joins[MAX_INTERFACES];
 
 static uint64_t monotonic_ms(void)
 {
@@ -182,6 +191,7 @@ void fwd_wan_reset_on_init(struct forwarder *fwd)
     wan_active_dp_count = fwd ? fwd->wan_count : 0;
     memset(wan_drains, 0, sizeof(wan_drains));
     memset(wan_stopped, 0, sizeof(wan_stopped));
+    memset(wan_joins, 0, sizeof(wan_joins));
 }
 
 void fwd_wan_configure_removal_drains(struct forwarder *fwd,
@@ -324,6 +334,71 @@ void fwd_wan_weight_blend_tick(void)
         if (wan_weight_blend_progress(&wan_weight_blends[bi]) >= 100)
             wan_weight_blends[bi].active = 0;
     }
+    fwd_wan_join_ramp_tick();
+}
+
+static int wan_join_ramp_pct(int cfg_wan)
+{
+    uint64_t now;
+    int i;
+
+    if (cfg_wan < 0)
+        return -1;
+    now = monotonic_ms();
+    for (i = 0; i < MAX_INTERFACES; i++) {
+        uint64_t total;
+        uint64_t elapsed;
+
+        if (!wan_joins[i].active || wan_joins[i].cfg_wan != cfg_wan)
+            continue;
+        if (now >= wan_joins[i].until_ms)
+            return 100;
+        total = wan_joins[i].until_ms - wan_joins[i].start_ms;
+        if (total == 0)
+            return 100;
+        elapsed = now - wan_joins[i].start_ms;
+        return (int)((elapsed * 100ULL) / total);
+    }
+    return -1;
+}
+
+void fwd_wan_join_ramp_begin(int cfg_wan, int target_weight)
+{
+    int slot = -1;
+    int i;
+
+    if (cfg_wan < 0)
+        return;
+    for (i = 0; i < MAX_INTERFACES; i++) {
+        if (wan_joins[i].active && wan_joins[i].cfg_wan == cfg_wan) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && !wan_joins[i].active)
+            slot = i;
+    }
+    if (slot < 0)
+        return;
+    wan_joins[slot].active = 1;
+    wan_joins[slot].cfg_wan = cfg_wan;
+    wan_joins[slot].target_w = target_weight > 0 ? target_weight : 1;
+    wan_joins[slot].start_ms = monotonic_ms();
+    wan_joins[slot].until_ms = wan_joins[slot].start_ms + WAN_DRAIN_GRACE_MS;
+    fprintf(stderr, "[WAN-ADMIN] join ramp cfg_wan=%d weight 0→%d over %us\n",
+            cfg_wan, wan_joins[slot].target_w,
+            (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
+    fflush(stderr);
+}
+
+void fwd_wan_join_ramp_tick(void)
+{
+    uint64_t now = monotonic_ms();
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        if (!wan_joins[i].active)
+            continue;
+        if (now >= wan_joins[i].until_ms)
+            wan_joins[i].active = 0;
+    }
 }
 
 void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_config *new,
@@ -418,6 +493,7 @@ int fwd_wan_build_profile_pool(struct forwarder *fwd, const struct profile_confi
         int wi = p->wan_indices[i];
         int base = profile_wan_weight_blended(p, wi, p->wan_bandwidth_weight[i]);
         int dp;
+        int ramp;
 
         if (base <= 0)
             base = (p->wan_bandwidth_weight[i] > 0) ? p->wan_bandwidth_weight[i] : 0;
@@ -428,8 +504,21 @@ int fwd_wan_build_profile_pool(struct forwarder *fwd, const struct profile_confi
                 dead_weight += base;
             continue;
         }
+
+        ramp = wan_join_ramp_pct(wi);
+        if (ramp == 0) {
+            if (base > 0)
+                dead_weight += base;
+            continue;
+        }
+
         live_cfg[live_n] = wi;
         live_w[live_n] = base > 0 ? base : 1;
+        if (ramp > 0 && ramp < 100) {
+            live_w[live_n] = (live_w[live_n] * ramp) / 100;
+            if (live_w[live_n] <= 0)
+                live_w[live_n] = 1;
+        }
         live_n++;
     }
 

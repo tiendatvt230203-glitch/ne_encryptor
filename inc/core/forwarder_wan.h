@@ -36,6 +36,9 @@ int fwd_wan_build_profile_pool(struct forwarder *fwd, const struct profile_confi
 
 int fwd_wan_live_dp_for_cfg(struct forwarder *fwd, int cfg_wan);
 
+void fwd_wan_join_ramp_begin(int cfg_wan, int target_weight);
+void fwd_wan_join_ramp_tick(void);
+
 int fwd_wan_dp_for_legacy_cfg(struct forwarder *fwd, int legacy_cfg_wan);
 
 int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,

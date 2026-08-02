@@ -52,6 +52,9 @@ void forwarder_pin_cpu(void);
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg);
 #define FORWARDER_WAN_DRAIN_SEC 5
 
+void forwarder_runtime_lock(void);
+void forwarder_runtime_unlock(void);
+
 void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
 void forwarder_stop(void);
