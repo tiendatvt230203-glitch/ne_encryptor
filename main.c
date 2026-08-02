@@ -19,12 +19,14 @@
 #include "interface.h"
 #include "main_diag.h"
 #include "profile_iface_xdp.h"
+#include "wan_admin.h"
 #include "pqc_handshake.h"
 #include "pqc_ipc.h"
 #include "traffic_crypto.h"
 #include "pqc_vault.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
+#define WAN_ADMIN_CHANNEL "xdp_wan_admin"
 #define MAX_ACTIVE_PROFILE_IDS 32
 
 static volatile sig_atomic_t g_stop_requested = 0;
@@ -71,9 +73,11 @@ static void usage(const char *prog) {
             "  %s -gi            # generate new identity key and load into RAM\n"
             "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
             "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
+            "  %s -di <wan_if>   # notify daemon: hard-detach WAN from bonding/profile\n"
+            "  %s -ai <wan_if>   # notify daemon: hot-add WAN back into bonding/profile\n"
             "  %s -check [ID]    # check database config consistency\n"
             "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -190,6 +194,82 @@ static int notify_profile_load(int profile_id) {
     PQclear(res);
     PQfinish(conn);
     return 0;
+}
+
+static int notify_wan_admin(const char *op, const char *ifname)
+{
+    struct ne_postgres_conn pg;
+    char payload[IF_NAMESIZE + 8];
+    char sql[160];
+    PGconn *conn;
+    PGresult *res;
+
+    if (!op || !ifname || !ifname[0] || strlen(ifname) >= IF_NAMESIZE) {
+        fprintf(stderr, "[ERR] invalid WAN ifname\n");
+        return -1;
+    }
+    if (ne_postgres_conn_fill(&pg) != 0)
+        return -1;
+
+    conn = PQconnectdbParams(pg.keywords, pg.values, 0);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "[ERR] DB: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return -1;
+    }
+
+    snprintf(payload, sizeof(payload), "%s:%s", op, ifname);
+    snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', '%s')", WAN_ADMIN_CHANNEL, payload);
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "[ERR] pg_notify %s failed: %s", WAN_ADMIN_CHANNEL, PQerrorMessage(conn));
+        PQclear(res);
+        PQfinish(conn);
+        return -1;
+    }
+    PQclear(res);
+    PQfinish(conn);
+    fprintf(stderr,
+            "[NOTIFY] sent %s to channel %s (daemon applies on mid-core)\n",
+            payload, WAN_ADMIN_CHANNEL);
+    return 0;
+}
+
+static int handle_wan_admin_notify(struct runtime_state *rt, const char *payload)
+{
+    const char *ifname;
+    int rc;
+
+    if (!rt || !payload || !payload[0])
+        return -1;
+    if (!rt->has_thread || !rt->running) {
+        fprintf(stderr, "[WAN-ADMIN] ignore %s — dataplane not running (load a profile first)\n",
+                payload);
+        fflush(stderr);
+        return -1;
+    }
+
+    if (strncmp(payload, "di:", 3) == 0) {
+        ifname = payload + 3;
+        fprintf(stderr, "\n[WAN-ADMIN] notify KICK %s\n", ifname);
+        fflush(stderr);
+        rc = wan_admin_kick(&rt->fwd, ifname);
+        if (rc != 0)
+            fprintf(stderr, "[WAN-ADMIN] KICK failed for %s\n", ifname);
+        return rc;
+    }
+    if (strncmp(payload, "ai:", 3) == 0) {
+        ifname = payload + 3;
+        fprintf(stderr, "\n[WAN-ADMIN] notify RESTORE %s\n", ifname);
+        fflush(stderr);
+        rc = wan_admin_restore(&rt->fwd, ifname);
+        if (rc != 0)
+            fprintf(stderr, "[WAN-ADMIN] RESTORE failed for %s\n", ifname);
+        return rc;
+    }
+
+    fprintf(stderr, "[WARN] ignoring WAN_ADMIN payload: \"%s\"\n", payload);
+    return -1;
 }
 
 static void *forwarder_thread_main(void *arg) {
@@ -814,6 +894,21 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (argc == 3 && strcmp(argv[1], "-di") == 0) {
+        if (load_ne_env() != 0) {
+            fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+            return 1;
+        }
+        return notify_wan_admin("di", argv[2]) != 0 ? 1 : 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "-ai") == 0) {
+        if (load_ne_env() != 0) {
+            fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+            return 1;
+        }
+        return notify_wan_admin("ai", argv[2]) != 0 ? 1 : 0;
+    }
+
     setbuf(stderr, NULL);
     if (trf_pqc_init_global() != TRF_PQC_OK) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
@@ -900,8 +995,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
+    PQclear(PQexec(listen_conn, "LISTEN " WAN_ADMIN_CHANNEL));
 
-    fprintf(stderr, "[DAEMON] listening %s — use %s -id <id>\n", NOTIFY_CHANNEL, argv[0]);
+    fprintf(stderr,
+            "[DAEMON] listening %s + %s — use %s -id <id> | -di <wan> | -ai <wan>\n",
+            NOTIFY_CHANNEL, WAN_ADMIN_CHANNEL, argv[0]);
 
     struct runtime_state *rt = calloc(1, sizeof(*rt));
     if (!rt) {
@@ -914,8 +1012,8 @@ int main(int argc, char **argv) {
     int active_id_count = 0;
 
     fprintf(stderr,
-            "[DAEMON] passive — no auto DB load; use %s -id <id> (LISTEN %s)\n",
-            argv[0], NOTIFY_CHANNEL);
+            "[DAEMON] passive — no auto DB load; use %s -id <id> | -di <wan> | -ai <wan>\n",
+            argv[0]);
     fflush(stderr);
 
     while (!g_stop_requested) {
@@ -923,6 +1021,7 @@ int main(int argc, char **argv) {
         if (pq_fd < 0) {
             PQreset(listen_conn);
             PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
+            PQclear(PQexec(listen_conn, "LISTEN " WAN_ADMIN_CHANNEL));
             usleep(200000);
             continue;
         }
@@ -952,15 +1051,19 @@ int main(int argc, char **argv) {
         PQconsumeInput(listen_conn);
         PGnotify *notify;
         while ((notify = PQnotifies(listen_conn)) != NULL) {
-            int id = parse_notify_profile_id(notify->extra);
-            if (id <= 0) {
-                fprintf(stderr,
-                        "[WARN] ignoring NOTIFY with invalid id payload: \"%s\"\n",
-                        notify->extra ? notify->extra : "");
+            if (notify->relname && strcmp(notify->relname, WAN_ADMIN_CHANNEL) == 0) {
+                (void)handle_wan_admin_notify(rt, notify->extra);
             } else {
-                fprintf(stderr, "\n[NOTIFY] profile %d\n", id);
-                fflush(stderr);
-                (void)handle_profile_notify(rt, active_ids, &active_id_count, id);
+                int id = parse_notify_profile_id(notify->extra);
+                if (id <= 0) {
+                    fprintf(stderr,
+                            "[WARN] ignoring NOTIFY with invalid id payload: \"%s\"\n",
+                            notify->extra ? notify->extra : "");
+                } else {
+                    fprintf(stderr, "\n[NOTIFY] profile %d\n", id);
+                    fflush(stderr);
+                    (void)handle_profile_notify(rt, active_ids, &active_id_count, id);
+                }
             }
             PQfreemem(notify);
         }
@@ -968,6 +1071,7 @@ int main(int argc, char **argv) {
         if (PQstatus(listen_conn) != CONNECTION_OK) {
             PQreset(listen_conn);
             PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
+            PQclear(PQexec(listen_conn, "LISTEN " WAN_ADMIN_CHANNEL));
         }
     }
 

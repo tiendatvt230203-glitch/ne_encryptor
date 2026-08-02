@@ -15,6 +15,11 @@ struct profile_attach_sess {
 int profile_iface_life_detach_lan(struct forwarder *fwd, const char *ifname, int profile_id);
 int profile_iface_life_detach_wan(struct forwarder *fwd, const char *ifname, int profile_id);
 
+int profile_iface_life_attach_wan_ifname(struct forwarder *fwd,
+                                        const struct app_config *cfg,
+                                        const char *ifname,
+                                        int profile_id);
+
 int profile_iface_life_detach_profile_rows(struct forwarder *fwd,
                                           const struct app_config *new_cfg,
                                           const struct app_config *old_cfg,

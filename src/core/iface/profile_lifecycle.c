@@ -223,8 +223,95 @@ int profile_iface_life_detach_wan(struct forwarder *fwd, const char *ifname, int
             profile_id, ifname, di);
     fflush(stderr);
     ne_pair_unplumb_wan_dp(&fwd->pair, di);
+    memset(&fwd->wans[di], 0, sizeof(fwd->wans[di]));
     fwd->wan_cfg_idx[di] = -1;
     fwd_wan_mark_stopped(di);
+    profile_iface_life_reconcile_counts(fwd);
+    fwd_wan_refresh_active(fwd);
+    return 0;
+}
+
+int profile_iface_life_attach_wan_ifname(struct forwarder *fwd,
+                                        const struct app_config *cfg,
+                                        const char *ifname,
+                                        int profile_id)
+{
+    int ci = -1;
+    int di;
+    int owner;
+
+    if (!fwd || !cfg || !ifname || !ifname[0])
+        return -1;
+
+    if (pair_wan_dp_slot_live(fwd, ifname) >= 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — already live, skip\n", ifname);
+        fflush(stderr);
+        return 0;
+    }
+
+    for (int i = 0; i < cfg->wan_count; i++) {
+        if (strcmp(cfg->wans[i].ifname, ifname) != 0)
+            continue;
+        if (!config_wan_live(cfg, i)) {
+            fprintf(stderr,
+                    "[PROFILE-LIFE] ADD WAN %s — not dataplane in cfg (dst_ip set?)\n",
+                    ifname);
+            fflush(stderr);
+            return -1;
+        }
+        ci = i;
+        break;
+    }
+    if (ci < 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — not found in active config\n", ifname);
+        fflush(stderr);
+        return -1;
+    }
+
+    if (if_nametoindex(ifname) == 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — kernel interface missing\n", ifname);
+        fflush(stderr);
+        return -1;
+    }
+
+    owner = config_wan_owner_profile(cfg, ci, -1);
+    if (profile_id <= 0)
+        profile_id = owner > 0 ? owner : 0;
+
+    di = fwd_alloc_wan_slot(fwd);
+    if (di < 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — no free dp slot\n", ifname);
+        fflush(stderr);
+        return -1;
+    }
+
+    fprintf(stderr, "[PROFILE-LIFE] profile %d ADD WAN %s (dp slot %d)\n",
+            profile_id, ifname, di);
+    fflush(stderr);
+
+    if (fwd_ensure_mid_wan_rings(fwd, di) != 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — egress ring init failed\n", ifname);
+        return -1;
+    }
+    if (ne_pair_plumb_wan_dp(&fwd->pair, cfg, ci, di) != 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — plumb/XSK failed\n", ifname);
+        return -1;
+    }
+    if (profile_iface_xdp_bind_wan(&fwd->pair, cfg, di, cfg->fake_ethertype_ipv4) != 0) {
+        fprintf(stderr, "[PROFILE-LIFE] ADD WAN %s — xdp attach failed\n", ifname);
+        ne_pair_unplumb_wan_dp(&fwd->pair, di);
+        return -1;
+    }
+    fwd->pair.xdp_wan_on[di] = 1;
+    init_fwd_wan_meta(fwd, di, cfg, ci);
+    fwd->wan_cfg_idx[di] = ci;
+    fwd_wan_mark_live(di);
+    profile_iface_life_reconcile_counts(fwd);
+    fwd_wan_refresh_active(fwd);
+    fprintf(stderr,
+            "[PROFILE-LIFE] profile %d ADD WAN %s OK (dp=%d wan_count=%d)\n",
+            profile_id, ifname, di, fwd->wan_count);
+    fflush(stderr);
     return 0;
 }
 
@@ -498,6 +585,7 @@ void profile_iface_life_attach_wan_rows(struct forwarder *fwd,
         fwd->pair.xdp_wan_on[di] = 1;
         init_fwd_wan_meta(fwd, di, new_cfg, ci);
         fwd->wan_cfg_idx[di] = ci;
+        fwd_wan_mark_live(di);
         fwd->wan_count = fwd->pair.wan_count;
         sess->wan_added[sess->wan_n++] = di;
     }

@@ -2,6 +2,8 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/forwarder_reload.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
+#include "../../../inc/core/wan_failover.h"
+#include "../../../inc/core/wan_admin.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane.h"
 #include "../../../inc/core/crypto_route.h"
@@ -337,6 +339,10 @@ static void *crypto_worker_thread(void *arg)
                 pthread_mutex_unlock(&runtime_lock);
                 continue;
             }
+            if (fwd_wan_admin_apply_if_pending()) {
+                pthread_mutex_unlock(&runtime_lock);
+                continue;
+            }
             if ((++maint_tick & 1023u) == 0)
                 crypto_worker_tick(fwd, 1);
         }
@@ -457,6 +463,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     // MAC_LEARN
     mac_learn_bootstrap(&fwd->mac_table);
     // MAC_LEARN
+    if (wan_failover_start(fwd) != 0) {
+        fprintf(stderr, "[FWD] wan_failover_start failed\n");
+        fflush(stderr);
+    }
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
 }
@@ -465,6 +475,8 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
+    wan_admin_shutdown();
+    wan_failover_stop();
     // MAC_LEARN
     mac_learn_shutdown(&fwd->mac_table);
     // MAC_LEARN

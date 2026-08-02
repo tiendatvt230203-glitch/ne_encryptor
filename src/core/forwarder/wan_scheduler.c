@@ -1,5 +1,6 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/profile_iface_xdp.h"
+#include "../../../inc/core/wan_failover.h"
 
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
@@ -81,6 +82,8 @@ int fwd_wan_dp_ok_for_new_traffic(int dp)
         return 0;
     if (wan_drains[dp].active)
         return 0;
+    if (wan_failover_dp_excluded(dp))
+        return 0;
     return dp < wan_active_dp_count;
 }
 
@@ -96,6 +99,18 @@ void fwd_wan_mark_stopped(int dp)
     if (dp < 0 || dp >= MAX_INTERFACES)
         return;
     wan_stopped[dp] = 1;
+}
+
+void fwd_wan_mark_live(int dp)
+{
+    if (dp < 0 || dp >= MAX_INTERFACES)
+        return;
+    wan_stopped[dp] = 0;
+}
+
+void fwd_wan_refresh_active(struct forwarder *fwd)
+{
+    wan_active_dp_count = fwd ? fwd->wan_count : 0;
 }
 
 int fwd_wan_ifname_dataplane_in_cfg(const struct app_config *cfg, const char *ifname)
@@ -366,39 +381,89 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
     fflush(stderr);
 }
 
+int fwd_wan_live_dp_for_cfg(struct forwarder *fwd, int cfg_wan)
+{
+    int n;
+
+    if (!fwd || cfg_wan < 0)
+        return -1;
+    n = fwd->wan_count;
+    if (fwd->pair.wan_count > n)
+        n = fwd->pair.wan_count;
+    if (n > MAX_INTERFACES)
+        n = MAX_INTERFACES;
+    for (int dp = 0; dp < n; dp++) {
+        if (fwd->wan_cfg_idx[dp] != cfg_wan)
+            continue;
+        if (!fwd_wan_dp_ok_for_new_traffic(dp))
+            return -1;
+        return dp;
+    }
+    return -1;
+}
+
 int fwd_wan_build_profile_pool(struct forwarder *fwd, const struct profile_config *p,
                                int *allowed_wans, int *allowed_weights, int max_n)
 {
+    int live_cfg[MAX_PROFILE_INTERFACES];
+    int live_w[MAX_PROFILE_INTERFACES];
+    int live_n = 0;
+    int dead_weight = 0;
     int n = 0;
-    if (!p || !allowed_wans || !allowed_weights || max_n <= 0)
+
+    if (!fwd || !p || !allowed_wans || !allowed_weights || max_n <= 0)
         return 0;
 
-    for (int i = 0; i < p->wan_count && n < max_n; i++) {
+    for (int i = 0; i < p->wan_count && live_n < MAX_PROFILE_INTERFACES; i++) {
         int wi = p->wan_indices[i];
-        int dp = config_wan_cfg_to_dp(fwd->cfg, wi);
-        if (dp < 0 || !fwd_wan_dp_ok_for_new_traffic(dp))
+        int base = profile_wan_weight_blended(p, wi, p->wan_bandwidth_weight[i]);
+        int dp;
+
+        if (base <= 0)
+            base = (p->wan_bandwidth_weight[i] > 0) ? p->wan_bandwidth_weight[i] : 0;
+
+        dp = fwd_wan_live_dp_for_cfg(fwd, wi);
+        if (dp < 0) {
+            if (base > 0)
+                dead_weight += base;
             continue;
-        allowed_wans[n] = wi;
-        allowed_weights[n] = profile_wan_weight_blended(
-            p, wi, p->wan_bandwidth_weight[i]);
+        }
+        live_cfg[live_n] = wi;
+        live_w[live_n] = base > 0 ? base : 1;
+        live_n++;
+    }
+
+    if (live_n > 0 && dead_weight > 0) {
+        int share = dead_weight / live_n;
+        int rem = dead_weight % live_n;
+
+        for (int i = 0; i < live_n; i++)
+            live_w[i] += share + (i < rem ? 1 : 0);
+    }
+
+    for (int i = 0; i < live_n && n < max_n; i++) {
+        allowed_wans[n] = live_cfg[i];
+        allowed_weights[n] = live_w[i];
         n++;
     }
 
-    int wan_n = fwd->wan_count;
-    if (wan_n > MAX_INTERFACES)
-        wan_n = MAX_INTERFACES;
-    for (int dp = 0; dp < wan_n && n < max_n; dp++) {
-        int taper;
-        if (!wan_drains[dp].active || wan_stopped[dp])
-            continue;
-        taper = wan_drain_taper_pct(dp);
-        if (taper <= 0)
-            continue;
-        allowed_wans[n] = wan_drains[dp].legacy_cfg_wan;
-        allowed_weights[n] = (wan_drains[dp].seed_weight * taper) / 100;
-        if (allowed_weights[n] <= 0)
-            allowed_weights[n] = 1;
-        n++;
+    {
+        int wan_n = fwd->wan_count;
+        if (wan_n > MAX_INTERFACES)
+            wan_n = MAX_INTERFACES;
+        for (int dp = 0; dp < wan_n && n < max_n; dp++) {
+            int taper;
+            if (!wan_drains[dp].active || wan_stopped[dp])
+                continue;
+            taper = wan_drain_taper_pct(dp);
+            if (taper <= 0)
+                continue;
+            allowed_wans[n] = wan_drains[dp].legacy_cfg_wan;
+            allowed_weights[n] = (wan_drains[dp].seed_weight * taper) / 100;
+            if (allowed_weights[n] <= 0)
+                allowed_weights[n] = 1;
+            n++;
+        }
     }
     return n;
 }
@@ -440,8 +505,8 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
         for (int i = 0; i < p->wan_count; i++) {
             if (sumw > 0 && p->wan_bandwidth_weight[i] <= 0)
                 continue;
-            int dp = config_wan_cfg_to_dp(fwd->cfg, p->wan_indices[i]);
-            if (dp < 0 || !fwd_wan_dp_ok_for_new_traffic(dp) || !fwd_wan_has_tx_room(fwd, dp))
+            int dp = fwd_wan_live_dp_for_cfg(fwd, p->wan_indices[i]);
+            if (dp < 0 || !fwd_wan_has_tx_room(fwd, dp))
                 continue;
             uint32_t d = fwd_mid_to_wan_depth(fwd, dp);
             if (d < best_depth) {
@@ -495,7 +560,7 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     if (wan_cfg < 0)
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
-    int dp = config_wan_cfg_to_dp(fwd->cfg, wan_cfg);
+    int dp = fwd_wan_live_dp_for_cfg(fwd, wan_cfg);
     if (dp < 0)
         dp = fwd_wan_dp_for_legacy_cfg(fwd, wan_cfg);
     if (dp < 0 || dp >= fwd->wan_count || fwd_wan_is_stopped(dp))

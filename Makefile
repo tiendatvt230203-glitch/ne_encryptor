@@ -23,6 +23,7 @@ CORE_SRCS = $(wildcard src/core/forwarder/*.c) \
             $(wildcard src/core/dataplane/*.c) \
             $(wildcard src/core/iface/*.c) \
             $(wildcard src/core/flow/*.c) \
+            $(wildcard src/core/failover/*.c) \
             $(wildcard src/core/util/*.c)
 
 CRYPTO_COMMON_SRCS = $(wildcard src/crypto/common/*.c)
