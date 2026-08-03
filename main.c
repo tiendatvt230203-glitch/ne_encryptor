@@ -23,7 +23,6 @@
 #include "pqc_handshake.h"
 #include "pqc_ipc.h"
 #include "traffic_crypto.h"
-#include "pqc_vault.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 #define WAN_ADMIN_CHANNEL "xdp_wan_admin"
@@ -914,6 +913,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
         return 1;
     }
+    sig_pqc_load_keys_from_disk();
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
@@ -974,7 +974,6 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_shutdown_signal);
 
     sig_pqc_start_ipc_server();
-    sig_pqc_init_vault();
     libbpf_set_print(libbpf_print_silent);
     fprintf(stderr, "[NE-BUILD] br-arp-noflood-data-flood-v1 (journal marker — verify deploy)\n");
     fflush(stderr);
