@@ -65,8 +65,7 @@ int l2_encrypt(uint8_t *pkt, uint32_t pkt_len, uint32_t capacity)
         return -1;
 
     payload_len = pkt_len - (size_t)l3_off;
-    if ((uint32_t)l3_off + (uint32_t)payload_len + L2_GCM_TAG_BYTES > capacity ||
-        (uint32_t)l3_off + (uint32_t)payload_len + L2_GCM_TAG_BYTES > NE_FRAME)
+    if ((uint32_t)l3_off + (uint32_t)payload_len + L2_GCM_TAG_BYTES > capacity)
         return -1;
 
     pkt[et_off] = (uint8_t)(L2_FAKE_ETHERTYPE >> 8);

@@ -4,8 +4,8 @@
 #include <stdint.h>
 
 /* Fill before running */
-#define IF_LAN "eth0"
-#define IF_WAN "eth1"
+#define IF_LAN "eno1"
+#define IF_WAN "eno3"
 
 /* Far-end MAC only. Local iface MACs come from the NIC. */
 #define REMOTE_MAC { 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 }
@@ -41,14 +41,29 @@ static const uint8_t HARD_AAD[8] = {
 };
 #define HARD_AAD_LEN 12
 
-#define NE_FRAME 16384u
-#define NE_N_FRAMES   1572864u
+/*
+ * AF_XDP UMEM chunk_size hard-max is PAGE_SIZE (4096 on most kernels).
+ * UNALIGNED only lifts power-of-two — it does NOT allow > PAGE_SIZE.
+ * Jumbo (~9K) needs multi-buffer: chain several 4K frames (XDP_USE_SG).
+ */
+#define NE_FRAME      4096u
+#define NE_PKT_MAX    16384u /* contiguous assemble/crypto/scatter buffer */
+#define NE_N_FRAMES   65536u /* 256 MiB UMEM */
 #define NE_RING       8192u
 #define NE_BATCH      64u
 #define NE_FQ_PREFILL 4096u
+#define NE_MAX_FRAGS  8u     /* 8 x 4K covers NE_PKT_MAX */
 
 #ifndef XDP_FLAGS_DRV_MODE
 #define XDP_FLAGS_DRV_MODE (1U << 2)
+#endif
+
+/* Bind / desc flags — older headers may omit these */
+#ifndef XDP_USE_SG
+#define XDP_USE_SG (1 << 4)
+#endif
+#ifndef XDP_PKT_CONTD
+#define XDP_PKT_CONTD (1 << 0)
 #endif
 
 #endif /* NE_MTU9K_CONFIG_H */

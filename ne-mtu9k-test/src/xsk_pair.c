@@ -2,6 +2,7 @@
 
 #include <bpf/bpf.h>
 #include <errno.h>
+#include <linux/if_xdp.h>
 #include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,45 +107,102 @@ void mtu9k_recycle(struct mtu9k_pair *p, struct mtu9k_iface *iface)
     refill_fq(p, q, NE_FQ_PREFILL);
 }
 
-int mtu9k_rx(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-             uint64_t *addrs, uint32_t *lens, int max)
+int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 uint8_t *out, uint32_t out_cap, uint32_t *out_len)
 {
     struct mtu9k_queue *q = &iface->q;
     uint32_t idx = 0;
     uint32_t n;
-    int out = 0;
+    uint32_t total = 0;
+    uint32_t frags = 0;
+    uint64_t addrs[NE_MAX_FRAGS];
 
-    (void)p;
-    if (max <= 0)
+    n = xsk_ring_cons__peek(&q->rx, NE_BATCH, &idx);
+    if (n == 0)
         return 0;
-    n = xsk_ring_cons__peek(&q->rx, (uint32_t)max, &idx);
+
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&q->rx, idx + i);
-        addrs[out] = d->addr;
-        lens[out] = d->len;
-        out++;
+        int eop = !(d->options & XDP_PKT_CONTD);
+
+        if (frags >= NE_MAX_FRAGS) {
+            for (uint32_t j = 0; j < frags; j++)
+                pool_push(p, addrs[j]);
+            pool_push(p, d->addr);
+            xsk_ring_cons__release(&q->rx, i + 1);
+            return -1;
+        }
+        if (total + d->len > out_cap) {
+            for (uint32_t j = 0; j < frags; j++)
+                pool_push(p, addrs[j]);
+            pool_push(p, d->addr);
+            xsk_ring_cons__release(&q->rx, i + 1);
+            return -1;
+        }
+        addrs[frags++] = d->addr;
+        memcpy(out + total, mtu9k_pkt_data(p, d->addr), d->len);
+        total += d->len;
+        if (eop) {
+            xsk_ring_cons__release(&q->rx, i + 1);
+            for (uint32_t j = 0; j < frags; j++)
+                pool_push(p, addrs[j]);
+            *out_len = total;
+            return 1;
+        }
     }
-    if (n)
-        xsk_ring_cons__release(&q->rx, n);
-    return out;
+
+    /* Peeked batch ended mid-packet — drop (kernel should deliver complete pkts) */
+    for (uint32_t j = 0; j < frags; j++)
+        pool_push(p, addrs[j]);
+    xsk_ring_cons__release(&q->rx, n);
+    return -1;
 }
 
-int mtu9k_tx(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-             uint64_t addr, uint32_t len)
+int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 const uint8_t *data, uint32_t len)
 {
     struct mtu9k_queue *q = &iface->q;
+    uint32_t nfrag;
     uint32_t idx = 0;
+    uint64_t addrs[NE_MAX_FRAGS];
+    uint32_t off = 0;
 
-    (void)p;
-    if (xsk_ring_prod__reserve(&q->tx, 1, &idx) != 1)
+    if (!data || len == 0 || len > NE_PKT_MAX)
         return -1;
-    {
-        struct xdp_desc *d = xsk_ring_prod__tx_desc(&q->tx, idx);
-        d->addr = addr;
-        d->len = len;
-        d->options = 0;
+
+    nfrag = (len + p->frame_size - 1) / p->frame_size;
+    if (nfrag == 0 || nfrag > NE_MAX_FRAGS)
+        return -1;
+
+    for (uint32_t i = 0; i < nfrag; i++) {
+        if (pool_pop(p, &addrs[i]) != 0) {
+            for (uint32_t j = 0; j < i; j++)
+                pool_push(p, addrs[j]);
+            return -1;
+        }
     }
-    xsk_ring_prod__submit(&q->tx, 1);
+
+    if (xsk_ring_prod__reserve(&q->tx, nfrag, &idx) != nfrag) {
+        for (uint32_t i = 0; i < nfrag; i++)
+            pool_push(p, addrs[i]);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < nfrag; i++) {
+        uint32_t chunk = len - off;
+        struct xdp_desc *d;
+
+        if (chunk > p->frame_size)
+            chunk = p->frame_size;
+        memcpy(mtu9k_pkt_data(p, addrs[i]), data + off, chunk);
+        d = xsk_ring_prod__tx_desc(&q->tx, idx + i);
+        d->addr = addrs[i];
+        d->len = chunk;
+        d->options = (i + 1 < nfrag) ? XDP_PKT_CONTD : 0;
+        off += chunk;
+    }
+
+    xsk_ring_prod__submit(&q->tx, nfrag);
     kick_tx(q);
     return 0;
 }
@@ -224,7 +282,6 @@ static int read_iface_mac(const char *ifname, uint8_t mac[6])
     return 0;
 }
 
-/* Force combined=1 — no RSS multi-queue / channel fan-in */
 static void force_one_rx_queue(const char *ifname)
 {
     char cmd[160];
@@ -243,7 +300,8 @@ static int open_queue(struct mtu9k_pair *p, struct mtu9k_iface *iface, const cha
         .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = XDP_FLAGS_DRV_MODE,
-        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
+        /* XDP_USE_SG: allow packets larger than frame_size via multi-buffer */
+        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP | XDP_USE_SG,
     };
     int ret;
 
@@ -259,7 +317,6 @@ static int open_queue(struct mtu9k_pair *p, struct mtu9k_iface *iface, const cha
         fprintf(stderr, "[XSK] cannot read MAC for %s\n", ifname);
         return -1;
     }
-    /* Always queue_id 0 — single LAN / single WAN */
     ret = xsk_socket__create_shared(&iface->q.xsk, ifname, 0, p->umem,
                                     &iface->q.rx, &iface->q.tx,
                                     &iface->q.fq, &iface->q.cq, &cfg);
@@ -303,12 +360,13 @@ int mtu9k_pair_open(struct mtu9k_pair *p, const char *lan, const char *wan)
 
     p->frame_size = NE_FRAME;
     p->n_frames = NE_N_FRAMES;
-    /* ring buffer needs one empty slot to distinguish full vs empty */
     p->free_cap = NE_N_FRAMES + 1;
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-    fprintf(stderr, "[XSK] UMEM size=%.2f GiB (frames=%u x %u)\n",
-            (double)p->bufsize / (1024.0 * 1024.0 * 1024.0),
-            p->n_frames, p->frame_size);
+    fprintf(stderr,
+            "[XSK] UMEM size=%.2f MiB (frames=%u x %u) multi-buffer SG "
+            "(pkt_max=%u)\n",
+            (double)p->bufsize / (1024.0 * 1024.0),
+            p->n_frames, p->frame_size, NE_PKT_MAX);
     p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p->bufs == MAP_FAILED) {
@@ -320,14 +378,15 @@ int mtu9k_pair_open(struct mtu9k_pair *p, const char *lan, const char *wan)
         goto fail;
 
     if (xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->fq, &p->cq, &ucfg)) {
-        perror("[XSK] umem create");
+        fprintf(stderr, "[XSK] umem create failed: %s (errno=%d) frame=%u\n",
+                strerror(errno), errno, NE_FRAME);
         goto fail;
     }
+    fprintf(stderr, "[XSK] umem OK frame=%u (PAGE_SIZE ceiling)\n", NE_FRAME);
 
     for (uint32_t i = 0; i < p->n_frames; i++)
         pool_push(p, (uint64_t)i * p->frame_size);
 
-    /* Detach leftover XDP */
     {
         unsigned int li = if_nametoindex(lan);
         unsigned int wi = if_nametoindex(wan);
@@ -354,7 +413,9 @@ int mtu9k_pair_open(struct mtu9k_pair *p, const char *lan, const char *wan)
     if (update_xskmap(&p->wan, 0) != 0)
         goto fail;
 
-    fprintf(stderr, "[XSK] ready 1xLAN=%s 1xWAN=%s frame=%u n_frames=%u umem=%.2f MiB (queue0 only)\n",
+    fprintf(stderr,
+            "[XSK] ready 1xLAN=%s 1xWAN=%s frame=%u n_frames=%u umem=%.2f MiB "
+            "(queue0, XDP_USE_SG)\n",
             lan, wan, p->frame_size, p->n_frames,
             (double)p->bufsize / (1024.0 * 1024.0));
     return 0;

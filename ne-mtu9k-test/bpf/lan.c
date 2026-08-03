@@ -14,7 +14,8 @@ struct {
     __type(value, __u32);
 } xsks_map SEC(".maps");
 
-SEC("xdp")
+/* xdp.frags: driver may deliver jumbo as multi-buffer */
+SEC("xdp.frags")
 int xdp_redirect_prog(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;

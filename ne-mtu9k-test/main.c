@@ -16,7 +16,6 @@ static void on_stop(int sig)
     g_stop = 1;
 }
 
-/* dst = who to deliver to (remote); src = egress NIC MAC */
 static void set_eth_macs(uint8_t *pkt, const uint8_t dst[6], const uint8_t src[6])
 {
     memcpy(pkt + 0, dst, 6);
@@ -34,62 +33,52 @@ static void note_len(uint32_t len)
         g_max_len = len;
 }
 
-static void process_lan_to_wan(struct mtu9k_pair *p, uint64_t addr, uint32_t len)
+static void process_lan_to_wan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
 {
     static const uint8_t remote[6] = REMOTE_MAC;
-    uint8_t *pkt = mtu9k_pkt_data(p, addr);
     int nlen;
 
     note_len(len);
-    /* Throw toward remote; src = our WAN NIC */
     set_eth_macs(pkt, remote, p->wan.mac);
 
 #if MODE_L2_PQC
-    nlen = l2_encrypt(pkt, len, NE_FRAME);
+    nlen = l2_encrypt(pkt, len, NE_PKT_MAX);
     if (nlen < 0) {
         g_drop++;
-        mtu9k_free_frame(p, addr);
         return;
     }
     len = (uint32_t)nlen;
 #endif
 
-    if (mtu9k_tx(p, &p->wan, addr, len) != 0) {
+    if (mtu9k_tx_pkt(p, &p->wan, pkt, len) != 0) {
         g_drop++;
-        mtu9k_free_frame(p, addr);
         return;
     }
     g_tx_wan++;
 }
 
-static void process_wan_to_lan(struct mtu9k_pair *p, uint64_t addr, uint32_t len)
+static void process_wan_to_lan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
 {
     static const uint8_t remote[6] = REMOTE_MAC;
-    uint8_t *pkt = mtu9k_pkt_data(p, addr);
     int nlen;
 
     note_len(len);
 
 #if MODE_L2_PQC
-    if (!l2_has_enc_marker(pkt, len)) {
-        /* plain IP on WAN (bypass peer) — still forward */
-    } else {
+    if (l2_has_enc_marker(pkt, len)) {
         nlen = l2_decrypt(pkt, len);
         if (nlen < 0) {
             g_drop++;
-            mtu9k_free_frame(p, addr);
             return;
         }
         len = (uint32_t)nlen;
     }
 #endif
 
-    /* Deliver on LAN: dst still remote identity under test; src = our LAN NIC */
     set_eth_macs(pkt, remote, p->lan.mac);
 
-    if (mtu9k_tx(p, &p->lan, addr, len) != 0) {
+    if (mtu9k_tx_pkt(p, &p->lan, pkt, len) != 0) {
         g_drop++;
-        mtu9k_free_frame(p, addr);
         return;
     }
     g_tx_lan++;
@@ -98,8 +87,7 @@ static void process_wan_to_lan(struct mtu9k_pair *p, uint64_t addr, uint32_t len
 int main(int argc, char **argv)
 {
     struct mtu9k_pair pair;
-    uint64_t addrs[NE_BATCH];
-    uint32_t lens[NE_BATCH];
+    uint8_t pkt[NE_PKT_MAX];
     unsigned stats_ticks = 0;
 
     (void)argc;
@@ -110,8 +98,9 @@ int main(int argc, char **argv)
     setbuf(stderr, NULL);
 
     fprintf(stderr,
-            "[mtu9k] MODE_L2_PQC=%d frame=%u n_frames=%u LAN=%s WAN=%s\n",
-            MODE_L2_PQC, NE_FRAME, NE_N_FRAMES, IF_LAN, IF_WAN);
+            "[mtu9k] MODE_L2_PQC=%d frame=%u pkt_max=%u n_frames=%u LAN=%s WAN=%s\n"
+            "[mtu9k] note: AF_XDP chunk <= PAGE_SIZE; jumbo via multi-buffer (XDP_USE_SG)\n",
+            MODE_L2_PQC, NE_FRAME, NE_PKT_MAX, NE_N_FRAMES, IF_LAN, IF_WAN);
 
     if (l2_crypto_init() != 0) {
         fprintf(stderr, "[FATAL] l2_crypto_init failed\n");
@@ -124,24 +113,32 @@ int main(int argc, char **argv)
     }
 
     while (!g_stop) {
-        int n;
+        uint32_t len = 0;
+        int r;
+        int idle = 1;
 
         mtu9k_recycle(&pair, &pair.lan);
         mtu9k_recycle(&pair, &pair.wan);
 
-        n = mtu9k_rx(&pair, &pair.lan, addrs, lens, NE_BATCH);
-        for (int i = 0; i < n; i++) {
+        r = mtu9k_rx_pkt(&pair, &pair.lan, pkt, sizeof(pkt), &len);
+        if (r > 0) {
+            idle = 0;
             g_rx_lan++;
-            process_lan_to_wan(&pair, addrs[i], lens[i]);
+            process_lan_to_wan(&pair, pkt, len);
+        } else if (r < 0) {
+            g_drop++;
         }
 
-        n = mtu9k_rx(&pair, &pair.wan, addrs, lens, NE_BATCH);
-        for (int i = 0; i < n; i++) {
+        r = mtu9k_rx_pkt(&pair, &pair.wan, pkt, sizeof(pkt), &len);
+        if (r > 0) {
+            idle = 0;
             g_rx_wan++;
-            process_wan_to_lan(&pair, addrs[i], lens[i]);
+            process_wan_to_lan(&pair, pkt, len);
+        } else if (r < 0) {
+            g_drop++;
         }
 
-        if (n == 0)
+        if (idle)
             usleep(50);
 
         if (++stats_ticks >= 100000) {

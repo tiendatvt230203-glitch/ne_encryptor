@@ -46,15 +46,21 @@ void mtu9k_pair_close(struct mtu9k_pair *p);
 
 void *mtu9k_pkt_data(struct mtu9k_pair *p, uint64_t addr);
 
-/* RX: returns number of packets filled into addrs/lens (max batch). */
-int mtu9k_rx(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-             uint64_t *addrs, uint32_t *lens, int max);
+/*
+ * RX one logical packet (may span several UMEM frames via XDP_PKT_CONTD).
+ * Copies into out[], returns length via *out_len, frees RX frames.
+ * Returns 1 on packet, 0 if no complete packet available, -1 on drop/error.
+ */
+int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 uint8_t *out, uint32_t out_cap, uint32_t *out_len);
 
-/* TX one frame; kicks wakeup if needed. */
-int mtu9k_tx(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-             uint64_t addr, uint32_t len);
+/*
+ * TX one logical packet: scatter into UMEM frames, XDP_PKT_CONTD on all
+ * but the last descriptor.
+ */
+int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 const uint8_t *data, uint32_t len);
 
-/* Return completed TX buffers to free pool + refill FQ. */
 void mtu9k_recycle(struct mtu9k_pair *p, struct mtu9k_iface *iface);
 
 int mtu9k_alloc_frame(struct mtu9k_pair *p, uint64_t *addr_out);
