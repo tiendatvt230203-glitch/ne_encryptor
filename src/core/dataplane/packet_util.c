@@ -213,7 +213,7 @@ void dp_log_arp_userspace(const char *dir, const char *iface,
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
 {
-    if (pkt->len > fwd->pair.frame_size || ne_ring_try_push(ring, pkt) != 0) {
+    if (pkt->len > NE_PKT_MAX || ne_ring_try_push(ring, pkt) != 0) {
         ne_dp_stats_mid_ring_drop(1);
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;

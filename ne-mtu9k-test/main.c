@@ -15,7 +15,6 @@ static void on_stop(int sig)
     g_stop = 1;
 }
 
-/* Pure L2: keep original eth dst/src; only encrypt/decrypt + forward. */
 static void process_lan_to_wan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
 {
 #if MODE_L2_PQC

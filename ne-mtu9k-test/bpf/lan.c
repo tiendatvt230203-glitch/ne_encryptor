@@ -13,7 +13,7 @@ struct {
     __type(value, __u32);
 } xsks_map SEC(".maps");
 
-/* xdp.frags: driver may deliver jumbo as multi-buffer */
+/* ice + jumbo MTU requires frags */
 SEC("xdp.frags")
 int xdp_redirect_prog(struct xdp_md *ctx)
 {

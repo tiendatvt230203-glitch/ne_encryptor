@@ -10,13 +10,6 @@
 #define ETH_HLEN 14
 #define ETH_P_IP 0x0800
 
-/*
- * L2 PQC feasibility:
- * - Set ethertype to L2_FAKE_ETHERTYPE (required L2 encrypt marker)
- * - Encrypt IPv4 payload in place; append GCM tag only
- * - No policy_id / core_id / nonce bytes stuffed after ethertype
- */
-
 static SCryptCipherCtx *g_pqc_ctx;
 
 int l2_crypto_init(void)

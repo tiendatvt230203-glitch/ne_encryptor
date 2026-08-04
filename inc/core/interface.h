@@ -12,19 +12,33 @@
 #define MAX_QUEUES     64
 
 #define NE_RING        16384u
-#define NE_FRAME       2048u
-#define NE_N_FRAMES    1048576u
+#define NE_FRAME       4096u   /* AF_XDP UMEM chunk (PAGE_SIZE ceiling) */
+#define NE_PKT_MAX     16384u  /* max logical packet (jumbo assemble) */
+#define NE_MAX_FRAGS   8u
+#define NE_N_JUMBO     4096u   /* contiguous jumbo slots in UMEM */
+#define NE_N_FRAMES    524288u /* ~2 GiB at 4K (was 1M x 2K) */
 #define NE_BATCH_SIZE   64u
 
 #define NE_QUEUE_OVERRIDE 0
 
 #define NE_FQ_PREFILL   16384u
 
+#ifndef XDP_FLAGS_SKB_MODE
+#define XDP_FLAGS_SKB_MODE (1U << 1)
+#endif
 #ifndef XDP_FLAGS_DRV_MODE
 #define XDP_FLAGS_DRV_MODE (1U << 2)
 #endif
+/* Production attaches generic XDP (SKB). Detach scrub still clears DRV leftovers. */
+#define NE_XDP_MODE XDP_FLAGS_SKB_MODE
 #ifndef XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
+#endif
+#ifndef XDP_USE_SG
+#define XDP_USE_SG (1 << 4)
+#endif
+#ifndef XDP_PKT_CONTD
+#define XDP_PKT_CONTD (1 << 0)
 #endif
 
 #include "cpu_map.h"
@@ -87,6 +101,8 @@ struct ne_pair {
     size_t bufsize;
     uint32_t frame_size;
     uint32_t n_frames;
+    uint64_t jumbo_base;   /* byte offset of first jumbo slot */
+    uint32_t n_jumbo;
     struct xsk_umem *umem;
     int umem_fq_li;
     int umem_fq_q;
@@ -97,6 +113,7 @@ struct ne_pair {
     int local_queue_total;
     int wan_queue_total;
     struct ne_pool pool;
+    struct ne_pool jumbo_pool;
     struct bpf_object *bpf_locals[MAX_INTERFACES];
     struct bpf_object *bpf_wans[MAX_INTERFACES];
     uint8_t xdp_local_on[MAX_INTERFACES];

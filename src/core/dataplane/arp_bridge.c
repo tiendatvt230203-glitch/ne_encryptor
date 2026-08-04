@@ -296,7 +296,7 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
     uint32_t spa = 0, tpa = 0;
     const struct arp_l2_pqc_entry *e;
     struct packet_crypto_ctx *pctx;
-    uint8_t scratch[NE_FRAME];
+    uint8_t scratch[NE_PKT_MAX];
     uint32_t orig_len;
     uint32_t len;
 
@@ -344,7 +344,7 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
     }
 
     orig_len = job->len;
-    if (orig_len > NE_FRAME) {
+    if (orig_len > NE_PKT_MAX) {
         if (skip_why)
             *skip_why = "frame-too-big";
         return 0;

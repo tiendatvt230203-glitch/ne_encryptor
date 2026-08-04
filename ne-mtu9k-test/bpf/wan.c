@@ -14,7 +14,7 @@ struct {
     __type(value, __u32);
 } wan_xsks_map SEC(".maps");
 
-/* xdp.frags: driver may deliver jumbo as multi-buffer */
+/* ice + jumbo MTU requires frags */
 SEC("xdp.frags")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
 {
@@ -28,7 +28,6 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL))
         return XDP_PASS;
 
-    /* L2 encrypt marker */
     if (eth->h_proto == bpf_htons(ETH_P_NE_L2_ENC))
         return bpf_redirect_map(&wan_xsks_map, ctx->rx_queue_index, 0);
 

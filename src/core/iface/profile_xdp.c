@@ -46,8 +46,11 @@ static void profile_iface_xdp_link_off(const char *ifname)
         return;
 
     ifindex = if_nametoindex(ifname);
-    if (ifindex != 0)
+    if (ifindex != 0) {
         (void)bpf_xdp_detach((int)ifindex, XDP_FLAGS_DRV_MODE, NULL);
+        (void)bpf_xdp_detach((int)ifindex, XDP_FLAGS_SKB_MODE, NULL);
+        (void)bpf_xdp_detach((int)ifindex, NE_XDP_MODE, NULL);
+    }
 
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off >/dev/null 2>&1",
              ifname);
@@ -267,15 +270,15 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
 
 static int xdp_attach_prog(int ifindex, int prog_fd, const char *ifname, const char *role)
 {
-    int rc = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL);
+    int rc = bpf_xdp_attach(ifindex, prog_fd, NE_XDP_MODE, NULL);
 
     if (rc) {
-        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s drv: %s\n",
+        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s skb: %s\n",
                 role, ifname, strerror(rc < 0 ? -rc : rc));
         fflush(stderr);
         return -1;
     }
-    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (drv)\n", role, ifname);
+    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (skb)\n", role, ifname);
     fflush(stderr);
     return 0;
 }
