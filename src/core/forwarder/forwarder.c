@@ -132,32 +132,59 @@ static void init_iface_meta(struct fwd_iface *iface, const char *ifname)
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
 }
 
+static int ioctl_iface_mtu(int sockfd, const char *ifname, uint32_t *mtu_out)
+{
+    struct ifreq ifr;
+
+    if (!ifname || !ifname[0] || !mtu_out)
+        return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    if (ioctl(sockfd, SIOCGIFMTU, &ifr) != 0 || ifr.ifr_mtu <= 0)
+        return -1;
+    *mtu_out = (uint32_t)ifr.ifr_mtu;
+    return 0;
+}
+
 static uint32_t resolve_runtime_frag_mtu(const struct app_config *cfg)
 {
     int sockfd;
-    uint32_t min_mtu = CRYPTO_OPT_FRAG_MTU_DEFAULT;
+    uint32_t min_mtu = 0;
+    uint32_t mtu;
+    int seen = 0;
 
     if (!cfg)
-        return min_mtu;
+        return CRYPTO_OPT_FRAG_MTU_DEFAULT;
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
-        return min_mtu;
+        return CRYPTO_OPT_FRAG_MTU_DEFAULT;
+
+    for (int li = 0; li < cfg->local_count; li++) {
+        if (ioctl_iface_mtu(sockfd, cfg->locals[li].ifname, &mtu) != 0)
+            continue;
+        if (!seen || mtu < min_mtu)
+            min_mtu = mtu;
+        seen = 1;
+    }
 
     for (int wi = 0; wi < cfg->wan_count; wi++) {
-        struct ifreq ifr;
         if (!cfg->wans[wi].dataplane)
             continue;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, cfg->wans[wi].ifname, IFNAMSIZ - 1);
-        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-        if (ioctl(sockfd, SIOCGIFMTU, &ifr) != 0)
+        if (ioctl_iface_mtu(sockfd, cfg->wans[wi].ifname, &mtu) != 0)
             continue;
-        if (ifr.ifr_mtu > 0 && (uint32_t)ifr.ifr_mtu < min_mtu)
-            min_mtu = (uint32_t)ifr.ifr_mtu;
+        if (!seen || mtu < min_mtu)
+            min_mtu = mtu;
+        seen = 1;
     }
 
     close(sockfd);
+
+    if (!seen || min_mtu < 512)
+        return CRYPTO_OPT_FRAG_MTU_DEFAULT;
+    if (min_mtu > NE_PKT_MAX)
+        min_mtu = NE_PKT_MAX;
     return min_mtu;
 }
 

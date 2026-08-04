@@ -171,6 +171,7 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
 void *ne_packet_data(struct ne_pair *p, uint64_t addr);
 int ne_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 uint32_t ne_frame_alloc_batch(struct ne_pair *p, uint64_t *addrs_out, uint32_t max_n);
+int ne_jumbo_frame_alloc(struct ne_pair *p, uint64_t *addr_out);
 void ne_frame_free(struct ne_pair *p, uint64_t addr);
 /* Frames currently idle in the shared UMEM pool (leak watchdog metric). */
 uint32_t ne_pool_free_count(struct ne_pair *p);

@@ -44,7 +44,7 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     int total_overhead;
 
     total_overhead = L4_TUNNEL_HDR_SIZE + AES_GCM_TAG_SIZE;
-    if (pkt_len + (size_t)total_overhead > NE_FRAME)
+    if (pkt_len + (size_t)total_overhead > NE_PKT_MAX)
         return -1;
 
     crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);

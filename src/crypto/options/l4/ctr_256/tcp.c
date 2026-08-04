@@ -43,7 +43,7 @@ static int l4_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     int enc_off = tunnel_off + L4_TUNNEL_HDR_SIZE;
     uint8_t iv[AES128_IV_SIZE];
 
-    if (pkt_len + (size_t)L4_TUNNEL_HDR_SIZE > NE_FRAME)
+    if (pkt_len + (size_t)L4_TUNNEL_HDR_SIZE > NE_PKT_MAX)
         return -1;
 
     crypto_generate_nonce(counter, PROTO_FLAG_IPV4, nonce, &nonce_len);

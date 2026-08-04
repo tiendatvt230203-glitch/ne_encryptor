@@ -9,6 +9,7 @@
 #include "aes_crypto.h"
 
 #define CRYPTO_OPT_FRAG_MTU_DEFAULT  1500u
+#define CRYPTO_OPT_FRAG_SLOT_MAX     9216u  /* enough for MTU 9000 wire frags */
 #define OPT_FRAG_TABLE_SIZE          4096
 #define OPT_FRAG_TIMEOUT_NS          (200ULL * 1000000ULL)
 

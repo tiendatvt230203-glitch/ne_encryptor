@@ -473,7 +473,7 @@ static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     }
     if (!best)
         return;
-    (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
+    (void)crypto_tcp_clamp_mss(pkt, len, crypto_option_get_mtu(),
                                crypto_option_wire_overhead(crypto_option_from_policy(best)));
 }
 

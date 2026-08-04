@@ -373,6 +373,11 @@ static int ne_jumbo_alloc(struct ne_pair *p, uint64_t *addr_out)
     return -1;
 }
 
+int ne_jumbo_frame_alloc(struct ne_pair *p, uint64_t *addr_out)
+{
+    return ne_jumbo_alloc(p, addr_out);
+}
+
 static int ne_addr_is_jumbo(const struct ne_pair *p, uint64_t addr)
 {
     return p && p->n_jumbo && addr >= p->jumbo_base;

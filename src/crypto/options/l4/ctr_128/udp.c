@@ -19,8 +19,8 @@
 
 struct opt_entry {
     uint16_t pkt_id;
-    uint8_t  first[1600];
-    uint8_t  second[1600];
+    uint8_t  first[CRYPTO_OPT_FRAG_SLOT_MAX];
+    uint8_t  second[CRYPTO_OPT_FRAG_SLOT_MAX];
     uint32_t first_len;
     uint32_t second_len;
     uint8_t  eth_hdr[ETH_L2_HDR_MAX];
@@ -141,7 +141,7 @@ static int opt_emit_join(struct opt_entry *entry, uint8_t *out_buf, uint32_t *ou
     if (!entry->got_first || !entry->got_second)
         return 0;
     int eth_len = entry->eth_len ? entry->eth_len : (int)ETH_HEADER_SIZE;
-    if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_FRAME) {
+    if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_PKT_MAX) {
         memset(entry, 0, sizeof(*entry));
         return -1;
     }
