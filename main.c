@@ -14,6 +14,7 @@
 #include "config.h"
 #include "db_env.h"
 #include "db_runtime.h"
+#include "vault.h"
 #include "forwarder.h"
 #include "forwarder_reload.h"
 #include "interface.h"
@@ -23,6 +24,7 @@
 #include "pqc_handshake.h"
 #include "pqc_ipc.h"
 #include "traffic_crypto.h"
+#include "pqc_vault.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 #define WAN_ADMIN_CHANNEL "xdp_wan_admin"
@@ -913,7 +915,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
         return 1;
     }
-    sig_pqc_load_keys_from_disk();
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
@@ -967,13 +968,15 @@ int main(int argc, char **argv) {
     struct ne_postgres_conn pg;
     if (ne_postgres_conn_fill(&pg) != 0) {
         fprintf(stderr,
-                "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
+                "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD "
+                "(expected in Vault " NE_VAULT_SECRET_PATH ")\n");
         return 1;
     }
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
 
     sig_pqc_start_ipc_server();
+    sig_pqc_init_vault();
     libbpf_set_print(libbpf_print_silent);
     fprintf(stderr, "[NE-BUILD] br-arp-noflood-data-flood-v1 (journal marker — verify deploy)\n");
     fflush(stderr);

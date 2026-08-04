@@ -2,6 +2,7 @@
 #include "traffic_crypto.h"
 #include "pqc_l2_handshake.h"
 #include "pqc_logger.h"
+#include "pqc_vault.h"
 #include "../../inc/crypto/packet_crypto.h"
 #include <sys/stat.h>
 #include <postgresql/libpq-fe.h>
@@ -1428,120 +1429,45 @@ int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_p
     strncpy(clean_fg, fingerprint, 8);
     clean_fg[8] = '\0';
 
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_registry_count; i++) {
-        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
-            if (out_priv) *out_priv = g_identity_registry[i].priv_key;
-            if (out_pub) *out_pub = g_identity_registry[i].pub_key;
-            pthread_mutex_unlock(&g_key_mutex);
-            return 0;
-        }
+    fprintf(stderr, "[PQC-VAULT-LOG] Fingerprint [%s]: Querying HashiCorp Vault directly...\n", clean_fg);
+
+    char priv_buf[8192] = "";
+    char pub_buf[8192]  = "";
+    if (sig_pqc_load_keys_from_vault(clean_fg, priv_buf, sizeof(priv_buf),
+                                      pub_buf,  sizeof(pub_buf)) != 0) {
+        fprintf(stderr, "[PQC-VAULT-LOG] ERROR: Fingerprint [%s] NOT found in HashiCorp Vault!\n", clean_fg);
+        return -1;
     }
-    pthread_mutex_unlock(&g_key_mutex);
-    fprintf(stderr, "[PQC-HS] Fingerprint [%s] not found in RAM registry. Reloading from disk...\n", clean_fg);
-    sig_pqc_load_keys_from_disk();
-    
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_registry_count; i++) {
-        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
-            if (out_priv) *out_priv = g_identity_registry[i].priv_key;
-            if (out_pub) *out_pub = g_identity_registry[i].pub_key;
-            pthread_mutex_unlock(&g_key_mutex);
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&g_key_mutex);
-    return -1;
+
+    if (out_priv) *out_priv = strdup(priv_buf);
+    if (out_pub)  *out_pub  = strdup(pub_buf);
+    return 0;
 }
 
-void sig_pqc_load_keys_from_disk(void) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_registry_count; i++) {
-        if (g_identity_registry[i].priv_key) {
-            free(g_identity_registry[i].priv_key);
-            g_identity_registry[i].priv_key = NULL; 
-        }
-        if (g_identity_registry[i].pub_key) {
-            free(g_identity_registry[i].pub_key);
-            g_identity_registry[i].pub_key = NULL; 
-        }
+int sig_pqc_load_keys_from_vault(const char *target_fg,
+                                  char *out_priv, size_t priv_sz,
+                                  char *out_pub,  size_t pub_sz) {
+    if (!target_fg || strlen(target_fg) == 0) return -1;
+    char clean_fg[16] = "";
+    strncpy(clean_fg, target_fg, 8);
+    clean_fg[8] = '\0';
+
+    char key_filename[64];
+    snprintf(key_filename, sizeof(key_filename), "%s.key", clean_fg);
+
+    int r_priv = sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PRIVATE, key_filename, out_priv, priv_sz);
+    if (r_priv != 0)
+        r_priv = sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PRIVATE, clean_fg, out_priv, priv_sz);
+
+    int r_pub = sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PUBLIC, key_filename, out_pub, pub_sz);
+    if (r_pub != 0)
+        r_pub = sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PUBLIC, clean_fg, out_pub, pub_sz);
+
+    if (r_priv == 0 && r_pub == 0) {
+        fprintf(stderr, "[PQC-VAULT-LOG] SUCCESS: Loaded local private key and public key for [%s] from HashiCorp Vault.\n", clean_fg);
+        return 0;
     }
-    g_registry_count = 0;
-    pthread_mutex_unlock(&g_key_mutex);
-    
-    DIR *dir = opendir("/dev/shm/.enc_config");
-    if (!dir) return;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
-            char fingerprint[16];
-            memset(fingerprint, 0, sizeof(fingerprint));
-            strncpy(fingerprint, entry->d_name, 8);
-
-            char priv_path[512];
-            char pub_path[512];
-            snprintf(priv_path, sizeof(priv_path), "/dev/shm/.enc_config/%s", entry->d_name);
-            snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/%s", entry->d_name);
-
-            FILE *fp_priv = fopen(priv_path, "r");
-            if (!fp_priv) continue;
-            char raw_file_priv[8192];
-            memset(raw_file_priv, 0, sizeof(raw_file_priv));
-            if (fgets(raw_file_priv, sizeof(raw_file_priv) - 1, fp_priv) == NULL) {
-                fclose(fp_priv);
-                continue;
-            }
-            fclose(fp_priv);
-            raw_file_priv[strcspn(raw_file_priv, "\r\n")] = '\0';
-
-            // Verify embedded fingerprint matches
-            if (strncmp(raw_file_priv, fingerprint, 8) != 0) {
-                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in private key %s\n", entry->d_name);
-                continue;
-            }
-            const char *obf_priv = raw_file_priv + 8;
-
-            FILE *fp_pub = fopen(pub_path, "r");
-            if (!fp_pub) continue;
-            char raw_file_pub[8192];
-            memset(raw_file_pub, 0, sizeof(raw_file_pub));
-            if (fgets(raw_file_pub, sizeof(raw_file_pub) - 1, fp_pub) == NULL) {
-                fclose(fp_pub);
-                continue;
-            }
-            fclose(fp_pub);
-            raw_file_pub[strcspn(raw_file_pub, "\r\n")] = '\0';
-
-            // Verify embedded fingerprint matches
-            if (strncmp(raw_file_pub, fingerprint, 8) != 0) {
-                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in public key %s\n", pub_path);
-                continue;
-            }
-            const char *obf_pub = raw_file_pub + 8;
-
-            unsigned char raw_priv[4096];
-            size_t raw_priv_len = 0;
-            trf_base64_decode_obfuscated(obf_priv, fingerprint, raw_priv, &raw_priv_len);
-
-            char plain_b64_priv[8192];
-            memset(plain_b64_priv, 0, sizeof(plain_b64_priv));
-            trf_base64_encode(raw_priv, raw_priv_len, plain_b64_priv);
-
-            unsigned char raw_pub[4096];
-            size_t raw_pub_len = 0;
-            trf_base64_decode_obfuscated(obf_pub, fingerprint, raw_pub, &raw_pub_len);
-
-            char plain_b64_pub[8192];
-            memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
-            trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-
-            sig_pqc_add_to_registry(fingerprint, plain_b64_priv, plain_b64_pub);
-            fprintf(stderr, "[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
-        }
-    }
-    closedir(dir);
+    return -1;
 }
 
 void sig_pqc_prepare_reload(void) {
@@ -1822,51 +1748,21 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         const char *peer_pub_path = PQgetvalue(peer_res, 0, 1);
         const char *key_id = PQgetvalue(peer_res, 0, 2);
 
-        char resolved_peer_pub_path[512] = "";
-        if (peer_pub_path && strlen(peer_pub_path) > 0) {
-            if (peer_pub_path[0] == '/') {
-                strncpy(resolved_peer_pub_path, peer_pub_path, sizeof(resolved_peer_pub_path) - 1);
-            } else {
-                snprintf(resolved_peer_pub_path, sizeof(resolved_peer_pub_path), "/etc/.dec_config/%s", peer_pub_path);
-            }
-        }
-
         char peer_fg_buf[16] = "";
         char *deobf_pub = NULL;
         bool valid = true;
 
-        if (strlen(resolved_peer_pub_path) == 0) {
-            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key file path in DB!\n", db_policy_id);
-            valid = false;
+        char vault_peer_pub_buf[8192] = "";
+        if (peer_pub_path && strlen(peer_pub_path) > 0 &&
+            sig_pqc_vault_read_key(VAULT_PATH_REMOTE_PUBLIC, peer_pub_path, vault_peer_pub_buf, sizeof(vault_peer_pub_buf)) == 0) {
+            fprintf(stderr, "[PQC-VAULT-LOG] SUCCESS: Loaded peer public key [%s] 100%% from HashiCorp Vault (remote_public).\n", peer_pub_path);
+            deobf_pub = strdup(vault_peer_pub_buf);
+            strncpy(peer_fg_buf, peer_pub_path, 8);
+            peer_fg_buf[8] = '\0';
         } else {
-            FILE *fp_pub = fopen(resolved_peer_pub_path, "r");
-            if (!fp_pub) {
-                fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] could not be opened!\n", db_policy_id, resolved_peer_pub_path);
-                valid = false;
-            } else {
-                char file_content[8192];
-                memset(file_content, 0, sizeof(file_content));
-                if (fgets(file_content, sizeof(file_content) - 1, fp_pub) == NULL) {
-                    fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] is empty!\n", db_policy_id, resolved_peer_pub_path);
-                    valid = false;
-                } else {
-                    file_content[strcspn(file_content, "\r\n")] = '\0';
-                    if (strlen(file_content) < 8) {
-                        fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] has invalid format (too short)!\n", db_policy_id, resolved_peer_pub_path);
-                        valid = false;
-                    } else {
-                        strncpy(peer_fg_buf, file_content, 8);
-                        peer_fg_buf[8] = '\0';
-                        const char *obf_pub = file_content + 8;
-                        deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
-                        if (!deobf_pub) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] deobfuscation failed!\n", db_policy_id, resolved_peer_pub_path);
-                            valid = false;
-                        }
-                    }
-                }
-                fclose(fp_pub);
-            }
+            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key [%s] NOT found in HashiCorp Vault (remote_public)!\n",
+                    db_policy_id, peer_pub_path ? peer_pub_path : "N/A");
+            valid = false;
         }
 
         int role_mode = PQC_USE_DYNAMIC_ROLE ? PQC_ROLE_DYNAMIC : PQC_ROLE_RESPONDER;
@@ -1889,6 +1785,8 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
             sig_pqc_write_log(db_policy_id, key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
         }
+        if (found_priv) { free(found_priv); found_priv = NULL; }
+        if (found_pub) { free(found_pub); found_pub = NULL; }
         if (deobf_pub) free(deobf_pub);
     } else {
         fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);

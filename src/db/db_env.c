@@ -1,4 +1,5 @@
 #include "../../inc/db/db_env.h"
+#include "../../inc/db/vault.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -6,92 +7,10 @@
 #include <stdio.h>
 #include <unistd.h>
 
-static int ne_env_key_allowed(const char *key) {
-    static const char *allowed[] = {
-        "POSTGRES_SERVER",
-        "POSTGRES_HOST",
-        "POSTGRES_PORT",
-        "POSTGRES_USER",
-        "POSTGRES_DB",
-        "POSTGRES_PASSWORD",
-        NULL
-    };
-    if (!key || !key[0])
-        return 0;
-    for (int i = 0; allowed[i]; i++) {
-        if (strcmp(key, allowed[i]) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-static void strip_env_quotes(char *val) {
-    size_t len = strlen(val);
-    if (len >= 2 && val[0] == '"' && val[len - 1] == '"') {
-        val[len - 1] = '\0';
-        memmove(val, val + 1, len - 1);
-        return;
-    }
-    if (len >= 2 && val[0] == '\'' && val[len - 1] == '\'') {
-        val[len - 1] = '\0';
-        memmove(val, val + 1, len - 1);
-    }
-}
-
 static void ne_sync_pgpassword(void) {
     const char *pass = getenv("POSTGRES_PASSWORD");
     if (pass && pass[0])
         setenv("PGPASSWORD", pass, 1);
-}
-
-static int ne_load_env_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[ENV] Could not open: %s\n", path);
-        return -1;
-    }
-
-    fprintf(stderr, "[ENV] loading POSTGRES_* from %s\n", path);
-
-    char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '\0' || *p == '\n' || *p == '#')
-            continue;
-        if (strncmp(p, "POSTGRES_", 9) != 0)
-            continue;
-
-        char *eq = strchr(p, '=');
-        if (!eq)
-            continue;
-
-        *eq = '\0';
-        char *key = p;
-        char *val = eq + 1;
-
-        char *end = key + strlen(key) - 1;
-        while (end > key && (*end == ' ' || *end == '\t'))
-            *end-- = '\0';
-
-        while (*val == ' ' || *val == '\t')
-            val++;
-
-        size_t len = strlen(val);
-        while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '\r')) {
-            val[--len] = '\0';
-        }
-
-        strip_env_quotes(val);
-
-        if (*key && *val && ne_env_key_allowed(key))
-            setenv(key, val, 1);
-    }
-
-    fclose(f);
-    ne_sync_pgpassword();
-    return 0;
 }
 
 int load_ne_env(void) {
@@ -99,7 +18,24 @@ int load_ne_env(void) {
         fprintf(stderr, "[ENV] Missing or unreadable: " NE_ENV_FILE "\n");
         return -1;
     }
-    return ne_load_env_file(NE_ENV_FILE);
+
+    fprintf(stderr,
+            "[ENV] " NE_ENV_FILE " holds VAULT config only; "
+            "POSTGRES_* come from Vault " NE_VAULT_SECRET_PATH "\n");
+
+    if (ne_vault_unseal_and_login() != 0) {
+        fprintf(stderr, "[ENV] Vault unseal/login failed\n");
+        return -1;
+    }
+
+    if (ne_vault_load_secrets() != 0) {
+        fprintf(stderr, "[ENV] Failed to load secrets from Vault\n");
+        return -1;
+    }
+
+    ne_sync_pgpassword();
+    fprintf(stderr, "[ENV] POSTGRES_* ready (from Vault " NE_VAULT_SECRET_PATH ")\n");
+    return 0;
 }
 
 int ne_postgres_conn_fill(struct ne_postgres_conn *out) {
@@ -119,7 +55,8 @@ int ne_postgres_conn_fill(struct ne_postgres_conn *out) {
     if (!host || !host[0] || !port || !port[0] || !user || !user[0] ||
         !dbname || !dbname[0] || !pass || !pass[0]) {
         fprintf(stderr,
-                "[DB] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
+                "[DB] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD "
+                "(expected in Vault " NE_VAULT_SECRET_PATH ")\n");
         return -1;
     }
 
