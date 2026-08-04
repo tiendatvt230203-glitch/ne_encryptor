@@ -1,6 +1,7 @@
 #include "xsk_pair.h"
 
 #include <bpf/bpf.h>
+#include <dirent.h>
 #include <errno.h>
 #include <linux/if_xdp.h>
 #include <net/if.h>
@@ -57,9 +58,16 @@ void *mtu9k_pkt_data(struct mtu9k_pair *p, uint64_t addr)
 
 static void kick_tx(struct mtu9k_queue *q)
 {
-    if (!xsk_ring_prod__needs_wakeup(&q->tx))
+    if (!q->xsk || !xsk_ring_prod__needs_wakeup(&q->tx))
         return;
     sendto(xsk_socket__fd(q->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+}
+
+static void kick_fq(struct mtu9k_queue *q)
+{
+    if (!q->xsk || !xsk_ring_prod__needs_wakeup(&q->fq))
+        return;
+    recvfrom(xsk_socket__fd(q->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
 static void refill_fq(struct mtu9k_pair *p, struct mtu9k_queue *q, uint32_t want)
@@ -83,34 +91,65 @@ static void refill_fq(struct mtu9k_pair *p, struct mtu9k_queue *q, uint32_t want
         if (reserved != got) {
             for (uint32_t i = 0; i < got; i++)
                 pool_push(p, addrs[i]);
+            kick_fq(q);
             return;
         }
         for (uint32_t i = 0; i < got; i++)
             *xsk_ring_prod__fill_addr(&q->fq, idx + i) = addrs[i];
         xsk_ring_prod__submit(&q->fq, got);
+        kick_fq(q);
         want -= got;
     }
 }
 
-void mtu9k_recycle(struct mtu9k_pair *p, struct mtu9k_iface *iface)
+static int iface_queue_count(const char *ifname)
 {
-    struct mtu9k_queue *q = &iface->q;
-    uint32_t idx = 0;
-    uint32_t n = xsk_ring_cons__peek(&q->cq, NE_BATCH, &idx);
+    char path[256];
+    DIR *dir;
+    struct dirent *ent;
+    int count = 0;
 
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t addr = *xsk_ring_cons__comp_addr(&q->cq, idx + i);
-        pool_push(p, addr);
+    snprintf(path, sizeof(path), "/sys/class/net/%s/queues", ifname);
+    dir = opendir(path);
+    if (!dir)
+        return 1;
+
+    while ((ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "rx-", 3) == 0)
+            count++;
     }
-    if (n)
-        xsk_ring_cons__release(&q->cq, n);
-    refill_fq(p, q, NE_FQ_PREFILL);
+    closedir(dir);
+    if (count < 1)
+        count = 1;
+    if (count > NE_MAX_QUEUES)
+        count = NE_MAX_QUEUES;
+    return count;
 }
 
-int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-                 uint8_t *out, uint32_t out_cap, uint32_t *out_len)
+void mtu9k_recycle(struct mtu9k_pair *p, struct mtu9k_iface *iface)
 {
-    struct mtu9k_queue *q = &iface->q;
+    for (int qi = 0; qi < iface->queue_count; qi++) {
+        struct mtu9k_queue *q = &iface->queues[qi];
+        uint32_t idx = 0;
+        uint32_t n;
+
+        if (!q->xsk)
+            continue;
+
+        n = xsk_ring_cons__peek(&q->cq, NE_BATCH, &idx);
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t addr = *xsk_ring_cons__comp_addr(&q->cq, idx + i);
+            pool_push(p, addr);
+        }
+        if (n)
+            xsk_ring_cons__release(&q->cq, n);
+        refill_fq(p, q, NE_FQ_PREFILL);
+    }
+}
+
+static int rx_one_queue(struct mtu9k_pair *p, struct mtu9k_queue *q,
+                       uint8_t *out, uint32_t out_cap, uint32_t *out_len)
+{
     uint32_t idx = 0;
     uint32_t n;
     uint32_t total = 0;
@@ -151,24 +190,43 @@ int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
         }
     }
 
-    /* Peeked batch ended mid-packet — drop (kernel should deliver complete pkts) */
     for (uint32_t j = 0; j < frags; j++)
         pool_push(p, addrs[j]);
     xsk_ring_cons__release(&q->rx, n);
     return -1;
 }
 
-int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
-                 const uint8_t *data, uint32_t len)
+int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 uint8_t *out, uint32_t out_cap, uint32_t *out_len)
 {
-    struct mtu9k_queue *q = &iface->q;
+    int nq = iface->queue_count;
+
+    if (nq <= 0)
+        return 0;
+
+    for (int i = 0; i < nq; i++) {
+        int qi = (iface->rx_cursor + i) % nq;
+        struct mtu9k_queue *q = &iface->queues[qi];
+        int r;
+
+        if (!q->xsk)
+            continue;
+        r = rx_one_queue(p, q, out, out_cap, out_len);
+        if (r != 0) {
+            iface->rx_cursor = (qi + 1) % nq;
+            return r;
+        }
+    }
+    return 0;
+}
+
+static int tx_one_queue(struct mtu9k_pair *p, struct mtu9k_queue *q,
+                       const uint8_t *data, uint32_t len)
+{
     uint32_t nfrag;
     uint32_t idx = 0;
     uint64_t addrs[NE_MAX_FRAGS];
     uint32_t off = 0;
-
-    if (!data || len == 0 || len > NE_PKT_MAX)
-        return -1;
 
     nfrag = (len + p->frame_size - 1) / p->frame_size;
     if (nfrag == 0 || nfrag > NE_MAX_FRAGS)
@@ -185,6 +243,7 @@ int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
     if (xsk_ring_prod__reserve(&q->tx, nfrag, &idx) != nfrag) {
         for (uint32_t i = 0; i < nfrag; i++)
             pool_push(p, addrs[i]);
+        kick_tx(q);
         return -1;
     }
 
@@ -205,6 +264,28 @@ int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
     xsk_ring_prod__submit(&q->tx, nfrag);
     kick_tx(q);
     return 0;
+}
+
+int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                 const uint8_t *data, uint32_t len)
+{
+    int nq = iface->queue_count;
+
+    if (!data || len == 0 || len > NE_PKT_MAX || nq <= 0)
+        return -1;
+
+    for (int i = 0; i < nq; i++) {
+        int qi = (iface->tx_cursor + i) % nq;
+        struct mtu9k_queue *q = &iface->queues[qi];
+
+        if (!q->xsk)
+            continue;
+        if (tx_one_queue(p, q, data, len) == 0) {
+            iface->tx_cursor = (qi + 1) % nq;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static int load_attach_bpf(struct mtu9k_iface *iface, const char *obj_path,
@@ -250,15 +331,28 @@ static int load_attach_bpf(struct mtu9k_iface *iface, const char *obj_path,
     return 0;
 }
 
-static int update_xskmap(struct mtu9k_iface *iface, int queue_id)
+static int update_xskmap_iface(struct mtu9k_iface *iface)
 {
-    int fd = xsk_socket__fd(iface->q.xsk);
-    int key = queue_id;
-    int err = bpf_map_update_elem(iface->xskmap_fd, &key, &fd, 0);
-    if (err) {
-        fprintf(stderr, "[BPF] xskmap update %s q=%d failed: %s\n",
-                iface->ifname, queue_id, strerror(errno));
-        return -1;
+    for (int q = 0; q < iface->queue_count; q++) {
+        int fd;
+        int key = q;
+        int err;
+
+        if (!iface->queues[q].xsk) {
+            fprintf(stderr, "[BPF] xskmap %s q=%d: no socket\n",
+                    iface->ifname, q);
+            return -1;
+        }
+        fd = xsk_socket__fd(iface->queues[q].xsk);
+        if (xsk_socket__update_xskmap(iface->queues[q].xsk,
+                                      iface->xskmap_fd) == 0)
+            continue;
+        err = bpf_map_update_elem(iface->xskmap_fd, &key, &fd, 0);
+        if (err) {
+            fprintf(stderr, "[BPF] xskmap update %s q=%d failed: %s\n",
+                    iface->ifname, q, strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
@@ -282,30 +376,29 @@ static int read_iface_mac(const char *ifname, uint8_t mac[6])
     return 0;
 }
 
-static void force_one_rx_queue(const char *ifname)
+static void close_iface_queues(struct mtu9k_iface *iface, int opened)
 {
-    char cmd[160];
-
-    snprintf(cmd, sizeof(cmd),
-             "ethtool -L %s combined 1 >/dev/null 2>&1 || "
-             "ethtool -L %s rx 1 tx 1 >/dev/null 2>&1",
-             ifname, ifname);
-    (void)system(cmd);
+    for (int q = 0; q < opened; q++) {
+        if (iface->queues[q].xsk) {
+            xsk_socket__delete(iface->queues[q].xsk);
+            iface->queues[q].xsk = NULL;
+        }
+    }
+    iface->queue_count = 0;
 }
 
-static int open_queue(struct mtu9k_pair *p, struct mtu9k_iface *iface, const char *ifname)
+static int open_iface_queues(struct mtu9k_pair *p, struct mtu9k_iface *iface,
+                             const char *ifname)
 {
     struct xsk_socket_config cfg = {
         .rx_size = NE_RING,
         .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = XDP_FLAGS_DRV_MODE,
-        /* XDP_USE_SG: allow packets larger than frame_size via multi-buffer */
         .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP | XDP_USE_SG,
     };
-    int ret;
-
-    force_one_rx_queue(ifname);
+    int nq;
+    int q;
 
     iface->ifindex = (int)if_nametoindex(ifname);
     if (!iface->ifindex) {
@@ -313,17 +406,31 @@ static int open_queue(struct mtu9k_pair *p, struct mtu9k_iface *iface, const cha
         return -1;
     }
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
+    iface->ifname[sizeof(iface->ifname) - 1] = '\0';
     if (read_iface_mac(ifname, iface->mac) != 0) {
         fprintf(stderr, "[XSK] cannot read MAC for %s\n", ifname);
         return -1;
     }
-    ret = xsk_socket__create_shared(&iface->q.xsk, ifname, 0, p->umem,
-                                    &iface->q.rx, &iface->q.tx,
-                                    &iface->q.fq, &iface->q.cq, &cfg);
-    if (ret) {
-        fprintf(stderr, "[XSK] create %s failed: %s (%d)\n",
-                ifname, strerror(-ret), ret);
-        return -1;
+
+    nq = iface_queue_count(ifname);
+    iface->queue_count = nq;
+    iface->rx_cursor = 0;
+    iface->tx_cursor = 0;
+    fprintf(stderr, "[XSK] %s: binding %d RX queue(s)\n", ifname, nq);
+
+    for (q = 0; q < nq; q++) {
+        int ret = xsk_socket__create_shared(&iface->queues[q].xsk, ifname,
+                                           (uint32_t)q, p->umem,
+                                           &iface->queues[q].rx,
+                                           &iface->queues[q].tx,
+                                           &iface->queues[q].fq,
+                                           &iface->queues[q].cq, &cfg);
+        if (ret) {
+            fprintf(stderr, "[XSK] create %s q=%d failed: %s (%d)\n",
+                    ifname, q, strerror(-ret), ret);
+            close_iface_queues(iface, q);
+            return -1;
+        }
     }
     return 0;
 }
@@ -334,10 +441,7 @@ static void detach_iface(struct mtu9k_iface *iface)
         bpf_xdp_detach(iface->ifindex, XDP_FLAGS_DRV_MODE, NULL);
         iface->xdp_on = 0;
     }
-    if (iface->q.xsk) {
-        xsk_socket__delete(iface->q.xsk);
-        iface->q.xsk = NULL;
-    }
+    close_iface_queues(iface, iface->queue_count);
     if (iface->bpf_obj) {
         bpf_object__close(iface->bpf_obj);
         iface->bpf_obj = NULL;
@@ -396,27 +500,31 @@ int mtu9k_pair_open(struct mtu9k_pair *p, const char *lan, const char *wan)
             bpf_xdp_detach((int)wi, XDP_FLAGS_DRV_MODE, NULL);
     }
 
-    if (open_queue(p, &p->lan, lan) != 0)
+    if (open_iface_queues(p, &p->lan, lan) != 0)
         goto fail;
-    if (open_queue(p, &p->wan, wan) != 0)
+    if (open_iface_queues(p, &p->wan, wan) != 0)
         goto fail;
 
-    refill_fq(p, &p->lan.q, NE_FQ_PREFILL);
-    refill_fq(p, &p->wan.q, NE_FQ_PREFILL);
+    for (int q = 0; q < p->lan.queue_count; q++)
+        refill_fq(p, &p->lan.queues[q], NE_FQ_PREFILL);
+    for (int q = 0; q < p->wan.queue_count; q++)
+        refill_fq(p, &p->wan.queues[q], NE_FQ_PREFILL);
 
     if (load_attach_bpf(&p->lan, "lib/lan.o", "xdp_redirect_prog", "xsks_map") != 0)
         goto fail;
-    if (load_attach_bpf(&p->wan, "lib/wan.o", "xdp_wan_redirect_prog", "wan_xsks_map") != 0)
+    if (load_attach_bpf(&p->wan, "lib/wan.o", "xdp_wan_redirect_prog",
+                        "wan_xsks_map") != 0)
         goto fail;
-    if (update_xskmap(&p->lan, 0) != 0)
+    if (update_xskmap_iface(&p->lan) != 0)
         goto fail;
-    if (update_xskmap(&p->wan, 0) != 0)
+    if (update_xskmap_iface(&p->wan) != 0)
         goto fail;
 
     fprintf(stderr,
-            "[XSK] ready 1xLAN=%s 1xWAN=%s frame=%u n_frames=%u umem=%.2f MiB "
-            "(queue0, XDP_USE_SG)\n",
-            lan, wan, p->frame_size, p->n_frames,
+            "[XSK] ready LAN=%s(q=%d) WAN=%s(q=%d) frame=%u n_frames=%u "
+            "umem=%.2f MiB (all queues mapped, XDP_USE_SG)\n",
+            lan, p->lan.queue_count, wan, p->wan.queue_count,
+            p->frame_size, p->n_frames,
             (double)p->bufsize / (1024.0 * 1024.0));
     return 0;
 

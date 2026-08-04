@@ -51,8 +51,10 @@ static const uint8_t HARD_AAD[8] = {
 #define NE_N_FRAMES   65536u /* 256 MiB UMEM */
 #define NE_RING       8192u
 #define NE_BATCH      64u
-#define NE_FQ_PREFILL 4096u
+/* Per-queue FQ depth — keep modest so LAN+WAN*N queues fit in UMEM */
+#define NE_FQ_PREFILL 1024u
 #define NE_MAX_FRAGS  8u     /* 8 x 4K covers NE_PKT_MAX */
+#define NE_MAX_QUEUES 64     /* match production MAX_QUEUES / xskmap */
 
 #ifndef XDP_FLAGS_DRV_MODE
 #define XDP_FLAGS_DRV_MODE (1U << 2)

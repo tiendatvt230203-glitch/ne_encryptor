@@ -19,7 +19,10 @@ struct mtu9k_iface {
     char ifname[16];
     int ifindex;
     uint8_t mac[6];
-    struct mtu9k_queue q;
+    int queue_count;
+    int rx_cursor;
+    int tx_cursor;
+    struct mtu9k_queue queues[NE_MAX_QUEUES];
     struct bpf_object *bpf_obj;
     int xskmap_fd;
     int xdp_on;
@@ -48,6 +51,7 @@ void *mtu9k_pkt_data(struct mtu9k_pair *p, uint64_t addr);
 
 /*
  * RX one logical packet (may span several UMEM frames via XDP_PKT_CONTD).
+ * Polls all iface queues round-robin.
  * Copies into out[], returns length via *out_len, frees RX frames.
  * Returns 1 on packet, 0 if no complete packet available, -1 on drop/error.
  */
@@ -56,7 +60,7 @@ int mtu9k_rx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
 
 /*
  * TX one logical packet: scatter into UMEM frames, XDP_PKT_CONTD on all
- * but the last descriptor.
+ * but the last descriptor. Picks a free TX queue round-robin.
  */
 int mtu9k_tx_pkt(struct mtu9k_pair *p, struct mtu9k_iface *iface,
                  const uint8_t *data, uint32_t len);

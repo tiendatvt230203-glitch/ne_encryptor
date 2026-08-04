@@ -6,10 +6,9 @@
 
 #define ETH_P_ARP_VAL 0x0806
 
-/* Exactly one LAN XSK (queue 0) — no multi-queue fan-in */
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
-    __uint(max_entries, 1);
+    __uint(max_entries, 64);
     __type(key, __u32);
     __type(value, __u32);
 } xsks_map SEC(".maps");
@@ -21,7 +20,6 @@ int xdp_redirect_prog(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     struct ethhdr *eth = data;
-    __u32 q0 = 0;
 
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
@@ -33,7 +31,7 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
-        return bpf_redirect_map(&xsks_map, q0, 0);
+        return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
     }
 
     return XDP_PASS;

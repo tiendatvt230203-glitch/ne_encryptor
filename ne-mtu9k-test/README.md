@@ -1,7 +1,11 @@
 # MTU / jumbo feasibility test (L2 PQC pure)
 
-AF_XDP forwarder: **1 LAN + 1 WAN**, **1 queue**, **1 core**.
+AF_XDP forwarder: **1 LAN + 1 WAN**, **all HW RX queues mapped** (like production), **1 core**.
 Goal: see if ~8K–9K frames pass with **pure PQC traffic crypto** (no wire metadata).
+
+Does **not** force `ethtool -L … 1` (often `device resource busy`). Reads queue
+count from `/sys/class/net/<if>/queues`, binds one XSK per queue, BPF redirects
+with `ctx->rx_queue_index`.
 
 ## Hard limit (important)
 
