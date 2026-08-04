@@ -7,12 +7,10 @@
 #define IF_LAN "eno1"
 #define IF_WAN "eno3"
 
-/* Far-end MAC only. Local iface MACs come from the NIC. */
-#define REMOTE_MAC { 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 }
-
 /*
  * 1 = L2 PQC (fake ethertype 0x104A + in-place crypto)
  * 0 = bypass forward
+ * Pure L2 bridge: eth dst/src MACs are never rewritten.
  */
 #ifndef MODE_L2_PQC
 #define MODE_L2_PQC 1

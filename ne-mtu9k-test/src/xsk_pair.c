@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -357,25 +356,6 @@ static int update_xskmap_iface(struct mtu9k_iface *iface)
     return 0;
 }
 
-static int read_iface_mac(const char *ifname, uint8_t mac[6])
-{
-    int fd;
-    struct ifreq ifr;
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
-    return 0;
-}
-
 static void close_iface_queues(struct mtu9k_iface *iface, int opened)
 {
     for (int q = 0; q < opened; q++) {
@@ -407,10 +387,6 @@ static int open_iface_queues(struct mtu9k_pair *p, struct mtu9k_iface *iface,
     }
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
     iface->ifname[sizeof(iface->ifname) - 1] = '\0';
-    if (read_iface_mac(ifname, iface->mac) != 0) {
-        fprintf(stderr, "[XSK] cannot read MAC for %s\n", ifname);
-        return -1;
-    }
 
     nq = iface_queue_count(ifname);
     iface->queue_count = nq;

@@ -18,7 +18,6 @@ struct mtu9k_queue {
 struct mtu9k_iface {
     char ifname[16];
     int ifindex;
-    uint8_t mac[6];
     int queue_count;
     int rx_cursor;
     int tx_cursor;

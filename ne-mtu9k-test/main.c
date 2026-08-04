@@ -5,7 +5,6 @@
 #include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop;
@@ -16,36 +15,20 @@ static void on_stop(int sig)
     g_stop = 1;
 }
 
-static void set_eth_macs(uint8_t *pkt, const uint8_t dst[6], const uint8_t src[6])
-{
-    memcpy(pkt + 0, dst, 6);
-    memcpy(pkt + 6, src, 6);
-}
-
+/* Pure L2: keep original eth dst/src; only encrypt/decrypt + forward. */
 static void process_lan_to_wan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
 {
-    static const uint8_t remote[6] = REMOTE_MAC;
-
 #if MODE_L2_PQC
-    int nlen;
-#endif
-
-    set_eth_macs(pkt, remote, p->wan.mac);
-
-#if MODE_L2_PQC
-    nlen = l2_encrypt(pkt, len, NE_PKT_MAX);
+    int nlen = l2_encrypt(pkt, len, NE_PKT_MAX);
     if (nlen < 0)
         return;
     len = (uint32_t)nlen;
 #endif
-
     (void)mtu9k_tx_pkt(p, &p->wan, pkt, len);
 }
 
 static void process_wan_to_lan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
 {
-    static const uint8_t remote[6] = REMOTE_MAC;
-
 #if MODE_L2_PQC
     if (l2_has_enc_marker(pkt, len)) {
         int nlen = l2_decrypt(pkt, len);
@@ -54,8 +37,6 @@ static void process_wan_to_lan(struct mtu9k_pair *p, uint8_t *pkt, uint32_t len)
         len = (uint32_t)nlen;
     }
 #endif
-
-    set_eth_macs(pkt, remote, p->lan.mac);
     (void)mtu9k_tx_pkt(p, &p->lan, pkt, len);
 }
 

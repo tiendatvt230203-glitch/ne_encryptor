@@ -31,8 +31,7 @@ Jumbo is done via **multi-buffer**:
 | Macro | Meaning |
 |-------|---------|
 | `IF_LAN` / `IF_WAN` | Interface names |
-| `REMOTE_MAC` | Far-end MAC |
-| `MODE_L2_PQC` | `1` crypto, `0` bypass |
+| `MODE_L2_PQC` | `1` crypto, `0` bypass (MACs never rewritten) |
 | `NE_FRAME` | **4096** (PAGE_SIZE ceiling) |
 | `NE_PKT_MAX` | 16384 contiguous packet buffer |
 | `NE_N_FRAMES` | 65536 (~256 MiB UMEM) |
