@@ -23,6 +23,10 @@
 typedef struct cfm_link {
     pthread_mutex_t lock;
     uint64_t last_recv_time;
+    uint64_t rx_any;
+    uint64_t rx_short;
+    uint64_t rx_not_cfm;
+    uint64_t rx_bad_ccm;
     uint64_t rx_peer_ccm;
     uint64_t rx_own_skip;
     int ifindex;
@@ -146,15 +150,17 @@ static void *cfm_monitor_thread(void *arg) {
         // Poll raw sockets for incoming CFM frames with 10ms timeout
         int ret = poll(fds, active_fds, 10);
         if (ret > 0) {
-            uint64_t now = get_time_ms();
             for (int i = 0; i < active_fds; i++) {
                 if (!(fds[i].revents & POLLIN))
                     continue;
 
-                /* Drain all pending CFM frames (tcpdump-like). */
+                /* Drain pending frames; parse as raw bytes (không phụ thuộc overlay struct). */
                 for (;;) {
-                    cfm_ccm_packet_t rx_pkt;
-                    ssize_t rx_bytes = recv(fds[i].fd, &rx_pkt, sizeof(rx_pkt), 0);
+                    uint8_t buf[2048];
+                    ssize_t rx_bytes = recv(fds[i].fd, buf, sizeof(buf), 0);
+                    uint16_t eth_type;
+                    const uint8_t *src_mac;
+                    const uint8_t *cfm;
                     uint8_t lvl;
                     uint8_t op;
                     uint16_t rx_mep_id;
@@ -162,55 +168,90 @@ static void *cfm_monitor_thread(void *arg) {
 
                     if (rx_bytes < 0)
                         break;
-                    if (rx_bytes < (ssize_t)(sizeof(eth_hdr_t) + sizeof(cfm_ccm_hdr_t)))
-                        continue;
-                    if (ntohs(rx_pkt.eth.eth_type) != ETH_P_CFM)
-                        continue;
-
-                    lvl = (rx_pkt.ccm.md_lvl_version >> 5) & 0x07;
-                    op = rx_pkt.ccm.opcode;
-                    if (lvl != 5 || op != CFM_OPCODE_CCM)
-                        continue;
-
-                    rx_mep_id = ntohs(rx_pkt.ccm.mep_id);
 
                     for (j = 0; j < g_link_count; j++) {
-                        bool old_up;
-
-                        if (g_links[j].sock_fd != fds[i].fd)
-                            continue;
-
-                        /* Never learn our own CCM (TX loopback). */
-                        if (memcmp(rx_pkt.eth.src_mac, g_links[j].local_mac, 6) == 0) {
-                            pthread_mutex_lock(&g_links[j].lock);
-                            g_links[j].rx_own_skip++;
-                            pthread_mutex_unlock(&g_links[j].lock);
+                        if (g_links[j].sock_fd == fds[i].fd)
                             break;
-                        }
+                    }
+                    if (j >= g_link_count)
+                        continue;
+
+                    pthread_mutex_lock(&g_links[j].lock);
+                    g_links[j].rx_any++;
+                    pthread_mutex_unlock(&g_links[j].lock);
+
+                    if (rx_bytes < 14 + 4) {
+                        pthread_mutex_lock(&g_links[j].lock);
+                        g_links[j].rx_short++;
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        continue;
+                    }
+
+                    eth_type = ((uint16_t)buf[12] << 8) | buf[13];
+                    if (eth_type != ETH_P_CFM) {
+                        pthread_mutex_lock(&g_links[j].lock);
+                        g_links[j].rx_not_cfm++;
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        continue;
+                    }
+
+                    if (rx_bytes < 14 + 8) {
+                        pthread_mutex_lock(&g_links[j].lock);
+                        g_links[j].rx_short++;
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        continue;
+                    }
+
+                    src_mac = buf + 6;
+                    cfm = buf + 14;
+                    lvl = (cfm[0] >> 5) & 0x07;
+                    op = cfm[1];
+                    if (lvl != 5 || op != CFM_OPCODE_CCM) {
+                        pthread_mutex_lock(&g_links[j].lock);
+                        g_links[j].rx_bad_ccm++;
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        continue;
+                    }
+
+                    rx_mep_id = ((uint16_t)cfm[6] << 8) | cfm[7];
+
+                    /* Never learn our own CCM (TX loopback). */
+                    if (memcmp(src_mac, g_links[j].local_mac, 6) == 0) {
+                        pthread_mutex_lock(&g_links[j].lock);
+                        g_links[j].rx_own_skip++;
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        continue;
+                    }
+
+                    {
+                        bool old_up;
+                        uint64_t now = get_time_ms();
 
                         pthread_mutex_lock(&g_links[j].lock);
                         old_up = g_links[j].is_up;
                         if (!g_links[j].mac_learned) {
-                            memcpy(g_links[j].remote_mac, rx_pkt.eth.src_mac, 6);
+                            memcpy(g_links[j].remote_mac, src_mac, 6);
                             g_links[j].remote_mep_id = rx_mep_id;
                             g_links[j].mac_learned = true;
                             g_links[j].is_up = true;
                             g_links[j].last_recv_time = now;
                             g_links[j].rx_peer_ccm++;
-                            printf("[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x and MEP %d on %s\n",
-                                   g_links[j].remote_mac[0], g_links[j].remote_mac[1], g_links[j].remote_mac[2],
-                                   g_links[j].remote_mac[3], g_links[j].remote_mac[4], g_links[j].remote_mac[5],
-                                   g_links[j].remote_mep_id, g_links[j].ifname);
-                            fflush(stdout);
+                            fprintf(stderr,
+                                    "[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x "
+                                    "and MEP %d on %s\n",
+                                    g_links[j].remote_mac[0], g_links[j].remote_mac[1],
+                                    g_links[j].remote_mac[2], g_links[j].remote_mac[3],
+                                    g_links[j].remote_mac[4], g_links[j].remote_mac[5],
+                                    g_links[j].remote_mep_id, g_links[j].ifname);
+                            fflush(stderr);
                         } else if (rx_mep_id == g_links[j].remote_mep_id &&
-                                   memcmp(rx_pkt.eth.src_mac, g_links[j].remote_mac, 6) == 0) {
+                                   memcmp(src_mac, g_links[j].remote_mac, 6) == 0) {
                             g_links[j].last_recv_time = now;
                             g_links[j].is_up = true;
                             g_links[j].rx_peer_ccm++;
                         }
                         pthread_mutex_unlock(&g_links[j].lock);
                         notify_is_up(&g_links[j], old_up);
-                        break;
                     }
                 }
             }
@@ -253,11 +294,20 @@ static void *cfm_monitor_thread(void *arg) {
                 pthread_mutex_lock(&g_links[i].lock);
                 if (!g_links[i].mac_learned) {
                     fprintf(stderr,
-                            "[CFM] %s: chưa học MAC đầu xa "
-                            "(rx_peer=%llu rx_own_skip=%llu) — đang gửi mồi multicast\n",
+                            "[CFM] %s: chưa học MAC | "
+                            "rx_any=%llu short=%llu not_cfm=%llu bad_ccm=%llu "
+                            "own_skip=%llu peer=%llu "
+                            "local=%02x:%02x:%02x:%02x:%02x:%02x\n",
                             g_links[i].ifname,
+                            (unsigned long long)g_links[i].rx_any,
+                            (unsigned long long)g_links[i].rx_short,
+                            (unsigned long long)g_links[i].rx_not_cfm,
+                            (unsigned long long)g_links[i].rx_bad_ccm,
+                            (unsigned long long)g_links[i].rx_own_skip,
                             (unsigned long long)g_links[i].rx_peer_ccm,
-                            (unsigned long long)g_links[i].rx_own_skip);
+                            g_links[i].local_mac[0], g_links[i].local_mac[1],
+                            g_links[i].local_mac[2], g_links[i].local_mac[3],
+                            g_links[i].local_mac[4], g_links[i].local_mac[5]);
                     fflush(stderr);
                 }
                 pthread_mutex_unlock(&g_links[i].lock);
@@ -303,7 +353,7 @@ int cfm_init(const struct app_config *cfg) {
             continue;
         }
 
-        int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_CFM));
+        int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (sock < 0) {
             fprintf(stderr, "[CFM-INIT] Error: Cannot create raw socket for %s: %s\n", wan->ifname, strerror(errno));
             continue;
@@ -314,7 +364,7 @@ int cfm_init(const struct app_config *cfg) {
         memset(&sll, 0, sizeof(sll));
         sll.sll_family = AF_PACKET;
         sll.sll_ifindex = ifindex;
-        sll.sll_protocol = htons(ETH_P_CFM);
+        sll.sll_protocol = htons(ETH_P_ALL);
         if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
             fprintf(stderr, "[CFM-INIT] Error: Cannot bind raw socket to %s: %s\n", wan->ifname, strerror(errno));
             close(sock);

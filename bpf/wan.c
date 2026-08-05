@@ -39,6 +39,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
     __u16 proto = eth->h_proto;
 
+    /* CFM failover — luôn vào kernel stack cho AF_PACKET raw socket. */
     if (proto == __constant_htons(ETH_P_CFM))
         return XDP_PASS;
 

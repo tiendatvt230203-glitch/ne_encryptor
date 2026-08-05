@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define ETH_P_CFM 0x8902
+#define ETH_P_ALL 0x0003
 #define CFM_OPCODE_CCM 1
 #define CFM_MULTICAST_MAC "\x01\x80\xC2\x00\x00\x35" // Level 5 Multicast MAC
 
