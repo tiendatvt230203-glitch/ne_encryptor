@@ -36,7 +36,7 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
-    if (l1 == 0 || l2 == 0 || l1 > NE_PKT_MAX || l2 > NE_PKT_MAX) {
+    if (l1 == 0 || l2 == 0 || l1 > fwd->pair.frame_size || l2 > fwd->pair.frame_size) {
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
@@ -60,20 +60,13 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
 static int split_tail_take(struct forwarder *fwd, int worker_idx, uint64_t *addr_out)
 {
     uint32_t got;
-    uint32_t i;
 
     if (!fwd || !addr_out || worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
         return -1;
 
     if (fwd->split_tail_count[worker_idx] == 0) {
-        /* UDP crypto frags can be up to wire MTU (~9000); need jumbo slots. */
-        got = 0;
-        for (i = 0; i < SPLIT_TAIL_REFILL_BATCH; i++) {
-            if (ne_jumbo_frame_alloc(&fwd->pair,
-                                    &fwd->split_tail_cache[worker_idx][got]) != 0)
-                break;
-            got++;
-        }
+        got = ne_frame_alloc_batch(&fwd->pair, fwd->split_tail_cache[worker_idx],
+                                   SPLIT_TAIL_REFILL_BATCH);
         if (got == 0)
             return -1;
         fwd->split_tail_count[worker_idx] = (uint16_t)got;
@@ -103,8 +96,8 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
         if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
             return -1;
         tail_buf = ne_packet_data(&fwd->pair, tail.addr);
-        if (crypto_option_split(opt_id, pclass, pctx, pkt, len, NE_PKT_MAX, &l1,
-                                tail_buf, NE_PKT_MAX, &l2) != 0) {
+        if (crypto_option_split(opt_id, pclass, pctx, pkt, len, fwd->pair.frame_size, &l1,
+                                tail_buf, fwd->pair.frame_size, &l2) != 0) {
             ne_frame_free(&fwd->pair, tail.addr);
             return -1;
         }
@@ -207,7 +200,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
     if (proto == IPPROTO_TCP) {
         crypto_option_id opt = crypto_option_from_policy(cp);
-        (void)crypto_tcp_clamp_mss(pkt, job.len, crypto_option_get_mtu(),
+        (void)crypto_tcp_clamp_mss(pkt, job.len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
                                    crypto_option_wire_overhead(opt));
     }
 

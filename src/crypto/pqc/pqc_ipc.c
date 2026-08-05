@@ -11,8 +11,7 @@
 #include "pqc_handshake.h"
 #include "traffic_crypto.h"
 #include "pqc_vault.h"
-
-#define IPC_SOCKET_PATH "/var/run/test_network-encryptor.sock"
+#define IPC_SOCKET_PATH "/var/run/pqc_network-encryptor.sock"
 
 static void *ipc_listener_thread_main(void *arg) {
     (void)arg;
@@ -84,53 +83,42 @@ void sig_pqc_start_ipc_server(void) {
     pthread_detach(ipc_thread);
 }
 
-static int run_ipc_client(int policy_id) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Error: Daemon is not running (failed to connect to socket %s)\n", IPC_SOCKET_PATH);
-        close(fd);
-        return 1;
-    }
-
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "RETRY %d\n", policy_id);
-    if (write(fd, cmd, strlen(cmd)) < 0) {
-        perror("write");
-        close(fd);
-        return 1;
-    }
-
-    char resp[128];
-    memset(resp, 0, sizeof(resp));
-    int n = read(fd, resp, sizeof(resp) - 1);
-    if (n > 0) {
-        printf("%s", resp);
-    } else {
-        fprintf(stderr, "Error: No response from daemon\n");
-    }
-
-    close(fd);
-    return 0;
-}
-
 int sig_pqc_handle_ipc_cli(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
-            int retry_policy_id = atoi(argv[i + 1]);
-            return run_ipc_client(retry_policy_id);
+    if (argc >= 3 && (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "--retry-policy") == 0)) {
+        int policy_id = atoi(argv[2]);
+        int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (client_fd < 0) {
+            perror("[PQC-CLI] Failed to create socket");
+            return -1;
         }
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+        if (connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("[PQC-CLI] Failed to connect to IPC server");
+            close(client_fd);
+            return -1;
+        }
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "RETRY %d\n", policy_id);
+        write(client_fd, msg, strlen(msg));
+
+        char resp[256];
+        int n = read(client_fd, resp, sizeof(resp) - 1);
+        if (n > 0) {
+            resp[n] = '\0';
+            printf("[PQC-CLI] Server Response:\n%s\n", resp);
+        } else {
+            printf("[PQC-CLI] Sent retry trigger for Policy %d.\n", policy_id);
+        }
+        close(client_fd);
+        return 0;
     }
-    return -1; // Not handled
+    return -1;
 }
 
 void sig_pqc_cleanup_ipc(void) {
@@ -140,23 +128,26 @@ void sig_pqc_cleanup_ipc(void) {
 void sig_pqc_handle_gen_identity(void) {
     uint8_t dsa_pub[3000], dsa_priv[5000];
     int pub_sz, priv_sz;
-
+    
     trf_pqc_init_global();
 
     printf("[PQC-GI] Generating Manual Identity (Vault Only)...\n");
     if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
         char *b64_priv = malloc(priv_sz * 2);
         char *b64_pub = malloc(pub_sz * 2);
-
+        
         trf_base64_encode(dsa_priv, priv_sz, b64_priv);
         trf_base64_encode(dsa_pub, pub_sz, b64_pub);
 
+        // Calculate 8-char fingerprint (SHA256 of public key binary)
         uint8_t hash[64];
         trf_calculate_digest(DIGEST_TYPE_SHA256, dsa_pub, pub_sz, hash);
         char fingerprint[16];
-        for (int i = 0; i < 4; i++)
-            sprintf(fingerprint + i * 2, "%02x", hash[i]);
+        for (int i = 0; i < 4; i++) sprintf(fingerprint + i * 2, "%02x", hash[i]);
 
+        // printf("[PQC-GI] Success! Generated Fingerprint: %s\n", fingerprint);
+
+        // Export directly to HashiCorp Vault (Vault is the only persistent storage)
         char key_filename[64];
         snprintf(key_filename, sizeof(key_filename), "%s.key", fingerprint);
         sig_pqc_init_vault();
@@ -167,7 +158,7 @@ void sig_pqc_handle_gen_identity(void) {
         } else {
             fprintf(stderr, "[PQC-GI] WARNING: Failed to export identity [%s] to HashiCorp Vault.\n", fingerprint);
         }
-
+        
         free(b64_priv);
         free(b64_pub);
     } else {

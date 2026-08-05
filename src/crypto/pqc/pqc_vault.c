@@ -1,4 +1,4 @@
-#include "pqc_vault.h"
+#include "../include/pqc_vault.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

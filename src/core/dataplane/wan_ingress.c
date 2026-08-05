@@ -65,7 +65,7 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     const struct crypto_policy *cp;
     crypto_option_id opt;
     uint8_t wire_id = 0;
-    uint8_t scratch[NE_PKT_MAX];
+    uint8_t scratch[NE_FRAME];
     uint32_t orig_len;
 
     if (!pkt || !len)
@@ -81,7 +81,7 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
 
     orig_len = *len;
-    if (orig_len > NE_PKT_MAX)
+    if (orig_len > NE_FRAME)
         return -1;
     memcpy(scratch, pkt, orig_len);
 
@@ -192,7 +192,7 @@ static int reassemble_l4(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 
 static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
 {
-    uint8_t scratch[NE_PKT_MAX];
+    uint8_t scratch[8192];
     uint8_t *pkt = ne_packet_data(&fwd->pair, job->addr);
     uint32_t len = job->len;
     uint16_t pid = 0;
@@ -473,7 +473,7 @@ static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     }
     if (!best)
         return;
-    (void)crypto_tcp_clamp_mss(pkt, len, crypto_option_get_mtu(),
+    (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
                                crypto_option_wire_overhead(crypto_option_from_policy(best)));
 }
 
@@ -530,7 +530,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 {
     uint8_t *pkt = ne_packet_data(&fwd->pair, job.addr);
-    uint8_t wire_buf[NE_PKT_MAX];
+    uint8_t wire_buf[NE_FRAME];
     uint32_t wire_len;
     int dec;
     int encrypted;
@@ -539,7 +539,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     wire_len = job.len;
-    if (wire_len < 14u || wire_len > NE_PKT_MAX)
+    if (wire_len < 14u || wire_len > NE_FRAME)
         goto drop;
     memcpy(wire_buf, pkt, wire_len);
 

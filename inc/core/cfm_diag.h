@@ -14,10 +14,14 @@ typedef enum {
 typedef void (*cfm_link_state_cb)(int wan_dp, const char *ifname,
                                   int old_state, int new_state, void *user);
 
+/* Packet-Parser-ne failover API */
 int cfm_init(const struct app_config *cfg);
-bool cfm_is_link_up(int wan_dp);
+bool cfm_is_link_up(int wan_idx);
+int failover_select_wan(const struct app_config *cfg, int profile_idx, int initial_wan_idx);
+void cfm_cleanup(void);
+
+/* Thin wrappers kept for current tree callers (wan_failover.c) */
 int cfm_get_link_state(int wan_dp);
 void cfm_set_state_callback(cfm_link_state_cb cb, void *user);
-void cfm_cleanup(void);
 
 #endif

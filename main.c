@@ -14,7 +14,6 @@
 #include "config.h"
 #include "db_env.h"
 #include "db_runtime.h"
-#include "vault.h"
 #include "forwarder.h"
 #include "forwarder_reload.h"
 #include "interface.h"
@@ -915,6 +914,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
         return 1;
     }
+    sig_pqc_load_keys_from_disk();
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
@@ -968,8 +968,7 @@ int main(int argc, char **argv) {
     struct ne_postgres_conn pg;
     if (ne_postgres_conn_fill(&pg) != 0) {
         fprintf(stderr,
-                "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD "
-                "(expected in Vault " NE_VAULT_SECRET_PATH ")\n");
+                "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
         return 1;
     }
     signal(SIGTERM, handle_shutdown_signal);

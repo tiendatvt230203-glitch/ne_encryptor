@@ -25,6 +25,7 @@ struct {
 #define IPPROTO_OSPF_VAL 89
 #define IPPROTO_CUSTOM_VAL 99
 #define ETH_P_NE_ARP_ENC 0x1048
+#define ETH_P_CFM        0x8902
 
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
@@ -37,6 +38,9 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
 
     __u16 proto = eth->h_proto;
+
+    if (proto == __constant_htons(ETH_P_CFM))
+        return XDP_PASS;
 
     if (proto == __constant_htons(ETH_P_ARP)) {
         goto redirect;
