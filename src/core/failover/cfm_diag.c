@@ -46,6 +46,27 @@ static cfm_link_state_cb g_state_cb;
 static void *g_state_cb_user;
 static pthread_mutex_t g_cb_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void notify_is_up(cfm_link_t *link, bool old_up)
+{
+    cfm_link_state_cb cb;
+    void *user;
+    int old_state;
+    int new_state;
+
+    if (link->is_up == old_up)
+        return;
+
+    old_state = old_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
+    new_state = link->is_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
+
+    pthread_mutex_lock(&g_cb_lock);
+    cb = g_state_cb;
+    user = g_state_cb_user;
+    pthread_mutex_unlock(&g_cb_lock);
+    if (cb)
+        cb(-1, link->ifname, old_state, new_state, user);
+}
+
 static uint64_t get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -140,7 +161,9 @@ static void *cfm_monitor_thread(void *arg) {
                                 // Find corresponding link by socket
                                 for (int j = 0; j < g_link_count; j++) {
                                     if (g_links[j].sock_fd == fds[i].fd) {
+                                        bool old_up;
                                         pthread_mutex_lock(&g_links[j].lock);
+                                        old_up = g_links[j].is_up;
                                         if (!g_links[j].mac_learned) {
                                             // Learn peer's MAC and MEP ID dynamically
                                             memcpy(g_links[j].remote_mac, rx_pkt.eth.src_mac, 6);
@@ -162,6 +185,7 @@ static void *cfm_monitor_thread(void *arg) {
                                             }
                                         }
                                         pthread_mutex_unlock(&g_links[j].lock);
+                                        notify_is_up(&g_links[j], old_up);
                                         break;
                                     }
                                 }
@@ -177,11 +201,14 @@ static void *cfm_monitor_thread(void *arg) {
         if (now - last_tx_time >= CFM_INTERVAL_MS) {
             for (int i = 0; i < g_link_count; i++) {
                 if (g_links[i].sock_fd >= 0) {
+                    bool old_up;
+
                     // Send out heartbeat
                     send_ccm_packet(&g_links[i]);
 
                     // Evaluate health status
                     pthread_mutex_lock(&g_links[i].lock);
+                    old_up = g_links[i].is_up;
                     if (g_links[i].mac_learned) {
                         if (now - g_links[i].last_recv_time > CFM_TIMEOUT_MS) {
                             g_links[i].is_up = false;
@@ -191,6 +218,7 @@ static void *cfm_monitor_thread(void *arg) {
                         g_links[i].is_up = true;
                     }
                     pthread_mutex_unlock(&g_links[i].lock);
+                    notify_is_up(&g_links[i], old_up);
                 }
             }
             last_tx_time = now;
