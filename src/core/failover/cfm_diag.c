@@ -23,6 +23,8 @@
 typedef struct cfm_link {
     pthread_mutex_t lock;
     uint64_t last_recv_time;
+    uint64_t rx_peer_ccm;
+    uint64_t rx_own_skip;
     int ifindex;
     int sock_fd;
     int local_mep_id;
@@ -123,6 +125,7 @@ static void *cfm_monitor_thread(void *arg) {
     (void)arg;
     struct pollfd fds[MAX_INTERFACES];
     uint64_t last_tx_time = get_time_ms();
+    uint64_t last_wait_log = 0;
 
     while (g_cfm_running) {
         int active_fds = 0;
@@ -145,52 +148,69 @@ static void *cfm_monitor_thread(void *arg) {
         if (ret > 0) {
             uint64_t now = get_time_ms();
             for (int i = 0; i < active_fds; i++) {
-                if (fds[i].revents & POLLIN) {
+                if (!(fds[i].revents & POLLIN))
+                    continue;
+
+                /* Drain all pending CFM frames (tcpdump-like). */
+                for (;;) {
                     cfm_ccm_packet_t rx_pkt;
                     ssize_t rx_bytes = recv(fds[i].fd, &rx_pkt, sizeof(rx_pkt), 0);
+                    uint8_t lvl;
+                    uint8_t op;
+                    uint16_t rx_mep_id;
+                    int j;
 
-                    if (rx_bytes >= (ssize_t)(sizeof(eth_hdr_t) + sizeof(cfm_ccm_hdr_t))) {
-                        if (ntohs(rx_pkt.eth.eth_type) == ETH_P_CFM) {
-                            uint8_t lvl = (rx_pkt.ccm.md_lvl_version >> 5) & 0x07;
-                            uint8_t op = rx_pkt.ccm.opcode;
+                    if (rx_bytes < 0)
+                        break;
+                    if (rx_bytes < (ssize_t)(sizeof(eth_hdr_t) + sizeof(cfm_ccm_hdr_t)))
+                        continue;
+                    if (ntohs(rx_pkt.eth.eth_type) != ETH_P_CFM)
+                        continue;
 
-                            // Process only Level 5 CCM packets
-                            if (lvl == 5 && op == CFM_OPCODE_CCM) {
-                                uint16_t rx_mep_id = ntohs(rx_pkt.ccm.mep_id);
+                    lvl = (rx_pkt.ccm.md_lvl_version >> 5) & 0x07;
+                    op = rx_pkt.ccm.opcode;
+                    if (lvl != 5 || op != CFM_OPCODE_CCM)
+                        continue;
 
-                                // Find corresponding link by socket
-                                for (int j = 0; j < g_link_count; j++) {
-                                    if (g_links[j].sock_fd == fds[i].fd) {
-                                        bool old_up;
-                                        pthread_mutex_lock(&g_links[j].lock);
-                                        old_up = g_links[j].is_up;
-                                        if (!g_links[j].mac_learned) {
-                                            // Learn peer's MAC and MEP ID dynamically
-                                            memcpy(g_links[j].remote_mac, rx_pkt.eth.src_mac, 6);
-                                            g_links[j].remote_mep_id = rx_mep_id;
-                                            g_links[j].mac_learned = true;
-                                            g_links[j].is_up = true;
-                                            g_links[j].last_recv_time = now;
-                                            printf("[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x and MEP %d on %s\n",
-                                                   g_links[j].remote_mac[0], g_links[j].remote_mac[1], g_links[j].remote_mac[2],
-                                                   g_links[j].remote_mac[3], g_links[j].remote_mac[4], g_links[j].remote_mac[5],
-                                                   g_links[j].remote_mep_id, g_links[j].ifname);
-                                            fflush(stdout);
-                                        } else {
-                                            // Check if incoming packet matches learned peer
-                                            if (rx_mep_id == g_links[j].remote_mep_id &&
-                                                memcmp(rx_pkt.eth.src_mac, g_links[j].remote_mac, 6) == 0) {
-                                                g_links[j].last_recv_time = now;
-                                                g_links[j].is_up = true;
-                                            }
-                                        }
-                                        pthread_mutex_unlock(&g_links[j].lock);
-                                        notify_is_up(&g_links[j], old_up);
-                                        break;
-                                    }
-                                }
-                            }
+                    rx_mep_id = ntohs(rx_pkt.ccm.mep_id);
+
+                    for (j = 0; j < g_link_count; j++) {
+                        bool old_up;
+
+                        if (g_links[j].sock_fd != fds[i].fd)
+                            continue;
+
+                        /* Never learn our own CCM (TX loopback). */
+                        if (memcmp(rx_pkt.eth.src_mac, g_links[j].local_mac, 6) == 0) {
+                            pthread_mutex_lock(&g_links[j].lock);
+                            g_links[j].rx_own_skip++;
+                            pthread_mutex_unlock(&g_links[j].lock);
+                            break;
                         }
+
+                        pthread_mutex_lock(&g_links[j].lock);
+                        old_up = g_links[j].is_up;
+                        if (!g_links[j].mac_learned) {
+                            memcpy(g_links[j].remote_mac, rx_pkt.eth.src_mac, 6);
+                            g_links[j].remote_mep_id = rx_mep_id;
+                            g_links[j].mac_learned = true;
+                            g_links[j].is_up = true;
+                            g_links[j].last_recv_time = now;
+                            g_links[j].rx_peer_ccm++;
+                            printf("[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x and MEP %d on %s\n",
+                                   g_links[j].remote_mac[0], g_links[j].remote_mac[1], g_links[j].remote_mac[2],
+                                   g_links[j].remote_mac[3], g_links[j].remote_mac[4], g_links[j].remote_mac[5],
+                                   g_links[j].remote_mep_id, g_links[j].ifname);
+                            fflush(stdout);
+                        } else if (rx_mep_id == g_links[j].remote_mep_id &&
+                                   memcmp(rx_pkt.eth.src_mac, g_links[j].remote_mac, 6) == 0) {
+                            g_links[j].last_recv_time = now;
+                            g_links[j].is_up = true;
+                            g_links[j].rx_peer_ccm++;
+                        }
+                        pthread_mutex_unlock(&g_links[j].lock);
+                        notify_is_up(&g_links[j], old_up);
+                        break;
                     }
                 }
             }
@@ -222,6 +242,27 @@ static void *cfm_monitor_thread(void *arg) {
                 }
             }
             last_tx_time = now;
+        }
+
+        /* Debug: still waiting to learn peer MAC? */
+        now = get_time_ms();
+        if (now - last_wait_log >= 1000) {
+            for (int i = 0; i < g_link_count; i++) {
+                if (g_links[i].sock_fd < 0)
+                    continue;
+                pthread_mutex_lock(&g_links[i].lock);
+                if (!g_links[i].mac_learned) {
+                    fprintf(stderr,
+                            "[CFM] %s: chưa học MAC đầu xa "
+                            "(rx_peer=%llu rx_own_skip=%llu) — đang gửi mồi multicast\n",
+                            g_links[i].ifname,
+                            (unsigned long long)g_links[i].rx_peer_ccm,
+                            (unsigned long long)g_links[i].rx_own_skip);
+                    fflush(stderr);
+                }
+                pthread_mutex_unlock(&g_links[i].lock);
+            }
+            last_wait_log = now;
         }
     }
     return NULL;
@@ -278,6 +319,50 @@ int cfm_init(const struct app_config *cfg) {
             fprintf(stderr, "[CFM-INIT] Error: Cannot bind raw socket to %s: %s\n", wan->ifname, strerror(errno));
             close(sock);
             continue;
+        }
+
+        /*
+         * Cần để nhận CCM peer (dst=01:80:c2:00:00:35):
+         * tcpdump thấy được vì bật promisc; AF_PACKET mặc định thường không.
+         */
+        {
+            int ignore_out = 1;
+            if (setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                           &ignore_out, sizeof(ignore_out)) < 0) {
+                fprintf(stderr, "[CFM-INIT] Warning: PACKET_IGNORE_OUTGOING %s: %s\n",
+                        wan->ifname, strerror(errno));
+            }
+        }
+        {
+            struct ifreq ifr_p;
+            memset(&ifr_p, 0, sizeof(ifr_p));
+            strncpy(ifr_p.ifr_name, wan->ifname, IFNAMSIZ - 1);
+            if (ioctl(sock, SIOCGIFFLAGS, &ifr_p) == 0) {
+                ifr_p.ifr_flags |= IFF_PROMISC;
+                if (ioctl(sock, SIOCSIFFLAGS, &ifr_p) < 0) {
+                    fprintf(stderr, "[CFM-INIT] Warning: IFF_PROMISC %s: %s\n",
+                            wan->ifname, strerror(errno));
+                }
+            }
+        }
+        {
+            struct packet_mreq mreq;
+            memset(&mreq, 0, sizeof(mreq));
+            mreq.mr_ifindex = ifindex;
+            mreq.mr_type = PACKET_MR_PROMISC;
+            if (setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+                fprintf(stderr, "[CFM-INIT] Warning: PACKET_MR_PROMISC %s: %s\n",
+                        wan->ifname, strerror(errno));
+            }
+            memset(&mreq, 0, sizeof(mreq));
+            mreq.mr_ifindex = ifindex;
+            mreq.mr_type = PACKET_MR_MULTICAST;
+            mreq.mr_alen = 6;
+            memcpy(mreq.mr_address, CFM_MULTICAST_MAC, 6);
+            if (setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+                fprintf(stderr, "[CFM-INIT] Warning: CFM multicast join %s: %s\n",
+                        wan->ifname, strerror(errno));
+            }
         }
 
         // Set non-blocking socket
