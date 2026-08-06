@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+#include <limits.h>
 #include <net/if.h>
 
 #define ARP_LOG_FAIL_INTERVAL_MS 30000ull
@@ -246,6 +248,139 @@ static int resolve_fwd_local_for_wan_dp(struct forwarder *fwd,
     return -1;
 }
 
+static int arp_wan_dp_usable(int wan_dp)
+{
+    if (wan_dp < 0)
+        return 0;
+    return fwd_wan_dp_ok_for_new_traffic(wan_dp) ? 1 : 0;
+}
+
+static int arp_wan_is_bridge_peer(const struct profile_config *prof, int wan_dp)
+{
+    if (!prof || wan_dp < 0)
+        return 0;
+    for (int i = 0; i < prof->bridge_count; i++) {
+        if (prof->bridges[i].wan_dp == wan_dp)
+            return 1;
+    }
+    return 0;
+}
+
+/* Prefer other UP bridge WANs; else least-loaded live WAN in profile pool. */
+static int arp_pick_backup_wan_dp(struct forwarder *fwd,
+                                  const struct profile_config *prof,
+                                  int primary_wan_dp)
+{
+    int best_bridge = -1;
+    uint32_t best_bridge_depth = UINT32_MAX;
+    int best_any = -1;
+    uint32_t best_any_depth = UINT32_MAX;
+
+    if (!fwd || !prof)
+        return -1;
+
+    for (int i = 0; i < prof->wan_count; i++) {
+        int cfg_wan = prof->wan_indices[i];
+        int dp;
+        uint32_t depth;
+
+        dp = fwd_wan_live_dp_for_cfg(fwd, cfg_wan);
+        if (dp < 0)
+            dp = fwd_wan_dp_for_legacy_cfg(fwd, cfg_wan);
+        if (dp < 0 || dp == primary_wan_dp)
+            continue;
+        if (!arp_wan_dp_usable(dp) || !fwd_wan_has_tx_room(fwd, dp))
+            continue;
+
+        depth = fwd_mid_to_wan_depth(fwd, dp);
+        if (arp_wan_is_bridge_peer(prof, dp)) {
+            if (depth < best_bridge_depth) {
+                best_bridge_depth = depth;
+                best_bridge = dp;
+            }
+        } else if (depth < best_any_depth) {
+            best_any_depth = depth;
+            best_any = dp;
+        }
+    }
+
+    return best_bridge >= 0 ? best_bridge : best_any;
+}
+
+/*
+ * LAN whose primary bridge WAN is down/held/CFM-excluded.
+ * One candidate → that LAN. Many → keep only if SPA/TPA policy uniquely matches.
+ */
+static int arp_resolve_backup_local(struct forwarder *fwd,
+                                    const struct profile_config *prof,
+                                    int profile_pi,
+                                    uint32_t spa, uint32_t tpa, int have_ips)
+{
+    int candidates[MAX_INTERFACES];
+    int n = 0;
+
+    if (!fwd || !fwd->cfg || !prof)
+        return -1;
+
+    for (int i = 0; i < prof->bridge_count; i++) {
+        int li;
+        int wan_dp = prof->bridges[i].wan_dp;
+
+        if (arp_wan_dp_usable(wan_dp))
+            continue;
+        li = bridge_fwd_local(fwd, prof->bridges[i].local_idx);
+        if (li < 0)
+            continue;
+        if (n < MAX_INTERFACES)
+            candidates[n++] = li;
+    }
+
+    if (n == 0)
+        return -1;
+    if (n == 1)
+        return candidates[0];
+
+    if (!have_ips)
+        return -1;
+
+    {
+        int matched = 0;
+        int pick = -1;
+
+        for (int i = 0; i < n; i++) {
+            if (!config_select_policy_for_arp(fwd->cfg, profile_pi, spa, tpa))
+                continue;
+            matched++;
+            pick = candidates[i];
+        }
+        /* Shared profile policies cannot disambiguate LANs — require unique. */
+        if (matched == 1)
+            return pick;
+    }
+    return -1;
+}
+
+static int arp_select_egress_wan(struct forwarder *fwd,
+                                 const struct profile_config *prof,
+                                 int primary_wan_dp, int *used_backup)
+{
+    if (used_backup)
+        *used_backup = 0;
+
+    if (arp_wan_dp_usable(primary_wan_dp) && !fwd_wan_is_stopped(primary_wan_dp))
+        return primary_wan_dp;
+
+    {
+        int backup = arp_pick_backup_wan_dp(fwd, prof, primary_wan_dp);
+
+        if (backup < 0)
+            return -1;
+        if (used_backup)
+            *used_backup = 1;
+        return backup;
+    }
+}
+
 static const char *local_ifname(struct forwarder *fwd, int li)
 {
     if (!fwd || li < 0 || li >= fwd->local_count)
@@ -442,7 +577,9 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
 {
     int profile_pi;
     const struct profile_config *prof;
+    int primary_wan_dp;
     int wan_dp;
+    int used_backup = 0;
     struct ne_ring *ring;
     uint8_t *mut;
 
@@ -467,7 +604,7 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
-    if (resolve_wan_dp_for_fwd_local(fwd, prof, ingress_li, &wan_dp) != 0) {
+    if (resolve_wan_dp_for_fwd_local(fwd, prof, ingress_li, &primary_wan_dp) != 0) {
         static uint64_t last_no_pair_ms;
 
         if (arp_log_fail_ratelimit(&last_no_pair_ms))
@@ -476,14 +613,17 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                     local_ifname(fwd, ingress_li), prof->name, prof->bridge_count);
         return -1;
     }
-    if (wan_dp < 0 || wan_dp >= fwd->wan_count)
+    if (primary_wan_dp < 0 || primary_wan_dp >= fwd->wan_count)
         return -1;
-    if (fwd_wan_is_stopped(wan_dp)) {
+
+    wan_dp = arp_select_egress_wan(fwd, prof, primary_wan_dp, &used_backup);
+    if (wan_dp < 0) {
         static uint64_t last_wan_stopped_ms;
 
         if (arp_log_fail_ratelimit(&last_wan_stopped_ms))
-            fprintf(stderr, "[ARP] bridge local %s -> wan %s fail: wan stopped\n",
-                    local_ifname(fwd, ingress_li), wan_ifname(fwd, wan_dp));
+            fprintf(stderr,
+                    "[ARP] bridge local %s fail: primary %s down, no backup WAN\n",
+                    local_ifname(fwd, ingress_li), wan_ifname(fwd, primary_wan_dp));
         return -1;
     }
 
@@ -527,7 +667,16 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
 
             arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
             arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
-            if (enc_pol)
+            if (used_backup)
+                fprintf(stderr,
+                        "[ARP] local %s spa=%s tpa=%s policy=cover "
+                        "wire_id=%d db_id=%d priority=%d action=%d "
+                        "encrypted=%d bridge=backup wan=%s primary=%s down\n",
+                        local_ifname(fwd, ingress_li), spa_s, tpa_s,
+                        cover->id, cover->db_id, cover->priority, cover->action,
+                        encrypted,
+                        wan_ifname(fwd, wan_dp), wan_ifname(fwd, primary_wan_dp));
+            else if (enc_pol)
                 fprintf(stderr,
                         "[ARP] local %s spa=%s tpa=%s policy=cover "
                         "wire_id=%d db_id=%d priority=%d action=%d "
@@ -622,56 +771,97 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     }
 
     prof = &fwd->cfg->profiles[profile_pi];
-    if (resolve_fwd_local_for_wan_dp(fwd, prof, ingress_wan_dp, &local_idx) != 0) {
-        static uint64_t last_no_pair_ms;
-
-        if (arp_log_fail_ratelimit(&last_no_pair_ms))
-            fprintf(stderr,
-                    "[ARP] bridge wan %s fail: no BE pair (profile=%s bridges=%d)\n",
-                    wan_ifname(fwd, ingress_wan_dp), prof->name, prof->bridge_count);
-        return -1;
-    }
-
-    ring = arp_mid_to_local_ring(fwd, local_idx);
-    job->dir = NE_DIR_LOCAL;
-    job->local_idx = (uint8_t)local_idx;
-    if (dp_ring_push(fwd, ring, job) != 0) {
-        static uint64_t last_ring_fail_ms;
-
-        if (arp_log_fail_ratelimit(&last_ring_fail_ms))
-            fprintf(stderr, "[ARP] bridge wan %s -> local %s fail: ring push\n",
-                    wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
-        return -1;
-    }
-
     {
-        static uint64_t last_wan_bridge_ms;
-        const char *crypto_state;
+        int bridge_local = -1;
+        int backup_local = -1;
+        int used_backup = 0;
 
-        if (dec == 1)
-            crypto_state = "decrypted";
-        else if (was_plain)
-            crypto_state = "plain";
-        else if (had_marker)
-            crypto_state = "decrypted";
-        else
-            crypto_state = "plain";
+        if (resolve_fwd_local_for_wan_dp(fwd, prof, ingress_wan_dp, &bridge_local) != 0)
+            bridge_local = -1;
 
-        if (arp_log_fail_ratelimit(&last_wan_bridge_ms)) {
-            char spa_s[16] = "?", tpa_s[16] = "?";
+        backup_local = arp_resolve_backup_local(fwd, prof, profile_pi, spa, tpa, have_ips);
 
-            if (have_ips) {
-                arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
-                arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+        /*
+         * Prefer backup return when ingress is not the primary bridge WAN of
+         * a LAN whose primary is down (ARP was sent out via a live peer WAN).
+         */
+        if (backup_local >= 0) {
+            int primary_of_backup = -1;
+
+            if (resolve_wan_dp_for_fwd_local(fwd, prof, backup_local,
+                                            &primary_of_backup) == 0 &&
+                primary_of_backup != ingress_wan_dp) {
+                local_idx = backup_local;
+                used_backup = 1;
             }
-            fprintf(stderr,
-                    "[ARP] wan %s spa=%s tpa=%s crypto=%s bridge=%s\n",
-                    wan_ifname(fwd, ingress_wan_dp), spa_s, tpa_s, crypto_state,
-                    local_ifname(fwd, local_idx));
         }
-    }
+        if (!used_backup) {
+            if (bridge_local >= 0) {
+                local_idx = bridge_local;
+            } else if (backup_local >= 0) {
+                local_idx = backup_local;
+                used_backup = 1;
+            } else {
+                static uint64_t last_no_pair_ms;
 
-    if (egress_ifname)
-        strncpy(egress_ifname, local_ifname(fwd, local_idx), IF_NAMESIZE - 1);
-    return 0;
+                if (arp_log_fail_ratelimit(&last_no_pair_ms))
+                    fprintf(stderr,
+                            "[ARP] bridge wan %s fail: no BE pair "
+                            "(profile=%s bridges=%d)\n",
+                            wan_ifname(fwd, ingress_wan_dp), prof->name,
+                            prof->bridge_count);
+                return -1;
+            }
+        }
+
+        ring = arp_mid_to_local_ring(fwd, local_idx);
+        job->dir = NE_DIR_LOCAL;
+        job->local_idx = (uint8_t)local_idx;
+        if (dp_ring_push(fwd, ring, job) != 0) {
+            static uint64_t last_ring_fail_ms;
+
+            if (arp_log_fail_ratelimit(&last_ring_fail_ms))
+                fprintf(stderr, "[ARP] bridge wan %s -> local %s fail: ring push\n",
+                        wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
+            return -1;
+        }
+
+        {
+            static uint64_t last_wan_bridge_ms;
+            const char *crypto_state;
+
+            if (dec == 1)
+                crypto_state = "decrypted";
+            else if (was_plain)
+                crypto_state = "plain";
+            else if (had_marker)
+                crypto_state = "decrypted";
+            else
+                crypto_state = "plain";
+
+            if (arp_log_fail_ratelimit(&last_wan_bridge_ms)) {
+                char spa_s[16] = "?", tpa_s[16] = "?";
+
+                if (have_ips) {
+                    arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
+                    arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+                }
+                if (used_backup)
+                    fprintf(stderr,
+                            "[ARP] wan %s spa=%s tpa=%s crypto=%s "
+                            "bridge=backup-return local=%s\n",
+                            wan_ifname(fwd, ingress_wan_dp), spa_s, tpa_s,
+                            crypto_state, local_ifname(fwd, local_idx));
+                else
+                    fprintf(stderr,
+                            "[ARP] wan %s spa=%s tpa=%s crypto=%s bridge=%s\n",
+                            wan_ifname(fwd, ingress_wan_dp), spa_s, tpa_s,
+                            crypto_state, local_ifname(fwd, local_idx));
+            }
+        }
+
+        if (egress_ifname)
+            strncpy(egress_ifname, local_ifname(fwd, local_idx), IF_NAMESIZE - 1);
+        return 0;
+    }
 }
