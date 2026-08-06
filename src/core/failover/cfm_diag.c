@@ -227,7 +227,7 @@ static void *cfm_monitor_thread(void *arg) {
                         continue;
                     }
 
-                    if (rx_bytes < 14 + 8) {
+                    if (rx_bytes < 14 + 10) {
                         pthread_mutex_lock(&g_links[j].lock);
                         g_links[j].rx_short++;
                         pthread_mutex_unlock(&g_links[j].lock);
@@ -245,7 +245,12 @@ static void *cfm_monitor_thread(void *arg) {
                         continue;
                     }
 
-                    rx_mep_id = ((uint16_t)cfm[6] << 8) | cfm[7];
+                    /*
+                     * CCM: [0]=lvl [1]=op [2]=flags [3]=tlv_off
+                     *      [4..7]=seq  [8..9]=mep_id  [10..]=MAID
+                     * (trước đây đọc cfm[6..7] = đuôi seq → MEP sai → CCM sau bị discard)
+                     */
+                    rx_mep_id = ((uint16_t)cfm[8] << 8) | cfm[9];
 
                     /* Never learn our own CCM (TX loopback). */
                     if (memcmp(src_mac, g_links[j].local_mac, 6) == 0) {
