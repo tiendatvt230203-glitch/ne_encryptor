@@ -8,29 +8,29 @@
 static struct forwarder *g_fwd;
 
 /*
- * CFM state callback: chỉ log để debug.
- * wan_admin_kick / restore cố ý comment — không auto down/up interface.
+ * CFM state callback: DOWN → kick (same as -di), UP → restore (same as -ai).
  */
 static void on_cfm_link_state(int wan_dp, const char *ifname,
                               int old_state, int new_state, void *user)
 {
     struct forwarder *fwd = user ? (struct forwarder *)user : g_fwd;
 
-    (void)wan_dp;
     (void)old_state;
     if (!fwd || !ifname || !ifname[0])
         return;
 
     if (new_state == CFM_LINK_STATE_DOWN) {
-        fprintf(stderr, "[WAN-FAILOVER] CFM DOWN %s → kick (same as -di)\n", ifname);
+        fprintf(stderr, "[WAN-FAILOVER] CFM DOWN %s dp=%d → kick (same as -di)\n",
+                ifname, wan_dp);
         fflush(stderr);
-        // (void)wan_admin_kick(fwd, ifname);
-        // return;
+        (void)wan_admin_kick(fwd, ifname);
+        return;
     }
     if (new_state == CFM_LINK_STATE_UP) {
-        fprintf(stderr, "[WAN-FAILOVER] CFM UP %s → restore (same as -ai)\n", ifname);
+        fprintf(stderr, "[WAN-FAILOVER] CFM UP %s dp=%d → restore (same as -ai)\n",
+                ifname, wan_dp);
         fflush(stderr);
-        // (void)wan_admin_restore(fwd, ifname);
+        (void)wan_admin_restore(fwd, ifname);
     }
 }
 
@@ -49,7 +49,7 @@ int wan_failover_start(struct forwarder *fwd)
     }
     fprintf(stderr,
             "[WAN-FAILOVER] CFM started — DOWN→kick / UP→restore "
-            "(manual -di/-ai still OK; kick/restore đang comment, chỉ log)\n");
+            "(manual -di/-ai still OK)\n");
     fflush(stderr);
     return 0;
 }
@@ -75,7 +75,6 @@ void wan_failover_stop(void)
 
 int wan_failover_dp_excluded(int wan_dp)
 {
-    (void)wan_dp;
-    /* Không exclude traffic theo CFM — chỉ check log. */
-    return 0;
+    /* CFM-managed WANs that are DOWN are kept out of the profile pool. */
+    return cfm_link_is_down(wan_dp) ? 1 : 0;
 }

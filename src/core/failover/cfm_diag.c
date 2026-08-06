@@ -17,8 +17,12 @@
 #include <time.h>
 #include <errno.h>
 
-#define CFM_INTERVAL_MS 100
-#define CFM_TIMEOUT_MS  350
+#define CFM_INTERVAL_MS         100
+#define CFM_TIMEOUT_MS          350
+#define CFM_STARTUP_TIMEOUT_MS  1000
+/* Consecutive 100ms eval ticks before committing UP/DOWN (anti-flap). */
+#define CFM_DOWN_CONFIRM        2
+#define CFM_UP_CONFIRM          3
 
 typedef struct cfm_link {
     pthread_mutex_t lock;
@@ -33,6 +37,10 @@ typedef struct cfm_link {
     int sock_fd;
     int local_mep_id;
     int remote_mep_id;
+    int cfg_wan_idx;
+    int wan_dp;
+    int consecutive_fails;
+    int consecutive_successes;
     uint32_t tx_seq;
     char ifname[IFNAMSIZ];
     uint8_t local_mac[6];
@@ -58,19 +66,43 @@ static void notify_is_up(cfm_link_t *link, bool old_up)
     void *user;
     int old_state;
     int new_state;
+    int wan_dp;
 
     if (link->is_up == old_up)
         return;
 
     old_state = old_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
     new_state = link->is_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
+    wan_dp = link->wan_dp;
 
     pthread_mutex_lock(&g_cb_lock);
     cb = g_state_cb;
     user = g_state_cb_user;
     pthread_mutex_unlock(&g_cb_lock);
     if (cb)
-        cb(-1, link->ifname, old_state, new_state, user);
+        cb(wan_dp, link->ifname, old_state, new_state, user);
+}
+
+static cfm_link_t *find_link_by_wan_dp(int wan_dp)
+{
+    if (wan_dp < 0)
+        return NULL;
+    for (int i = 0; i < g_link_count; i++) {
+        if (g_links[i].wan_dp == wan_dp)
+            return &g_links[i];
+    }
+    return NULL;
+}
+
+static cfm_link_t *find_link_by_cfg_idx(int cfg_idx)
+{
+    if (cfg_idx < 0)
+        return NULL;
+    for (int i = 0; i < g_link_count; i++) {
+        if (g_links[i].cfg_wan_idx == cfg_idx)
+            return &g_links[i];
+    }
+    return NULL;
 }
 
 static uint64_t get_time_ms(void) {
@@ -235,19 +267,26 @@ static void *cfm_monitor_thread(void *arg) {
                             g_links[j].mac_learned = true;
                             g_links[j].is_up = true;
                             g_links[j].last_recv_time = now;
+                            g_links[j].consecutive_fails = 0;
+                            g_links[j].consecutive_successes = CFM_UP_CONFIRM;
                             g_links[j].rx_peer_ccm++;
                             fprintf(stderr,
                                     "[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x "
-                                    "and MEP %d on %s\n",
+                                    "and MEP %d on %s (dp=%d)\n",
                                     g_links[j].remote_mac[0], g_links[j].remote_mac[1],
                                     g_links[j].remote_mac[2], g_links[j].remote_mac[3],
                                     g_links[j].remote_mac[4], g_links[j].remote_mac[5],
-                                    g_links[j].remote_mep_id, g_links[j].ifname);
+                                    g_links[j].remote_mep_id, g_links[j].ifname,
+                                    g_links[j].wan_dp);
                             fflush(stderr);
                         } else if (rx_mep_id == g_links[j].remote_mep_id &&
                                    memcmp(src_mac, g_links[j].remote_mac, 6) == 0) {
                             g_links[j].last_recv_time = now;
-                            g_links[j].is_up = true;
+                            g_links[j].consecutive_fails = 0;
+                            if (g_links[j].consecutive_successes < CFM_UP_CONFIRM)
+                                g_links[j].consecutive_successes++;
+                            if (g_links[j].consecutive_successes >= CFM_UP_CONFIRM)
+                                g_links[j].is_up = true;
                             g_links[j].rx_peer_ccm++;
                         }
                         pthread_mutex_unlock(&g_links[j].lock);
@@ -267,16 +306,29 @@ static void *cfm_monitor_thread(void *arg) {
                     // Send out heartbeat
                     send_ccm_packet(&g_links[i]);
 
-                    // Evaluate health status
+                    // Evaluate health status (debounce + startup timeout)
                     pthread_mutex_lock(&g_links[i].lock);
                     old_up = g_links[i].is_up;
                     if (g_links[i].mac_learned) {
                         if (now - g_links[i].last_recv_time > CFM_TIMEOUT_MS) {
-                            g_links[i].is_up = false;
+                            g_links[i].consecutive_fails++;
+                            g_links[i].consecutive_successes = 0;
+                            if (g_links[i].consecutive_fails >= CFM_DOWN_CONFIRM)
+                                g_links[i].is_up = false;
+                        } else {
+                            g_links[i].consecutive_fails = 0;
+                            if (g_links[i].consecutive_successes < CFM_UP_CONFIRM)
+                                g_links[i].consecutive_successes++;
+                            if (g_links[i].consecutive_successes >= CFM_UP_CONFIRM)
+                                g_links[i].is_up = true;
                         }
                     } else {
-                        // Keep UP until MAC is learned
-                        g_links[i].is_up = true;
+                        /* No peer yet: stay UP briefly, then DOWN if never learned. */
+                        if (now - g_links[i].last_recv_time > CFM_STARTUP_TIMEOUT_MS) {
+                            g_links[i].is_up = false;
+                        } else {
+                            g_links[i].is_up = true;
+                        }
                     }
                     pthread_mutex_unlock(&g_links[i].lock);
                     notify_is_up(&g_links[i], old_up);
@@ -423,6 +475,8 @@ int cfm_init(const struct app_config *cfg) {
         strncpy(link->ifname, wan->ifname, IFNAMSIZ - 1);
         link->ifindex = ifindex;
         link->sock_fd = sock;
+        link->cfg_wan_idx = i;
+        link->wan_dp = config_wan_cfg_to_dp(cfg, i);
 
         // Query local MAC address dynamically, fallback to DB configuration
         struct ifreq ifr;
@@ -460,8 +514,14 @@ int cfm_init(const struct app_config *cfg) {
 
         link->last_recv_time = get_time_ms();
         link->tx_seq = 0;
+        link->consecutive_fails = 0;
+        link->consecutive_successes = link->mac_learned ? CFM_UP_CONFIRM : 0;
         link->is_up = true; // Assume UP initially so we don't disrupt traffic before learning
         pthread_mutex_init(&link->lock, NULL);
+
+        fprintf(stderr, "[CFM-INIT] %s cfg=%d dp=%d mac_learned=%d\n",
+                link->ifname, link->cfg_wan_idx, link->wan_dp, link->mac_learned ? 1 : 0);
+        fflush(stderr);
 
         g_link_count++;
         initialized_links++;
@@ -489,16 +549,31 @@ int cfm_init(const struct app_config *cfg) {
     return 0;
 }
 
-bool cfm_is_link_up(int wan_idx) {
-    if (wan_idx < 0 || wan_idx >= g_link_count) {
-        return false;
-    }
+bool cfm_is_link_up(int wan_dp) {
+    cfm_link_t *link = find_link_by_wan_dp(wan_dp);
+    bool status;
 
-    pthread_mutex_lock(&g_links[wan_idx].lock);
-    bool status = g_links[wan_idx].is_up;
-    pthread_mutex_unlock(&g_links[wan_idx].lock);
+    if (!link)
+        return true; /* Not CFM-managed → treat as UP for callers. */
 
+    pthread_mutex_lock(&link->lock);
+    status = link->is_up;
+    pthread_mutex_unlock(&link->lock);
     return status;
+}
+
+int cfm_link_is_down(int wan_dp)
+{
+    cfm_link_t *link = find_link_by_wan_dp(wan_dp);
+    bool is_up;
+
+    if (!link)
+        return 0;
+
+    pthread_mutex_lock(&link->lock);
+    is_up = link->is_up;
+    pthread_mutex_unlock(&link->lock);
+    return is_up ? 0 : 1;
 }
 
 void cfm_cleanup(void) {
@@ -523,13 +598,27 @@ void cfm_cleanup(void) {
     pthread_mutex_unlock(&g_cfm_init_lock);
 }
 
+static bool cfm_cfg_link_up(int cfg_wan_idx)
+{
+    cfm_link_t *link = find_link_by_cfg_idx(cfg_wan_idx);
+    bool status;
+
+    if (!link)
+        return true;
+
+    pthread_mutex_lock(&link->lock);
+    status = link->is_up;
+    pthread_mutex_unlock(&link->lock);
+    return status;
+}
+
 int failover_select_wan(const struct app_config *cfg, int profile_idx, int initial_wan_idx) {
-    if (initial_wan_idx < 0 || initial_wan_idx >= cfg->wan_count) {
+    if (!cfg || initial_wan_idx < 0 || initial_wan_idx >= cfg->wan_count) {
         return initial_wan_idx;
     }
 
     // 1. If the chosen WAN is UP, use it.
-    if (cfm_is_link_up(initial_wan_idx)) {
+    if (cfm_cfg_link_up(initial_wan_idx)) {
         return initial_wan_idx;
     }
 
@@ -538,7 +627,7 @@ int failover_select_wan(const struct app_config *cfg, int profile_idx, int initi
         const struct profile_config *p = &cfg->profiles[profile_idx];
         for (int i = 0; i < p->wan_count; i++) {
             int w_idx = p->wan_indices[i];
-            if (w_idx >= 0 && w_idx < cfg->wan_count && cfm_is_link_up(w_idx)) {
+            if (w_idx >= 0 && w_idx < cfg->wan_count && cfm_cfg_link_up(w_idx)) {
                 return w_idx;
             }
         }
@@ -546,7 +635,7 @@ int failover_select_wan(const struct app_config *cfg, int profile_idx, int initi
 
     // 3. Global fallback: If no other WAN in the same profile is UP, search across all WANs
     for (int i = 0; i < cfg->wan_count; i++) {
-        if (cfm_is_link_up(i)) {
+        if (cfm_cfg_link_up(i)) {
             return i;
         }
     }
@@ -566,5 +655,9 @@ void cfm_set_state_callback(cfm_link_state_cb cb, void *user)
 
 int cfm_get_link_state(int wan_dp)
 {
+    cfm_link_t *link = find_link_by_wan_dp(wan_dp);
+
+    if (!link)
+        return CFM_LINK_STATE_UP;
     return cfm_is_link_up(wan_dp) ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
 }
