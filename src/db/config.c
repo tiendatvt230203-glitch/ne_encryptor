@@ -486,22 +486,6 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
     return 1;
 }
 
-/* ARP: SPA/TPA only — match forward (src→dst) or reverse (reply đảo chiều). */
-static int crypto_policy_match_arp_ips(const struct crypto_policy *cp,
-                                       uint32_t spa, uint32_t tpa)
-{
-    if (!cp)
-        return 0;
-    if (cidr_match_with_negate(cp->src_any, cp->src_negate, spa, cp->src_net, cp->src_mask) &&
-        cidr_match_with_negate(cp->dst_any, cp->dst_negate, tpa, cp->dst_net, cp->dst_mask))
-        return 1;
-    /* ARP reply: SPA/TPA đảo so với request — cùng rule 1.1→1.2 vẫn cover 1.2→1.1 */
-    if (cidr_match_with_negate(cp->src_any, cp->src_negate, tpa, cp->src_net, cp->src_mask) &&
-        cidr_match_with_negate(cp->dst_any, cp->dst_negate, spa, cp->dst_net, cp->dst_mask))
-        return 1;
-    return 0;
-}
-
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
@@ -522,74 +506,6 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
 
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol))
-            continue;
-
-        if (!best ||
-            cp->priority < best_priority ||
-            (cp->priority == best_priority && cp->id < best_id)) {
-            best = cp;
-            best_priority = cp->priority;
-            best_id = cp->id;
-        }
-    }
-
-    return best;
-}
-
-const struct crypto_policy *config_select_policy_for_arp(struct app_config *cfg, int profile_idx, uint32_t spa, uint32_t tpa) {
-    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
-        return NULL;
-    }
-
-    const struct profile_config *p = &cfg->profiles[profile_idx];
-    const struct crypto_policy *best = NULL;
-    int best_priority = 0x7fffffff;
-    int best_id = 0x7fffffff;
-
-    for (int i = 0; i < p->policy_count; i++) {
-        int pi = p->policy_indices[i];
-        const struct crypto_policy *cp;
-        if (pi < 0 || pi >= cfg->policy_count) {
-            continue;
-        }
-
-        cp = &cfg->policies[pi];
-        if (!crypto_policy_match_arp_ips(cp, spa, tpa)) {
-            continue;
-        }
-
-        if (!best || cp->priority < best_priority || (cp->priority == best_priority && cp->id < best_id)) {
-            best = cp;
-            best_priority = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    return best;
-}
-
-const struct crypto_policy *config_select_arp_l2_policy(struct app_config *cfg, int profile_idx,
-                                                        uint32_t spa, uint32_t tpa)
-{
-    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count)
-        return NULL;
-
-    const struct profile_config *p = &cfg->profiles[profile_idx];
-    const struct crypto_policy *best = NULL;
-    int best_priority = 0x7fffffff;
-    int best_id = 0x7fffffff;
-
-    for (int i = 0; i < p->policy_count; i++) {
-        int pi = p->policy_indices[i];
-        const struct crypto_policy *cp;
-
-        if (pi < 0 || pi >= cfg->policy_count)
-            continue;
-
-        cp = &cfg->policies[pi];
-        if (cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->protocol != POLICY_PROTO_ANY)
-            continue;
-
-        if (!crypto_policy_match_arp_ips(cp, spa, tpa))
             continue;
 
         if (!best ||

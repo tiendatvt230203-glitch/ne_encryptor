@@ -6,6 +6,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/interface.h"
+#include "../../../inc/core/wan_failover.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
 
@@ -13,16 +14,13 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
-#include <limits.h>
 #include <stdarg.h>
-#include <pthread.h>
 #include <net/if.h>
 
 #define ARP_LOG_FAIL_INTERVAL_MS 30000ull
-#define ARP_BACKUP_SOFT_MAX      64
-#define ARP_BACKUP_SOFT_TTL_MS   3000ull
 #define ARP_DEFAULT_WIRE_ID      250u
 #define ARP_DEFAULT_AES_BITS     256
+#define ARP_ETH_HDR_LEN          14u
 
 /* 1 = mã hóa ARP L2-PQC (key/option riêng), 0 = bridge ARP plaintext.
  * Decrypt vẫn chạy nếu wire có ARP marker (peer vẫn encrypt). */
@@ -30,18 +28,6 @@
 #define ARP_ENCRYPT_ENABLE 1
 #endif
 
-struct arp_backup_soft_entry {
-    int used;
-    int backup_wan_dp;
-    int return_local_idx;
-    uint32_t spa;
-    uint32_t tpa;
-    uint64_t expire_ms;
-};
-
-static struct arp_backup_soft_entry g_arp_backup_soft[ARP_BACKUP_SOFT_MAX];
-static pthread_spinlock_t g_arp_backup_soft_lock;
-static int g_arp_backup_soft_lock_ready;
 static struct packet_crypto_ctx g_arp_crypto_ctx;
 static int g_arp_crypto_ctx_ready;
 static int g_arp_key_loaded;
@@ -88,101 +74,6 @@ static void arp_crypto_ctx_init(const struct app_config *cfg)
     g_arp_crypto_ctx_ready = 1;
 }
 
-static void arp_backup_soft_lock_init(void)
-{
-    if (g_arp_backup_soft_lock_ready)
-        return;
-    pthread_spin_init(&g_arp_backup_soft_lock, PTHREAD_PROCESS_PRIVATE);
-    g_arp_backup_soft_lock_ready = 1;
-}
-
-static void arp_backup_remember(int backup_wan_dp, uint32_t spa, uint32_t tpa,
-                                int return_local_idx)
-{
-    uint64_t now;
-    int free_slot = -1;
-    int oldest = 0;
-    uint64_t oldest_exp = UINT64_MAX;
-
-    if (backup_wan_dp < 0 || return_local_idx < 0)
-        return;
-
-    arp_backup_soft_lock_init();
-    now = arp_monotonic_ms();
-    pthread_spin_lock(&g_arp_backup_soft_lock);
-
-    for (int i = 0; i < ARP_BACKUP_SOFT_MAX; i++) {
-        struct arp_backup_soft_entry *e = &g_arp_backup_soft[i];
-
-        if (e->used && e->expire_ms <= now) {
-            e->used = 0;
-        }
-        if (e->used &&
-            e->backup_wan_dp == backup_wan_dp &&
-            e->spa == spa && e->tpa == tpa) {
-            e->return_local_idx = return_local_idx;
-            e->expire_ms = now + ARP_BACKUP_SOFT_TTL_MS;
-            pthread_spin_unlock(&g_arp_backup_soft_lock);
-            return;
-        }
-        if (!e->used && free_slot < 0)
-            free_slot = i;
-        if (!e->used)
-            continue;
-        if (e->expire_ms < oldest_exp) {
-            oldest_exp = e->expire_ms;
-            oldest = i;
-        }
-    }
-
-    {
-        int slot = free_slot >= 0 ? free_slot : oldest;
-        struct arp_backup_soft_entry *e = &g_arp_backup_soft[slot];
-
-        e->used = 1;
-        e->backup_wan_dp = backup_wan_dp;
-        e->return_local_idx = return_local_idx;
-        e->spa = spa;
-        e->tpa = tpa;
-        e->expire_ms = now + ARP_BACKUP_SOFT_TTL_MS;
-    }
-    pthread_spin_unlock(&g_arp_backup_soft_lock);
-}
-
-/* Match request (spa,tpa) or reply (spa↔tpa). Returns return_local_idx or -1. */
-static int arp_backup_lookup(int ingress_wan_dp, uint32_t spa, uint32_t tpa)
-{
-    uint64_t now;
-    int hit = -1;
-
-    if (ingress_wan_dp < 0)
-        return -1;
-
-    arp_backup_soft_lock_init();
-    now = arp_monotonic_ms();
-    pthread_spin_lock(&g_arp_backup_soft_lock);
-
-    for (int i = 0; i < ARP_BACKUP_SOFT_MAX; i++) {
-        struct arp_backup_soft_entry *e = &g_arp_backup_soft[i];
-
-        if (!e->used)
-            continue;
-        if (e->expire_ms <= now) {
-            e->used = 0;
-            continue;
-        }
-        if (e->backup_wan_dp != ingress_wan_dp)
-            continue;
-        if ((e->spa == spa && e->tpa == tpa) ||
-            (e->spa == tpa && e->tpa == spa)) {
-            hit = e->return_local_idx;
-            break;
-        }
-    }
-    pthread_spin_unlock(&g_arp_backup_soft_lock);
-    return hit;
-}
-
 static int arp_log_fail_ratelimit(uint64_t *last_ms)
 {
     uint64_t now = arp_monotonic_ms();
@@ -212,13 +103,37 @@ static void arp_format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
     snprintf(buf, bufsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
 }
 
+static void arp_format_mac(const uint8_t mac[MAC_LEN], char *buf, size_t bufsz)
+{
+    snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static int arp_eth_dmac_is_broadcast(const uint8_t *pkt, uint32_t len)
+{
+    static const uint8_t bcast[MAC_LEN] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    };
+
+    if (!pkt || len < ARP_ETH_HDR_LEN)
+        return 0;
+    return memcmp(pkt, bcast, MAC_LEN) == 0;
+}
+
+static int arp_eth_dmac_is_multicast(const uint8_t *pkt, uint32_t len)
+{
+    if (!pkt || len < ARP_ETH_HDR_LEN)
+        return 0;
+    return (pkt[0] & 0x01u) != 0;
+}
+
 void arp_bridge_reload_policies(struct app_config *cfg)
 {
     if (!cfg)
         return;
     arp_crypto_ctx_init(cfg);
     fprintf(stderr,
-            "[ARP] mode=allow-all | arp_encrypt=%d | key=arp-default | opt=L2-PQC/ARP\n",
+            "[ARP] mode=mac-fdb+flood-bcast | arp_encrypt=%d | key=arp-default | opt=L2-PQC/ARP\n",
             ARP_ENCRYPT_ENABLE);
 }
 
@@ -256,11 +171,6 @@ static int profile_pi_for_wan_dp(struct forwarder *fwd, int wan_dp)
 }
 
 /* bridges[].local_idx is cfg locals[] index — map to live fwd pair slot by ifname. */
-static int bridge_fwd_local(struct forwarder *fwd, int cfg_local_idx)
-{
-    return mac_fwd_local_for_cfg_idx(fwd, cfg_local_idx);
-}
-
 static int resolve_wan_dp_for_fwd_local(struct forwarder *fwd,
                                         const struct profile_config *prof,
                                         int fwd_local_idx, int *wan_dp_out)
@@ -282,27 +192,6 @@ static int resolve_wan_dp_for_fwd_local(struct forwarder *fwd,
         if (strcmp(fwd->cfg->locals[ci].ifname, ifname) != 0)
             continue;
         *wan_dp_out = prof->bridges[i].wan_dp;
-        return 0;
-    }
-    return -1;
-}
-
-static int resolve_fwd_local_for_wan_dp(struct forwarder *fwd,
-                                        const struct profile_config *prof,
-                                        int ingress_wan_dp, int *fwd_local_out)
-{
-    if (!fwd || !prof || !fwd_local_out || ingress_wan_dp < 0)
-        return -1;
-
-    for (int i = 0; i < prof->bridge_count; i++) {
-        int li;
-
-        if (prof->bridges[i].wan_dp != ingress_wan_dp)
-            continue;
-        li = bridge_fwd_local(fwd, prof->bridges[i].local_idx);
-        if (li < 0)
-            return -1;
-        *fwd_local_out = li;
         return 0;
     }
     return -1;
@@ -367,45 +256,6 @@ static int arp_pick_backup_wan_dp(struct forwarder *fwd,
     return best_bridge >= 0 ? best_bridge : best_any;
 }
 
-/*
- * LAN whose primary bridge WAN is down/held/CFM-excluded.
- * One candidate → that LAN. If many candidates exist, avoid guessing.
- */
-static int arp_resolve_backup_local(struct forwarder *fwd,
-                                    const struct profile_config *prof,
-                                    int profile_pi,
-                                    uint32_t spa, uint32_t tpa, int have_ips)
-{
-    int candidates[MAX_INTERFACES];
-    int n = 0;
-    (void)profile_pi;
-    (void)spa;
-    (void)tpa;
-    (void)have_ips;
-
-    if (!fwd || !fwd->cfg || !prof)
-        return -1;
-
-    for (int i = 0; i < prof->bridge_count; i++) {
-        int li;
-        int wan_dp = prof->bridges[i].wan_dp;
-
-        if (arp_wan_dp_usable(wan_dp))
-            continue;
-        li = bridge_fwd_local(fwd, prof->bridges[i].local_idx);
-        if (li < 0)
-            continue;
-        if (n < MAX_INTERFACES)
-            candidates[n++] = li;
-    }
-
-    if (n == 0)
-        return -1;
-    if (n == 1)
-        return candidates[0];
-    return -1;
-}
-
 static int arp_select_egress_wan(struct forwarder *fwd,
                                  const struct profile_config *prof,
                                  int primary_wan_dp, int *used_backup)
@@ -416,6 +266,9 @@ static int arp_select_egress_wan(struct forwarder *fwd,
     if (arp_wan_dp_usable(primary_wan_dp) && !fwd_wan_is_stopped(primary_wan_dp))
         return primary_wan_dp;
 
+    if (!wan_failover_enabled())
+        return -1;
+
     {
         int backup = arp_pick_backup_wan_dp(fwd, prof, primary_wan_dp);
 
@@ -425,6 +278,111 @@ static int arp_select_egress_wan(struct forwarder *fwd,
             *used_backup = 1;
         return backup;
     }
+}
+
+static int arp_profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd_local_idx)
+{
+    const struct profile_config *prof;
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
+        return 0;
+    if (fwd_local_idx < 0 || fwd_local_idx >= fwd->local_count)
+        return 0;
+    if (!ne_pair_local_live(&fwd->pair, fwd_local_idx))
+        return 0;
+
+    prof = &fwd->cfg->profiles[profile_pi];
+    if (!prof->enabled)
+        return 0;
+
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
+        return 0;
+
+    for (int i = 0; i < prof->local_count; i++) {
+        int ci = prof->local_indices[i];
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* who-has (ffff) or unicast FDB miss: clone to every live LAN in the profile.
+ * lans_out: optional "lan1,lan2,..." of interfaces that actually got a copy. */
+static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
+                                       const uint8_t *pkt, int profile_pi,
+                                       char *lans_out, size_t lans_out_sz)
+{
+    const struct profile_config *prof;
+    int wi;
+    int sent = 0;
+    uint16_t sent_mask = 0;
+    size_t lans_len = 0;
+
+    if (lans_out && lans_out_sz > 0)
+        lans_out[0] = '\0';
+
+    if (!fwd || !job || !pkt || !fwd->cfg || profile_pi < 0 ||
+        profile_pi >= fwd->cfg->profile_count)
+        return -1;
+
+    prof = &fwd->cfg->profiles[profile_pi];
+    if (!prof->enabled || prof->local_count <= 0)
+        return -1;
+
+    wi = dp_crypto_current_worker_idx();
+
+    for (int i = 0; i < prof->local_count; i++) {
+        int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);
+        struct ne_ring *ring;
+        const char *lif;
+
+        if (li < 0 || li >= fwd->local_count)
+            continue;
+        if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
+            continue;
+
+        ring = &fwd->mid_to_local[li][wi];
+        lif = fwd->locals[li].ifname[0] ? fwd->locals[li].ifname : "?";
+
+        if (sent == 0) {
+            job->dir = NE_DIR_LOCAL;
+            job->local_idx = (uint8_t)li;
+            if (ne_ring_try_push(ring, job) != 0)
+                return -1;
+            sent = 1;
+        } else {
+            struct ne_packet clone = {
+                .len = job->len,
+                .dir = NE_DIR_LOCAL,
+                .local_idx = (uint8_t)li,
+            };
+
+            if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
+                break;
+            memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
+            if (ne_ring_try_push(ring, &clone) != 0) {
+                ne_frame_free(&fwd->pair, clone.addr);
+                break;
+            }
+        }
+        if (li < (int)(sizeof(sent_mask) * 8))
+            sent_mask |= (1u << li);
+
+        if (lans_out && lans_out_sz > 1) {
+            int n = snprintf(lans_out + lans_len, lans_out_sz - lans_len,
+                             "%s%s", lans_len ? "," : "", lif);
+            if (n < 0 || (size_t)n >= lans_out_sz - lans_len)
+                lans_len = lans_out_sz - 1;
+            else
+                lans_len += (size_t)n;
+        }
+    }
+    return sent > 0 ? 0 : -1;
 }
 
 static const char *local_ifname(struct forwarder *fwd, int li)
@@ -439,6 +397,49 @@ static const char *wan_ifname(struct forwarder *fwd, int wan_dp)
     if (!fwd || wan_dp < 0 || wan_dp >= fwd->wan_count)
         return "?";
     return fwd->wans[wan_dp].ifname;
+}
+
+/* BR name for LAN (fwd local) in profile; "-" if not in a bridge pair. */
+static const char *arp_br_name_for_lan(struct forwarder *fwd,
+                                       const struct profile_config *prof,
+                                       int fwd_local_idx)
+{
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || !prof || fwd_local_idx < 0 ||
+        fwd_local_idx >= fwd->local_count)
+        return "-";
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
+        return "-";
+
+    for (int i = 0; i < prof->bridge_count; i++) {
+        int ci = prof->bridges[i].local_idx;
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) != 0)
+            continue;
+        if (prof->bridges[i].ifname[0])
+            return prof->bridges[i].ifname;
+        return "(unnamed)";
+    }
+    return "-";
+}
+
+/* BR name for WAN dp in profile. */
+static const char *arp_br_name_for_wan(const struct profile_config *prof, int wan_dp)
+{
+    if (!prof || wan_dp < 0)
+        return "-";
+    for (int i = 0; i < prof->bridge_count; i++) {
+        if (prof->bridges[i].wan_dp != wan_dp)
+            continue;
+        if (prof->bridges[i].ifname[0])
+            return prof->bridges[i].ifname;
+        return "(unnamed)";
+    }
+    return "-";
 }
 
 static int profile_pi_for_fwd_local(struct forwarder *fwd, int fwd_li)
@@ -640,70 +641,83 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
         uint32_t spa = 0, tpa = 0;
         const char *skip_why = NULL;
         int encrypted;
-        static uint64_t last_local_policy_ms;
+        int is_req;
+        char spa_s[16], tpa_s[16], dmac_s[24], smac_s[24];
 
-        if (dp_parse_arp_ips(pkt, job->len, &spa, &tpa) != 0) {
+        if (job->len < ARP_ETH_HDR_LEN ||
+            dp_parse_arp_ips(pkt, job->len, &spa, &tpa) != 0) {
             static uint64_t last_parse_ms;
 
             if (arp_log_fail_ratelimit(&last_parse_ms))
-                fprintf(stderr, "[ARP] local %s parse-fail bridge=drop\n",
+                fprintf(stderr, "[ARP-TX] FAIL parse lan=%s\n",
                         local_ifname(fwd, ingress_li));
             return -1;
         }
         encrypted = arp_try_encrypt_l2_pqc(fwd, job, mut, profile_pi, &skip_why);
 
-        if (used_backup)
-            arp_backup_remember(wan_dp, spa, tpa, ingress_li);
+        is_req = arp_eth_dmac_is_broadcast(pkt, job->len) ||
+                 arp_eth_dmac_is_multicast(pkt, job->len);
+        arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
+        arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+        arp_format_mac(pkt, dmac_s, sizeof(dmac_s));
+        arp_format_mac(pkt + MAC_LEN, smac_s, sizeof(smac_s));
 
-        {
-            char spa_s[16], tpa_s[16];
-
-            arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
-            arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
-            if (used_backup) {
-                const char *br_of_backup = "?";
-                int bl = -1;
-
-                if (resolve_fwd_local_for_wan_dp(fwd, prof, wan_dp, &bl) == 0)
-                    br_of_backup = local_ifname(fwd, bl);
-
+        if (is_req) {
+            if (used_backup)
                 arp_log_backup_line(
-                    "[ARP] BACKUP-EGRESS pkt: origin_lan=%s "
-                    "primary_wan=%s(DOWN) actual_egress_wan=%s "
-                    "reply_must_deliver_lan=%s "
-                    "br_of_actual_wan=%s(IGNORE-br-sai) "
-                    "spa=%s tpa=%s encrypted=%d\n",
+                    "[ARP-TX] REQUEST (who-has) dmac=%s\n"
+                    "         lan=%s (br=%s) primary_wan=%s(DOWN) -> BACKUP wan=%s (br=%s)\n"
+                    "         spa=%s tpa=%s smac=%s encrypted=%d%s%s\n",
+                    dmac_s,
                     local_ifname(fwd, ingress_li),
+                    arp_br_name_for_lan(fwd, prof, ingress_li),
                     wan_ifname(fwd, primary_wan_dp),
                     wan_ifname(fwd, wan_dp),
+                    arp_br_name_for_wan(prof, wan_dp),
+                    spa_s, tpa_s, smac_s, encrypted,
+                    (!encrypted && skip_why) ? " why=" : "",
+                    (!encrypted && skip_why) ? skip_why : "");
+            else
+                arp_log_backup_line(
+                    "[ARP-TX] REQUEST (who-has) dmac=%s\n"
+                    "         lan=%s (br=%s) -> wan=%s (br=%s) [PRIMARY]\n"
+                    "         spa=%s tpa=%s smac=%s encrypted=%d%s%s\n",
+                    dmac_s,
                     local_ifname(fwd, ingress_li),
-                    br_of_backup,
-                    spa_s, tpa_s, encrypted);
-            } else if (arp_log_fail_ratelimit(&last_local_policy_ms)) {
-                if (encrypted)
-                    fprintf(stderr,
-                            "[ARP] path=primary dir=lan->wan "
-                            "origin_lan=%s primary_wan=%s egress_wan=%s "
-                            "spa=%s tpa=%s mode=encrypt-l2-default-key "
-                            "enc_wire_id=%d encrypted=%d%s%s\n",
-                            local_ifname(fwd, ingress_li),
-                            wan_ifname(fwd, wan_dp), wan_ifname(fwd, wan_dp),
-                            spa_s, tpa_s,
-                            ARP_DEFAULT_WIRE_ID, encrypted,
-                            (!encrypted && skip_why) ? " why=" : "",
-                            (!encrypted && skip_why) ? skip_why : "");
-                else
-                    fprintf(stderr,
-                            "[ARP] path=primary dir=lan->wan "
-                            "origin_lan=%s primary_wan=%s egress_wan=%s "
-                            "spa=%s tpa=%s mode=plain encrypted=0%s%s\n",
-                            local_ifname(fwd, ingress_li),
-                            wan_ifname(fwd, wan_dp), wan_ifname(fwd, wan_dp),
-                            spa_s, tpa_s,
-                            skip_why ? " why=" : "",
-                            skip_why ? skip_why : "");
-                fflush(stderr);
-            }
+                    arp_br_name_for_lan(fwd, prof, ingress_li),
+                    wan_ifname(fwd, wan_dp),
+                    arp_br_name_for_wan(prof, wan_dp),
+                    spa_s, tpa_s, smac_s, encrypted,
+                    (!encrypted && skip_why) ? " why=" : "",
+                    (!encrypted && skip_why) ? skip_why : "");
+        } else {
+            if (used_backup)
+                arp_log_backup_line(
+                    "[ARP-TX] REPLY dmac=%s\n"
+                    "         lan=%s (br=%s) primary_wan=%s(DOWN) -> BACKUP wan=%s (br=%s)\n"
+                    "         spa=%s tpa=%s smac=%s encrypted=%d%s%s\n",
+                    dmac_s,
+                    local_ifname(fwd, ingress_li),
+                    arp_br_name_for_lan(fwd, prof, ingress_li),
+                    wan_ifname(fwd, primary_wan_dp),
+                    wan_ifname(fwd, wan_dp),
+                    arp_br_name_for_wan(prof, wan_dp),
+                    spa_s, tpa_s, smac_s, encrypted,
+                    (!encrypted && skip_why) ? " why=" : "",
+                    (!encrypted && skip_why) ? skip_why : "");
+            else
+                arp_log_backup_line(
+                    "[ARP-TX] REPLY dmac=%s\n"
+                    "         lan=%s (br=%s) -> wan=%s (br=%s) [PRIMARY]\n"
+                    "         spa=%s tpa=%s smac=%s encrypted=%d%s%s\n",
+                    dmac_s,
+                    local_ifname(fwd, ingress_li),
+                    arp_br_name_for_lan(fwd, prof, ingress_li),
+                    wan_ifname(fwd, wan_dp),
+                    arp_br_name_for_wan(prof, wan_dp),
+                    spa_s, tpa_s, smac_s, encrypted,
+                    (!encrypted && skip_why) ? " why=" : "",
+                    (!encrypted && skip_why) ? skip_why : "");
         }
     }
 
@@ -728,15 +742,17 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
                         char egress_ifname[IF_NAMESIZE])
 {
     int profile_pi;
-    const struct profile_config *prof;
-    int local_idx;
-    struct ne_ring *ring;
     uint8_t *mut;
     int dec;
     int was_plain;
     int had_marker;
     uint32_t spa = 0, tpa = 0;
     int have_ips = 0;
+    int is_bcast;
+    int deliver_li = -1;
+    char spa_s[16] = "?", tpa_s[16] = "?", dmac_s[24], smac_s[24] = "?";
+    char flood_lans[256] = "";
+    const char *crypto_state;
 
     if (egress_ifname)
         egress_ifname[0] = '\0';
@@ -777,114 +793,115 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
         return -1;
     }
 
-    prof = &fwd->cfg->profiles[profile_pi];
-    {
-        int bridge_local = -1;
-        int soft_local = -1;
-        int backup_local = -1;
-        int used_backup = 0;
+    if (job->len < ARP_ETH_HDR_LEN) {
+        static uint64_t last_short_ms;
 
-        if (have_ips)
-            soft_local = arp_backup_lookup(ingress_wan_dp, spa, tpa);
+        if (arp_log_fail_ratelimit(&last_short_ms))
+            fprintf(stderr, "[ARP] wan %s fail: frame too short\n",
+                    wan_ifname(fwd, ingress_wan_dp));
+        return -1;
+    }
 
-        if (soft_local >= 0) {
-            local_idx = soft_local;
-            used_backup = 1;
-            if (resolve_fwd_local_for_wan_dp(fwd, prof, ingress_wan_dp,
-                                            &bridge_local) != 0)
-                bridge_local = -1;
-        } else {
-            bridge_local = -1;
-            if (resolve_fwd_local_for_wan_dp(fwd, prof, ingress_wan_dp, &bridge_local) != 0)
-                bridge_local = -1;
+    is_bcast = arp_eth_dmac_is_broadcast(mut, job->len) ||
+               arp_eth_dmac_is_multicast(mut, job->len);
+    arp_format_mac(mut, dmac_s, sizeof(dmac_s));
+    arp_format_mac(mut + MAC_LEN, smac_s, sizeof(smac_s));
+    if (have_ips) {
+        arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
+        arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+    }
 
-            if (bridge_local >= 0) {
-                /* Normal pair — do not steal with primary-down heuristic. */
-                local_idx = bridge_local;
-            } else {
-                /* WAN has no Br pair: fall back to LAN whose primary is down. */
-                backup_local = arp_resolve_backup_local(fwd, prof, profile_pi,
-                                                        spa, tpa, have_ips);
-                if (backup_local < 0) {
-                    static uint64_t last_no_pair_ms;
+    if (dec == 1)
+        crypto_state = "decrypted";
+    else if (was_plain)
+        crypto_state = "plain";
+    else if (had_marker)
+        crypto_state = "decrypted";
+    else
+        crypto_state = "plain";
 
-                    if (arp_log_fail_ratelimit(&last_no_pair_ms))
-                        fprintf(stderr,
-                                "[ARP] bridge wan %s fail: no BE pair "
-                                "(profile=%s bridges=%d)\n",
-                                wan_ifname(fwd, ingress_wan_dp), prof->name,
-                                prof->bridge_count);
-                    return -1;
-                }
-                local_idx = backup_local;
-                used_backup = 1;
-            }
-        }
+    if (is_bcast) {
+        const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
 
-        ring = arp_mid_to_local_ring(fwd, local_idx);
-        job->dir = NE_DIR_LOCAL;
-        job->local_idx = (uint8_t)local_idx;
-        if (dp_ring_push(fwd, ring, job) != 0) {
-            static uint64_t last_ring_fail_ms;
+        if (arp_flood_to_profile_locals(fwd, job, mut, profile_pi,
+                                        flood_lans, sizeof(flood_lans)) != 0) {
+            static uint64_t last_flood_fail_ms;
 
-            if (arp_log_fail_ratelimit(&last_ring_fail_ms))
-                fprintf(stderr, "[ARP] bridge wan %s -> local %s fail: ring push\n",
-                        wan_ifname(fwd, ingress_wan_dp), local_ifname(fwd, local_idx));
+            if (arp_log_fail_ratelimit(&last_flood_fail_ms))
+                fprintf(stderr,
+                        "[ARP-RX] REQUEST FLOOD FAIL from_wan=%s spa=%s tpa=%s\n",
+                        wan_ifname(fwd, ingress_wan_dp), spa_s, tpa_s);
             return -1;
         }
+        arp_log_backup_line(
+            "[ARP-RX] REQUEST (who-has) dmac=%s\n"
+            "         from_wan=%s (br=%s) -> FLOOD lans=[%s]\n"
+            "         spa=%s tpa=%s smac=%s crypto=%s\n",
+            dmac_s,
+            wan_ifname(fwd, ingress_wan_dp),
+            arp_br_name_for_wan(prof, ingress_wan_dp),
+            flood_lans[0] ? flood_lans : "-",
+            spa_s, tpa_s, smac_s, crypto_state);
+    } else {
+        const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
 
-        {
-            static uint64_t last_wan_bridge_ms;
-            const char *crypto_state;
-            char spa_s[16] = "?", tpa_s[16] = "?";
+        deliver_li = mac_lookup(fwd, mut);
+        if (deliver_li >= 0 && arp_profile_owns_local(fwd, profile_pi, deliver_li)) {
+            struct ne_ring *ring = arp_mid_to_local_ring(fwd, deliver_li);
 
-            if (dec == 1)
-                crypto_state = "decrypted";
-            else if (was_plain)
-                crypto_state = "plain";
-            else if (had_marker)
-                crypto_state = "decrypted";
-            else
-                crypto_state = "plain";
+            job->dir = NE_DIR_LOCAL;
+            job->local_idx = (uint8_t)deliver_li;
+            if (dp_ring_push(fwd, ring, job) != 0) {
+                static uint64_t last_ring_fail_ms;
 
-            if (have_ips) {
-                arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
-                arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+                if (arp_log_fail_ratelimit(&last_ring_fail_ms))
+                    fprintf(stderr,
+                            "[ARP-RX] REPLY FDB FAIL from_wan=%s lan=%s "
+                            "smac=%s dmac=%s\n",
+                            wan_ifname(fwd, ingress_wan_dp),
+                            local_ifname(fwd, deliver_li),
+                            smac_s, dmac_s);
+                return -1;
             }
+            arp_log_backup_line(
+                "[ARP-RX] REPLY dmac=%s\n"
+                "         from_wan=%s (br=%s) -> lan=%s (br=%s) [MAC-FDB]\n"
+                "         spa=%s tpa=%s smac=%s crypto=%s\n",
+                dmac_s,
+                wan_ifname(fwd, ingress_wan_dp),
+                arp_br_name_for_wan(prof, ingress_wan_dp),
+                local_ifname(fwd, deliver_li),
+                arp_br_name_for_lan(fwd, prof, deliver_li),
+                spa_s, tpa_s, smac_s, crypto_state);
+        } else {
+            if (arp_flood_to_profile_locals(fwd, job, mut, profile_pi,
+                                            flood_lans, sizeof(flood_lans)) != 0) {
+                static uint64_t last_flood_miss_ms;
 
-            if (used_backup && soft_local >= 0) {
-                const char *br_would = bridge_local >= 0
-                    ? local_ifname(fwd, bridge_local) : "none";
-
-                arp_log_backup_line(
-                    "[ARP] BACKUP-RETURN pkt: ingress_wan=%s "
-                    "br_of_ingress_wan=%s(IGNORE-br-sai) "
-                    "deliver_lan=%s(LAN-goc-tu-soft-state) "
-                    "spa=%s tpa=%s crypto=%s\n",
-                    wan_ifname(fwd, ingress_wan_dp), br_would,
-                    local_ifname(fwd, local_idx),
-                    spa_s, tpa_s, crypto_state);
-            } else if (used_backup) {
-                arp_log_backup_line(
-                    "[ARP] BACKUP-RETURN pkt: ingress_wan=%s "
-                    "deliver_lan=%s(LAN-goc-heuristic) "
-                    "spa=%s tpa=%s crypto=%s\n",
-                    wan_ifname(fwd, ingress_wan_dp),
-                    local_ifname(fwd, local_idx),
-                    spa_s, tpa_s, crypto_state);
-            } else if (arp_log_fail_ratelimit(&last_wan_bridge_ms)) {
-                fprintf(stderr,
-                        "[ARP] path=primary dir=wan->lan "
-                        "ingress_wan=%s deliver_lan=%s spa=%s tpa=%s crypto=%s\n",
-                        wan_ifname(fwd, ingress_wan_dp),
-                        local_ifname(fwd, local_idx),
-                        spa_s, tpa_s, crypto_state);
-                fflush(stderr);
+                if (arp_log_fail_ratelimit(&last_flood_miss_ms))
+                    fprintf(stderr,
+                            "[ARP-RX] REPLY FLOOD-MISS FAIL from_wan=%s "
+                            "smac=%s dmac=%s\n",
+                            wan_ifname(fwd, ingress_wan_dp), smac_s, dmac_s);
+                return -1;
             }
+            arp_log_backup_line(
+                "[ARP-RX] REPLY dmac=%s [MAC miss -> FLOOD]\n"
+                "         from_wan=%s (br=%s) -> FLOOD lans=[%s]\n"
+                "         spa=%s tpa=%s smac=%s crypto=%s\n",
+                dmac_s,
+                wan_ifname(fwd, ingress_wan_dp),
+                arp_br_name_for_wan(prof, ingress_wan_dp),
+                flood_lans[0] ? flood_lans : "-",
+                spa_s, tpa_s, smac_s, crypto_state);
         }
-
-        if (egress_ifname)
-            strncpy(egress_ifname, local_ifname(fwd, local_idx), IF_NAMESIZE - 1);
-        return 0;
     }
+
+    if (egress_ifname) {
+        if (deliver_li >= 0)
+            strncpy(egress_ifname, local_ifname(fwd, deliver_li), IF_NAMESIZE - 1);
+        else
+            strncpy(egress_ifname, "*", IF_NAMESIZE - 1);
+    }
+    return 0;
 }

@@ -3,6 +3,12 @@
 
 struct forwarder;
 
+/* 1 = CFM failover + WAN backup (ARP/traffic). 0 = primary bridge only. */
+#ifndef FAILOVER_ENABLE
+#define FAILOVER_ENABLE 0
+#endif
+
+int wan_failover_enabled(void);
 int wan_failover_start(struct forwarder *fwd);
 void wan_failover_on_cfg(struct forwarder *fwd);
 void wan_failover_stop(void);

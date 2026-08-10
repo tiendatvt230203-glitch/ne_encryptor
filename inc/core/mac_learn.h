@@ -33,7 +33,7 @@ void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
 void mac_learn_tick(struct forwarder *fwd);
 
-/* BR userspace: learn SMAC from ARP on LAN only — never drives flooding. */
+/* BR userspace: learn SMAC from ARP on LAN — drives WAN->LAN unicast ARP deliver. */
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);

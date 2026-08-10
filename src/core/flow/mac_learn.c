@@ -82,7 +82,7 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
 
 /*
  * Userspace BR FDB: key = MAC, value = LAN ifname learned from ARP on that BR.
- * Forwarding itself uses BE bridge pairs only — this table does not drive flood.
+ * ARP bridge WAN->LAN: unicast uses this table; broadcast who-has floods all LANs.
  */
 static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const char *ifname,
                                             const uint8_t mac[MAC_LEN], uint64_t now_ms,
