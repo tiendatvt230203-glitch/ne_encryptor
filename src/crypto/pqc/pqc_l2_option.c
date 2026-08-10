@@ -345,11 +345,12 @@ static int l2_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
 
 /*
  * ARP L2 PQC wire (overwrite ethertype only):
- *   [dst][src][0x823E][policy_id:1][core_id:1][nonce:12][ciphertext(ARP 28B)+tag:16]
+ *   [dst][src][0x823E][core_id:1][nonce:12][ciphertext(ARP 28B)+tag:16]
+ * No policy-id byte for ARP wire; marker ethertype is enough.
  * Decrypt: see 0x823E → decrypt → write back 0x0806.
  */
 #define ARP_ETH_IPV4_PAYLOAD 28
-#define ARP_WIRE_HDR_LEN     (L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE) /* 14 */
+#define ARP_WIRE_HDR_LEN     (L2_CORE_ID_LEN + L2_NONCE_SIZE) /* 13 */
 
 static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len)
 {
@@ -370,9 +371,11 @@ static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
         return -1;
     if (crypto_pqc_generate_nonce(nonce) != 0)
         return -1;
-    /* Overwrite 0x0806 → 0x823E + policy_id + core_id + nonce */
-    l2_write_wire_header_et(packet, et_off, NE_L2_FAKE_ETHERTYPE_ARP,
-                            ctx->wire_id, nonce, L2_NONCE_SIZE);
+    /* Overwrite 0x0806 → 0x823E + core_id + nonce (no policy-id for ARP). */
+    packet[et_off] = (uint8_t)(NE_L2_FAKE_ETHERTYPE_ARP >> 8);
+    packet[et_off + 1] = (uint8_t)(NE_L2_FAKE_ETHERTYPE_ARP & 0xFF);
+    packet[et_off + 2] = crypto_option_worker_idx();
+    memcpy(packet + et_off + 3, nonce, (size_t)L2_NONCE_SIZE);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start,
                                    ARP_ETH_IPV4_PAYLOAD, &new_len) != 0)
         return -1;
@@ -396,7 +399,7 @@ static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
         return -1;
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
-    memcpy(nonce, packet + et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN, (size_t)L2_NONCE_SIZE);
+    memcpy(nonce, packet + et_off + 2 + L2_CORE_ID_LEN, (size_t)L2_NONCE_SIZE);
     if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_start,
                                    (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;

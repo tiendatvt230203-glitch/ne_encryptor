@@ -21,22 +21,14 @@
 #define ARP_LOG_FAIL_INTERVAL_MS 30000ull
 #define ARP_BACKUP_SOFT_MAX      64
 #define ARP_BACKUP_SOFT_TTL_MS   3000ull
+#define ARP_DEFAULT_WIRE_ID      250u
+#define ARP_DEFAULT_AES_BITS     256
 
-struct arp_l2_pqc_entry {
-    int policy_index;
-    int priority;
-    int wire_id;
-    int db_id;
-    int profile_id;
-    int src_any;
-    int dst_any;
-    int src_negate;
-    int dst_negate;
-    uint32_t src_net;
-    uint32_t src_mask;
-    uint32_t dst_net;
-    uint32_t dst_mask;
-};
+/* 1 = mã hóa ARP L2-PQC (key/option riêng), 0 = bridge ARP plaintext.
+ * Decrypt vẫn chạy nếu wire có ARP marker (peer vẫn encrypt). */
+#ifndef ARP_ENCRYPT_ENABLE
+#define ARP_ENCRYPT_ENABLE 1
+#endif
 
 struct arp_backup_soft_entry {
     int used;
@@ -47,12 +39,17 @@ struct arp_backup_soft_entry {
     uint64_t expire_ms;
 };
 
-static struct arp_l2_pqc_entry g_arp_l2_pqc[MAX_CRYPTO_POLICIES];
-static int g_arp_l2_pqc_count;
-
 static struct arp_backup_soft_entry g_arp_backup_soft[ARP_BACKUP_SOFT_MAX];
 static pthread_spinlock_t g_arp_backup_soft_lock;
 static int g_arp_backup_soft_lock_ready;
+static struct packet_crypto_ctx g_arp_crypto_ctx;
+static int g_arp_crypto_ctx_ready;
+static int g_arp_key_loaded;
+static uint8_t g_arp_default_master_key[AES_MAX_KEY_SIZE];
+
+/* 32-byte ARP master key: paste 64 hex chars (0-9a-f). Both peers must match. */
+static const char g_arp_hardcoded_master_key_hex[] =
+    "73214a9ce15d2fb816c73b90ad44f26e580da137cb7f2495ee6318d489ba05cf";
 
 static uint64_t arp_monotonic_ms(void)
 {
@@ -60,6 +57,35 @@ static uint64_t arp_monotonic_ms(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+static void arp_crypto_ctx_init(const struct app_config *cfg)
+{
+    if (!cfg || !cfg->crypto_enabled)
+        return;
+    if (!g_arp_key_loaded) {
+        if (parse_hex_bytes_pub(g_arp_hardcoded_master_key_hex,
+                                g_arp_default_master_key, AES_MAX_KEY_SIZE) != 0) {
+            fprintf(stderr,
+                    "[ARP] bad key hex (need %d hex chars, got %zu): %s\n",
+                    AES_MAX_KEY_SIZE * 2,
+                    strlen(g_arp_hardcoded_master_key_hex),
+                    g_arp_hardcoded_master_key_hex);
+            return;
+        }
+        g_arp_key_loaded = 1;
+    }
+    if (g_arp_crypto_ctx_ready)
+        return;
+    if (packet_crypto_init(&g_arp_crypto_ctx, g_arp_default_master_key,
+                           ARP_DEFAULT_AES_BITS) != 0)
+        return;
+    g_arp_crypto_ctx.initialized = true;
+    g_arp_crypto_ctx.crypto_mode = CRYPTO_MODE_PQC;
+    g_arp_crypto_ctx.wire_id = (uint8_t)ARP_DEFAULT_WIRE_ID;
+    g_arp_crypto_ctx.policy_id = 0;
+    g_arp_crypto_ctx.profile_id = 0;
+    g_arp_crypto_ctx_ready = 1;
 }
 
 static void arp_backup_soft_lock_init(void)
@@ -186,103 +212,14 @@ static void arp_format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
     snprintf(buf, bufsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
 }
 
-static int arp_cidr_match(int any_flag, int negate, uint32_t ip, uint32_t net, uint32_t mask)
-{
-    int in_cidr;
-
-    if (any_flag)
-        return 1;
-    in_cidr = ((ip & mask) == (net & mask));
-    return negate ? !in_cidr : in_cidr;
-}
-
-static int arp_entry_match_ips(const struct arp_l2_pqc_entry *e, uint32_t spa, uint32_t tpa)
-{
-    if (!e)
-        return 0;
-    if (!arp_cidr_match(e->src_any, e->src_negate, spa, e->src_net, e->src_mask))
-        return 0;
-    if (!arp_cidr_match(e->dst_any, e->dst_negate, tpa, e->dst_net, e->dst_mask))
-        return 0;
-    return 1;
-}
-
 void arp_bridge_reload_policies(struct app_config *cfg)
 {
-    g_arp_l2_pqc_count = 0;
     if (!cfg)
         return;
-
-    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (!p->enabled)
-            continue;
-        for (int j = 0; j < p->policy_count && j < MAX_CRYPTO_POLICIES; j++) {
-            int idx = p->policy_indices[j];
-            const struct crypto_policy *cp;
-            struct arp_l2_pqc_entry *e;
-
-            if (idx < 0 || idx >= cfg->policy_count)
-                continue;
-            cp = &cfg->policies[idx];
-            if (cp->action != POLICY_ACTION_ENCRYPT_L2)
-                continue;
-            if (cp->crypto_mode != CRYPTO_MODE_PQC)
-                continue;
-            if (cp->protocol != POLICY_PROTO_ANY)
-                continue;
-            if (g_arp_l2_pqc_count >= MAX_CRYPTO_POLICIES)
-                break;
-
-            e = &g_arp_l2_pqc[g_arp_l2_pqc_count++];
-            e->policy_index = idx;
-            e->priority = cp->priority;
-            e->wire_id = cp->id;
-            e->db_id = cp->db_id;
-            e->profile_id = p->id;
-            e->src_any = cp->src_any;
-            e->dst_any = cp->dst_any;
-            e->src_negate = cp->src_negate;
-            e->dst_negate = cp->dst_negate;
-            e->src_net = cp->src_net;
-            e->src_mask = cp->src_mask;
-            e->dst_net = cp->dst_net;
-            e->dst_mask = cp->dst_mask;
-        }
-    }
-
-    fprintf(stderr, "[ARP] l2-pqc-any policies cached: %d (lan->wan gate)\n",
-            g_arp_l2_pqc_count);
-}
-
-static const struct arp_l2_pqc_entry *arp_bridge_match_policy(int profile_id,
-                                                             uint32_t spa, uint32_t tpa)
-{
-    const struct arp_l2_pqc_entry *best = NULL;
-
-    for (int i = 0; i < g_arp_l2_pqc_count; i++) {
-        const struct arp_l2_pqc_entry *e = &g_arp_l2_pqc[i];
-
-        if (profile_id > 0 && e->profile_id != profile_id)
-            continue;
-        if (!arp_entry_match_ips(e, spa, tpa))
-            continue;
-        if (!best ||
-            e->priority < best->priority ||
-            (e->priority == best->priority && e->wire_id < best->wire_id))
-            best = e;
-    }
-    return best;
-}
-
-static const struct arp_l2_pqc_entry *arp_bridge_entry_by_wire_id(uint8_t wire_id)
-{
-    for (int i = 0; i < g_arp_l2_pqc_count; i++) {
-        if (g_arp_l2_pqc[i].wire_id == (int)wire_id)
-            return &g_arp_l2_pqc[i];
-    }
-    return NULL;
+    arp_crypto_ctx_init(cfg);
+    fprintf(stderr,
+            "[ARP] mode=allow-all | arp_encrypt=%d | key=arp-default | opt=L2-PQC/ARP\n",
+            ARP_ENCRYPT_ENABLE);
 }
 
 static struct ne_ring *arp_mid_to_local_ring(struct forwarder *fwd, int li)
@@ -432,7 +369,7 @@ static int arp_pick_backup_wan_dp(struct forwarder *fwd,
 
 /*
  * LAN whose primary bridge WAN is down/held/CFM-excluded.
- * One candidate → that LAN. Many → keep only if SPA/TPA policy uniquely matches.
+ * One candidate → that LAN. If many candidates exist, avoid guessing.
  */
 static int arp_resolve_backup_local(struct forwarder *fwd,
                                     const struct profile_config *prof,
@@ -441,6 +378,10 @@ static int arp_resolve_backup_local(struct forwarder *fwd,
 {
     int candidates[MAX_INTERFACES];
     int n = 0;
+    (void)profile_pi;
+    (void)spa;
+    (void)tpa;
+    (void)have_ips;
 
     if (!fwd || !fwd->cfg || !prof)
         return -1;
@@ -462,24 +403,6 @@ static int arp_resolve_backup_local(struct forwarder *fwd,
         return -1;
     if (n == 1)
         return candidates[0];
-
-    if (!have_ips)
-        return -1;
-
-    {
-        int matched = 0;
-        int pick = -1;
-
-        for (int i = 0; i < n; i++) {
-            if (!config_select_policy_for_arp(fwd->cfg, profile_pi, spa, tpa))
-                continue;
-            matched++;
-            pick = candidates[i];
-        }
-        /* Shared profile policies cannot disambiguate LANs — require unique. */
-        if (matched == 1)
-            return pick;
-    }
     return -1;
 }
 
@@ -545,21 +468,15 @@ static int profile_pi_for_fwd_local(struct forwarder *fwd, int fwd_li)
     return -1;
 }
 
-/* Returns 1 if encrypted, 0 if plaintext. Never blocks — allow-gate is separate. */
+/* Returns 1 if encrypted, 0 if plaintext. Never blocks ARP forwarding. */
 static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
-                                  uint8_t *pkt, int profile_id,
-                                  const struct arp_l2_pqc_entry **e_out,
+                                  uint8_t *pkt, int profile_idx,
                                   const char **skip_why)
 {
-    uint32_t spa = 0, tpa = 0;
-    const struct arp_l2_pqc_entry *e;
-    struct packet_crypto_ctx *pctx;
     uint8_t scratch[NE_FRAME];
     uint32_t orig_len;
     uint32_t len;
 
-    if (e_out)
-        *e_out = NULL;
     if (skip_why)
         *skip_why = NULL;
 
@@ -568,36 +485,20 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
             *skip_why = "bad-args";
         return 0;
     }
-    if (dp_parse_arp_ips(pkt, job->len, &spa, &tpa) != 0) {
+    if (!ARP_ENCRYPT_ENABLE) {
         if (skip_why)
-            *skip_why = "parse-fail";
+            *skip_why = "arp-encrypt-disabled";
         return 0;
     }
-
-    e = arp_bridge_match_policy(profile_id, spa, tpa);
-    if (!e) {
-        if (skip_why)
-            *skip_why = "no-l2-pqc-match";
-        return 0;
-    }
-    if (e_out)
-        *e_out = e;
-
     if (!fwd->cfg->crypto_enabled) {
         if (skip_why)
             *skip_why = "crypto-disabled";
         return 0;
     }
-    if (!fwd_crypto_policy_ready(e->policy_index)) {
+    arp_crypto_ctx_init(fwd->cfg);
+    if (!g_arp_crypto_ctx_ready) {
         if (skip_why)
-            *skip_why = "crypto-not-ready";
-        return 0;
-    }
-
-    pctx = fwd_crypto_policy_ctx(e->policy_index);
-    if (!pctx) {
-        if (skip_why)
-            *skip_why = "no-ctx";
+            *skip_why = "arp-crypto-not-ready";
         return 0;
     }
 
@@ -610,11 +511,12 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
     memcpy(scratch, pkt, orig_len);
     len = orig_len;
 
-    pctx->profile_id = profile_id;
-    pctx->wire_id = (uint8_t)e->wire_id;
-    pctx->policy_id = e->db_id;
+    g_arp_crypto_ctx.profile_id = profile_idx >= 0 ? profile_idx : 0;
+    g_arp_crypto_ctx.policy_id = 0;
+    g_arp_crypto_ctx.wire_id = (uint8_t)ARP_DEFAULT_WIRE_ID;
 
-    if (crypto_option_encrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP, pctx, pkt, &len) != 0) {
+    if (crypto_option_encrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP,
+                              &g_arp_crypto_ctx, pkt, &len) != 0) {
         memcpy(pkt, scratch, orig_len);
         job->len = orig_len;
         if (skip_why)
@@ -627,9 +529,6 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
 
 static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, uint8_t *pkt)
 {
-    uint8_t wire_id = 0;
-    const struct arp_l2_pqc_entry *e;
-    struct packet_crypto_ctx *pctx;
     uint32_t len;
     const char *fail_why = NULL;
 
@@ -646,25 +545,14 @@ static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, 
         fail_why = "crypto-disabled";
         goto decrypt_fail;
     }
-    if (crypto_eth_l2_read_policy_id(pkt, job->len, &wire_id) != 0) {
-        fail_why = "read-wire-id";
+    arp_crypto_ctx_init(fwd->cfg);
+    if (!g_arp_crypto_ctx_ready) {
+        fail_why = "arp-crypto-not-ready";
         goto decrypt_fail;
     }
-
-    e = arp_bridge_entry_by_wire_id(wire_id);
-    if (!e) {
-        fail_why = "unknown-wire-id";
-        goto decrypt_fail;
-    }
-
-    pctx = fwd_crypto_ctx_for_wire_id(wire_id);
-    if (!pctx) {
-        fail_why = "no-ctx";
-        goto decrypt_fail;
-    }
-
     len = job->len;
-    if (crypto_option_decrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP, pctx, pkt, &len) != 0) {
+    if (crypto_option_decrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_ARP,
+                              &g_arp_crypto_ctx, pkt, &len) != 0) {
         fail_why = "decrypt-error";
         goto decrypt_fail;
     }
@@ -677,9 +565,7 @@ static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, 
         static uint64_t last_dec_ok_ms;
 
         if (arp_log_fail_ratelimit(&last_dec_ok_ms))
-            fprintf(stderr,
-                    "[ARP] decrypt ok wire_id=%u policy_index=%d db_id=%d\n",
-                    (unsigned)wire_id, e->policy_index, e->db_id);
+            fprintf(stderr, "[ARP] decrypt ok (arp-default-key)\n");
     }
     return 1;
 
@@ -688,8 +574,8 @@ decrypt_fail:
         static uint64_t last_dec_fail_ms;
 
         if (arp_log_fail_ratelimit(&last_dec_fail_ms))
-            fprintf(stderr, "[ARP] decrypt fail wire_id=%u why=%s\n",
-                    (unsigned)wire_id, fail_why ? fail_why : "unknown");
+            fprintf(stderr, "[ARP] decrypt fail why=%s\n",
+                    fail_why ? fail_why : "unknown");
     }
     return -1;
 }
@@ -752,8 +638,6 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
 
     {
         uint32_t spa = 0, tpa = 0;
-        const struct crypto_policy *cover = NULL;
-        const struct arp_l2_pqc_entry *enc_pol = NULL;
         const char *skip_why = NULL;
         int encrypted;
         static uint64_t last_local_policy_ms;
@@ -762,28 +646,11 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
             static uint64_t last_parse_ms;
 
             if (arp_log_fail_ratelimit(&last_parse_ms))
-                fprintf(stderr, "[ARP] local %s policy=no-match why=parse-fail bridge=drop\n",
+                fprintf(stderr, "[ARP] local %s parse-fail bridge=drop\n",
                         local_ifname(fwd, ingress_li));
             return -1;
         }
-
-        cover = config_select_policy_for_arp(fwd->cfg, profile_pi, spa, tpa);
-        if (!cover) {
-            static uint64_t last_local_drop_ms;
-            char spa_s[16], tpa_s[16];
-
-            if (arp_log_fail_ratelimit(&last_local_drop_ms)) {
-                arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
-                arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
-                fprintf(stderr,
-                        "[ARP] local %s spa=%s tpa=%s policy=no-match "
-                        "encrypted=0 bridge=drop\n",
-                        local_ifname(fwd, ingress_li), spa_s, tpa_s);
-            }
-            return -1;
-        }
-
-        encrypted = arp_try_encrypt_l2_pqc(fwd, job, mut, prof->id, &enc_pol, &skip_why);
+        encrypted = arp_try_encrypt_l2_pqc(fwd, job, mut, profile_pi, &skip_why);
 
         if (used_backup)
             arp_backup_remember(wan_dp, spa, tpa, ingress_li);
@@ -813,31 +680,26 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                     br_of_backup,
                     spa_s, tpa_s, encrypted);
             } else if (arp_log_fail_ratelimit(&last_local_policy_ms)) {
-                if (enc_pol)
+                if (encrypted)
                     fprintf(stderr,
                             "[ARP] path=primary dir=lan->wan "
                             "origin_lan=%s primary_wan=%s egress_wan=%s "
-                            "spa=%s tpa=%s policy=cover "
-                            "wire_id=%d db_id=%d priority=%d action=%d "
+                            "spa=%s tpa=%s mode=encrypt-l2-default-key "
                             "enc_wire_id=%d encrypted=%d%s%s\n",
                             local_ifname(fwd, ingress_li),
                             wan_ifname(fwd, wan_dp), wan_ifname(fwd, wan_dp),
                             spa_s, tpa_s,
-                            cover->id, cover->db_id, cover->priority, cover->action,
-                            enc_pol->wire_id, encrypted,
+                            ARP_DEFAULT_WIRE_ID, encrypted,
                             (!encrypted && skip_why) ? " why=" : "",
                             (!encrypted && skip_why) ? skip_why : "");
                 else
                     fprintf(stderr,
                             "[ARP] path=primary dir=lan->wan "
                             "origin_lan=%s primary_wan=%s egress_wan=%s "
-                            "spa=%s tpa=%s policy=cover "
-                            "wire_id=%d db_id=%d priority=%d action=%d "
-                            "encrypted=0%s%s\n",
+                            "spa=%s tpa=%s mode=plain encrypted=0%s%s\n",
                             local_ifname(fwd, ingress_li),
                             wan_ifname(fwd, wan_dp), wan_ifname(fwd, wan_dp),
                             spa_s, tpa_s,
-                            cover->id, cover->db_id, cover->priority, cover->action,
                             skip_why ? " why=" : "",
                             skip_why ? skip_why : "");
                 fflush(stderr);

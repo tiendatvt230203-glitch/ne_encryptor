@@ -486,17 +486,20 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
     return 1;
 }
 
-/* ARP: SPA/TPA only — no L4 ports; caller requires L2 + protocol any. */
+/* ARP: SPA/TPA only — match forward (src→dst) or reverse (reply đảo chiều). */
 static int crypto_policy_match_arp_ips(const struct crypto_policy *cp,
                                        uint32_t spa, uint32_t tpa)
 {
     if (!cp)
         return 0;
-    if (!cidr_match_with_negate(cp->src_any, cp->src_negate, spa, cp->src_net, cp->src_mask))
-        return 0;
-    if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, tpa, cp->dst_net, cp->dst_mask))
-        return 0;
-    return 1;
+    if (cidr_match_with_negate(cp->src_any, cp->src_negate, spa, cp->src_net, cp->src_mask) &&
+        cidr_match_with_negate(cp->dst_any, cp->dst_negate, tpa, cp->dst_net, cp->dst_mask))
+        return 1;
+    /* ARP reply: SPA/TPA đảo so với request — cùng rule 1.1→1.2 vẫn cover 1.2→1.1 */
+    if (cidr_match_with_negate(cp->src_any, cp->src_negate, tpa, cp->src_net, cp->src_mask) &&
+        cidr_match_with_negate(cp->dst_any, cp->dst_negate, spa, cp->dst_net, cp->dst_mask))
+        return 1;
+    return 0;
 }
 
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
