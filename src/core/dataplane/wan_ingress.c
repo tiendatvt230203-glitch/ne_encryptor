@@ -293,11 +293,6 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     return 0;
 }
 
-static int eth_dmac_is_unicast(const uint8_t *pkt)
-{
-    return (pkt[0] & 0x01u) == 0;
-}
-
 static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
 {
     int profile_id;
@@ -343,64 +338,6 @@ static int profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd_loc
             return 1;
     }
     return 0;
-}
-
-/* Data path only (tcp/udp/icmp/ospf) when dmac is not in the FDB yet. */
-static int flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
-                                   const uint8_t *pkt, int profile_pi)
-{
-    const struct profile_config *prof;
-    int wi;
-    int sent = 0;
-    uint16_t sent_mask = 0;
-
-    if (!fwd || !job || !pkt || !fwd->cfg || profile_pi < 0 ||
-        profile_pi >= fwd->cfg->profile_count)
-        return -1;
-
-    prof = &fwd->cfg->profiles[profile_pi];
-    if (!prof->enabled || prof->local_count <= 0)
-        return -1;
-
-    wi = dp_crypto_current_worker_idx();
-
-    for (int i = 0; i < prof->local_count; i++) {
-        int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);
-        struct ne_ring *ring;
-
-        if (li < 0 || li >= fwd->local_count)
-            continue;
-        if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
-            continue;
-
-        ring = &fwd->mid_to_local[li][wi];
-
-        if (sent == 0) {
-            job->dir = NE_DIR_LOCAL;
-            job->local_idx = (uint8_t)li;
-            if (ne_ring_try_push(ring, job) != 0)
-                return -1;
-            sent = 1;
-        } else {
-            struct ne_packet clone = {
-                .len = job->len,
-                .dir = NE_DIR_LOCAL,
-                .local_idx = (uint8_t)li,
-            };
-            /* Job already owned by first LAN ring — never fail the whole flood
-             * after that, or caller would double-free job.addr. */
-            if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
-                return 0;
-            memcpy(ne_packet_data(&fwd->pair, clone.addr), pkt, job->len);
-            if (ne_ring_try_push(ring, &clone) != 0) {
-                ne_frame_free(&fwd->pair, clone.addr);
-                return 0;
-            }
-        }
-        if (li < (int)(sizeof(sent_mask) * 8))
-            sent_mask |= (1u << li);
-    }
-    return sent > 0 ? 0 : -1;
 }
 
 static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
@@ -498,33 +435,32 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 }
 
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
-                                const uint8_t *wire_pkt, uint32_t wire_len)
+                                const uint8_t *wire_pkt, uint32_t wire_len,
+                                int wan_dp)
 {
     uint8_t *pkt;
     int profile_pi;
     int li;
 
+    (void)wan_dp;
     if (!fwd || !job || !wire_pkt || wire_len < 14u)
         return -1;
     pkt = ne_packet_data(&fwd->pair, job->addr);
     if (!pkt || job->len < 14u)
-        return -1;
-    if (!eth_dmac_is_unicast(pkt))
         return -1;
 
     profile_pi = wan_profile_pi(fwd, wire_pkt, wire_len);
     if (profile_pi < 0)
         return -1;
 
-    /* Data path: FDB hit → that LAN only. ARP never reaches here (bridged earlier). */
+    /* TCP/UDP/OSPF về WAN: tra MAC đã học từ ARP → deliver 1 LAN; miss thì drop. */
     li = mac_lookup(fwd, pkt);
-    if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
-        job->dir = NE_DIR_LOCAL;
-        job->local_idx = (uint8_t)li;
-        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
-    }
+    if (li < 0 || !profile_owns_local(fwd, profile_pi, li))
+        return -1;
 
-    return flood_to_profile_locals(fwd, job, pkt, profile_pi);
+    job->dir = NE_DIR_LOCAL;
+    job->local_idx = (uint8_t)li;
+    return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
 }
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
@@ -534,8 +470,9 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint32_t wire_len;
     int dec;
     int encrypted;
+    int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
 
-    if (!fwd || !pkt)
+    if (!fwd || !pkt || wan_dp < 0)
         goto drop;
 
     wire_len = job.len;
@@ -544,17 +481,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     memcpy(wire_buf, pkt, wire_len);
 
     if (crypto_eth_l2_has_arp_marker(pkt, job.len) || dp_pkt_is_arp(pkt, job.len)) {
-        int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-        char bridge_to[IF_NAMESIZE] = "";
-        int bridged = -1;
-
-        if (wan_dp >= 0)
-            bridged = arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to);
-
-        if (bridged == 0) {
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+        if (arp_bridge_from_wan(fwd, &job, pkt, wan_dp, NULL) == 0)
             return;
-        }
         goto drop;
     }
 
@@ -571,12 +499,11 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
-
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
     }
 
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
+    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len, wan_dp) != 0)
         goto drop;
     ne_dp_stats_wan_fwd(1);
     return;

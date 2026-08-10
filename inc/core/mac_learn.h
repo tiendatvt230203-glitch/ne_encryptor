@@ -11,8 +11,7 @@ struct forwarder;
 #define MAC_LEARN_HASH_BUCKETS 256
 
 enum mac_learn_src {
-    MAC_LEARN_SRC_TRAFFIC = 0, /* unused on BR path — ARP only */
-    MAC_LEARN_SRC_ARP = 1,
+    MAC_LEARN_SRC_ARP = 1, /* chỉ ARP trên LAN populate FDB */
 };
 
 struct mac_learn_entry {
@@ -33,9 +32,10 @@ void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
 void mac_learn_tick(struct forwarder *fwd);
 
-/* BR userspace: learn SMAC from ARP on LAN — drives WAN->LAN unicast ARP deliver. */
+/* Học SMAC từ ARP client trên LAN (request/reply). Entry lưu vĩnh viễn (no TTL). */
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);
+/* Tra MAC → LAN ifname (dùng khi TCP/UDP/OSPF về từ WAN gộp kênh; không học từ data). */
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);
 
 /* Map profile cfg local_indices[] entry → live fwd pair slot (by ifname). */
