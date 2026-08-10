@@ -412,7 +412,7 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
             return -1;
 
         /* Client ARP từ LAN: học SMAC → LAN (vĩnh viễn, không TTL). */
-        mac_learn(fwd, ingress_li, pkt, job->len, MAC_LEARN_SRC_ARP);
+        mac_learn(fwd, ingress_li, pkt, job->len);
 
         (void)arp_try_encrypt_l2_pqc(fwd, job, mut, profile_pi, &skip_why);
         arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));

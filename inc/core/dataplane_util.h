@@ -11,4 +11,7 @@ int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len);
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt);
 int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *tpa);
+/* op: 1=request, 2=reply; spa/tpa network-order IPv4. */
+int dp_parse_arp(const uint8_t *pkt, uint32_t len,
+                 uint16_t *op, uint32_t *spa, uint32_t *tpa);
 #endif

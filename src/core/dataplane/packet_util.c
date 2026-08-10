@@ -133,31 +133,35 @@ static int arp_payload_offset(const uint8_t *pkt, uint32_t len, uint32_t *off_ou
     return 0;
 }
 
-int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *tpa) {
+int dp_parse_arp(const uint8_t *pkt, uint32_t len,
+                 uint16_t *op, uint32_t *spa, uint32_t *tpa)
+{
     uint32_t off;
     const uint8_t *arp;
 
-    if (!pkt || !spa || !tpa) {
+    if (!pkt || !op || !spa || !tpa)
         return -1;
-    }
-
-    if (arp_payload_offset(pkt, len, &off) != 0){
+    if (arp_payload_offset(pkt, len, &off) != 0)
         return -1;
-    }
     arp = pkt + off;
-    if (arp[0] != 0x00 || arp[1] != 0x01) {
+    if (arp[0] != 0x00 || arp[1] != 0x01)
         return -1;
-    }
-    if (arp[2] != 0x08 || arp[3] != 0x00) {
+    if (arp[2] != 0x08 || arp[3] != 0x00)
         return -1;
-    }
-    if (arp[4] != 6 || arp[5] != 4) {
+    if (arp[4] != 6 || arp[5] != 4)
         return -1;
-    }
 
+    *op = ((uint16_t)arp[6] << 8) | arp[7];
     memcpy(spa, arp + 14, 4);
     memcpy(tpa, arp + 24, 4);
     return 0;
+}
+
+int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *tpa)
+{
+    uint16_t op;
+
+    return dp_parse_arp(pkt, len, &op, spa, tpa);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)
