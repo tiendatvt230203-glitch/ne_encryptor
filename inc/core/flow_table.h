@@ -35,7 +35,7 @@ struct flow_table {
     struct flow_entry *buckets[FLOW_TABLE_SIZE];
     pthread_mutex_t locks[FLOW_TABLE_SIZE];
     int wan_count;
-    uint32_t wan_window_sizes[MAX_INTERFACES];
+    uint32_t wan_window_sizes[MAX_INTERFACES]; /* window_kb quota — data only, not ARP */
 };
 
 void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets);
@@ -46,12 +46,12 @@ void flow_table_cleanup(struct flow_table *ft);
 int flow_table_get_wan(struct flow_table *ft,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t src_port, uint16_t dst_port,
-                       uint8_t protocol, uint32_t pkt_len);
+                       uint8_t protocol, uint32_t window_bytes);
 
 int flow_table_get_wan_profile(struct flow_table *ft,
                                 uint32_t src_ip, uint32_t dst_ip,
                                 uint16_t src_port, uint16_t dst_port,
-                                uint8_t protocol, uint32_t pkt_len,
+                                uint8_t protocol, uint32_t window_bytes,
                                 const int *allowed_wans, int allowed_count,
                                 const int *allowed_weights);
 

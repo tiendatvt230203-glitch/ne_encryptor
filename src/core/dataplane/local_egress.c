@@ -173,7 +173,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (dp_pkt_is_arp(pkt, job.len)) {
         char bridge_to[IF_NAMESIZE] = "";
 
-        /* ARP: học/cập nhật SMAC↔LAN; cùng SPA đổi MAC → replace ngay. */
+        /* ARP: bridge path only — không qua WRR/window_kb (data bandwidth). */
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
         if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
             dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
@@ -187,7 +187,8 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                             &profile_idx, &cp) != 0)
         goto drop;
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
-                                    src_port, dst_port, proto, job.len);
+                                    src_port, dst_port, proto,
+                                    dp_flow_window_bytes(pkt, job.len, job.len));
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
         goto drop;
 

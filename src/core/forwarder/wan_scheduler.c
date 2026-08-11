@@ -643,7 +643,7 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
 int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                            uint32_t src_ip, uint32_t dst_ip,
                            uint16_t src_port, uint16_t dst_port,
-                           uint8_t proto, uint32_t pkt_len)
+                           uint8_t proto, uint32_t window_bytes)
 {
     if (!fwd || fwd->wan_count <= 0)
         return -1;
@@ -661,7 +661,8 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     int slot = fwd_crypto_profile_slot_for_id(p->id);
     int wan_cfg = flow_ok && slot >= 0 && fwd_crypto_flow_table_ready(slot)
         ? flow_table_get_wan_profile(fwd_crypto_flow_table(slot),
-                                     src_ip, dst_ip, src_port, dst_port, proto, pkt_len,
+                                     src_ip, dst_ip, src_port, dst_port, proto,
+                                     window_bytes,
                                      allowed_wans, pool_n, allowed_weights)
         : flow_table_pick_wan_per_packet(allowed_wans, allowed_weights, pool_n);
     if (wan_cfg < 0)

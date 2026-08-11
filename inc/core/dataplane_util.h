@@ -9,6 +9,14 @@ int dp_parse_flow(void *pkt, uint32_t len,
 
 int dp_pkt_is_arp(const uint8_t *pkt, uint32_t len);
 
+/* Bytes charged toward WAN window_kb quota. ARP → 0 (never counts bandwidth). */
+static inline uint32_t dp_flow_window_bytes(const uint8_t *pkt, uint32_t len, uint32_t pkt_len)
+{
+    if (!pkt || dp_pkt_is_arp(pkt, len))
+        return 0;
+    return pkt_len;
+}
+
 
 void dp_log_arp_userspace(const char *dir, const char *iface,
                           const uint8_t *pkt, uint32_t len,

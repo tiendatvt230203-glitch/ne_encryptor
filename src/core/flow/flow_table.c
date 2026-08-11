@@ -200,18 +200,18 @@ static void flow_commit_window_switch(struct flow_entry *entry,
                                       const int *allowed_wans,
                                       const int *allowed_weights,
                                       int allowed_count,
-                                      uint32_t first_pkt_len) {
+                                      uint32_t window_bytes) {
     int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
     if (pos < 0)
         pos = 0;
     entry->wrr_slot = next_enabled_pos(pos, allowed_weights, allowed_count);
     entry->current_wan = allowed_wans[entry->wrr_slot];
-    entry->byte_count = first_pkt_len;
+    entry->byte_count = window_bytes;
     entry->drain_until_ns = 0;
 }
 
 static void flow_window_advance(struct flow_entry *entry, struct flow_table *ft,
-                                uint32_t pkt_len, uint64_t now_ns,
+                                uint32_t window_bytes, uint64_t now_ns,
                                 const int *allowed_wans, int allowed_count,
                                 const int *allowed_weights, int sumw) {
     int pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
@@ -223,12 +223,12 @@ static void flow_window_advance(struct flow_entry *entry, struct flow_table *ft,
         entry->drain_until_ns = 0;
     }
 
-    entry->byte_count += pkt_len;
+    entry->byte_count += window_bytes;
 
     if (entry->drain_until_ns) {
         if (now_ns >= entry->drain_until_ns)
             flow_commit_window_switch(entry, allowed_wans, allowed_weights,
-                                      allowed_count, pkt_len);
+                                      allowed_count, window_bytes);
         return;
     }
 
@@ -246,7 +246,7 @@ static void flow_window_advance(struct flow_entry *entry, struct flow_table *ft,
 int flow_table_get_wan(struct flow_table *ft,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t src_port, uint16_t dst_port,
-                       uint8_t protocol, uint32_t pkt_len) {
+                       uint8_t protocol, uint32_t window_bytes) {
     normalize_flow_ips(&src_ip, &dst_ip);
     uint32_t idx = flow_hash_ips(src_ip, dst_ip);
     uint64_t now = get_time_sec();
@@ -267,12 +267,12 @@ int flow_table_get_wan(struct flow_table *ft,
             entry->key.dst_ip == dst_ip) {
 
             entry->last_seen = now;
-            entry->byte_count += pkt_len;
+            entry->byte_count += window_bytes;
 
             if (entry->drain_until_ns) {
                 if (now_ns >= entry->drain_until_ns) {
                     entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
-                    entry->byte_count = pkt_len;
+                    entry->byte_count = window_bytes;
                     entry->drain_until_ns = 0;
                 }
             } else {
@@ -304,7 +304,7 @@ int flow_table_get_wan(struct flow_table *ft,
     entry->key.src_port = src_port;
     entry->key.dst_port = dst_port;
     entry->key.protocol = protocol;
-    entry->byte_count = pkt_len;
+    entry->byte_count = window_bytes;
     entry->current_wan = get_next_wan(ft->wan_count);
     entry->wrr_slot = 0;
     entry->last_seen = now;
@@ -339,11 +339,12 @@ int flow_table_pick_wan_per_packet(const int *allowed_wans,
 int flow_table_get_wan_profile(struct flow_table *ft,
                                 uint32_t src_ip, uint32_t dst_ip,
                                 uint16_t src_port, uint16_t dst_port,
-                                uint8_t protocol, uint32_t pkt_len,
+                                uint8_t protocol, uint32_t window_bytes,
                                 const int *allowed_wans, int allowed_count,
                                 const int *allowed_weights) {
     if (!ft || !allowed_wans || allowed_count <= 0)
-        return flow_table_get_wan(ft, src_ip, dst_ip, src_port, dst_port, protocol, pkt_len);
+        return flow_table_get_wan(ft, src_ip, dst_ip, src_port, dst_port, protocol,
+                                  window_bytes);
     if (allowed_count == 1)
         return allowed_wans[0];
 
@@ -366,7 +367,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             entry->key.protocol == protocol) {
 
             entry->last_seen = now;
-            flow_window_advance(entry, ft, pkt_len, now_ns,
+            flow_window_advance(entry, ft, window_bytes, now_ns,
                                 allowed_wans, allowed_count, allowed_weights, sumw);
             {
                 int wan_idx = entry->current_wan;
@@ -389,7 +390,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     entry->key.src_port = src_port;
     entry->key.dst_port = dst_port;
     entry->key.protocol = protocol;
-    entry->byte_count = pkt_len;
+    entry->byte_count = window_bytes;
     entry->last_seen = now;
     entry->drain_until_ns = 0;
     entry->valid = 1;
