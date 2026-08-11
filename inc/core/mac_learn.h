@@ -34,6 +34,10 @@ void mac_learn_persist(struct forwarder *fwd);
 void mac_learn_restore(struct forwarder *fwd);
 void mac_learn_tick(struct forwarder *fwd);
 
+/* Một bảng hệ thống: LAN/WAN + bridge + mac + WAN UP/DOWN. Bảng mới nhất = đang dùng. */
+void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config *cfg,
+                                 const char *event);
+
 /*
  * L2 FDB: MAC → LAN ifname (no IP — thiết bị bridge L2, client đổi subnet không ảnh hưởng).
  * Chỉ ARP trên LAN học SMAC; purge khi ifname rời config. Lookup cho WAN→LAN unicast.

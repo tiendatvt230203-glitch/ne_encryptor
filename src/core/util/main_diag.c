@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "../../../inc/core/config.h"
+#include "../../../inc/core/forwarder.h"
+#include "../../../inc/core/mac_learn.h"
 
 #define DIAG_TBL_N     12
 #define DIAG_CIDR_LEN  24
@@ -110,67 +112,9 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
              (unsigned)cp->aes_bits);
 }
 
-static const char *diag_bridge_for_local(const struct app_config *cfg, int local_idx)
+static void print_system_table(const struct app_config *cfg, const char *event)
 {
-    if (!cfg || local_idx < 0)
-        return "-";
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        for (int bi = 0; bi < p->bridge_count; bi++) {
-            if (p->bridges[bi].local_idx == local_idx && p->bridges[bi].ifname[0])
-                return p->bridges[bi].ifname;
-        }
-    }
-    return "-";
-}
-
-static const char *diag_bridge_for_wan(const struct app_config *cfg, int wan_cfg_idx)
-{
-    int wan_dp;
-
-    if (!cfg || wan_cfg_idx < 0)
-        return "-";
-    wan_dp = config_wan_cfg_to_dp(cfg, wan_cfg_idx);
-    if (wan_dp < 0)
-        return "-";
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        for (int bi = 0; bi < p->bridge_count; bi++) {
-            if (p->bridges[bi].wan_dp == wan_dp && p->bridges[bi].ifname[0])
-                return p->bridges[bi].ifname;
-        }
-    }
-    return "-";
-}
-
-static void print_iface_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = { 14, 12, 12, 0, 0, 0, 0, 0 };
-    static const char *hdr[DIAG_TBL_N] = {
-        "role", "interface", "bridge", "", "", "", "", ""
-    };
-
-    fprintf(stderr, "\n  [interfaces]\n");
-    tbl_hline(w, 3);
-    tbl_row(w, 3, hdr);
-    tbl_hline(w, 3);
-
-    for (int i = 0; i < cfg->local_count; i++) {
-        char c0[32], c1[32], c2[32];
-        snprintf(c0, sizeof(c0), "lan");
-        snprintf(c1, sizeof(c1), "%s", cfg->locals[i].ifname);
-        snprintf(c2, sizeof(c2), "%s", diag_bridge_for_local(cfg, i));
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-        tbl_row(w, 3, row);
-    }
-    for (int i = 0; i < cfg->wan_count; i++) {
-        char c0[32], c1[32], c2[32];
-        snprintf(c0, sizeof(c0), cfg->wans[i].dataplane ? "wan" : "wan(hs)");
-        snprintf(c1, sizeof(c1), "%s", cfg->wans[i].ifname);
-        snprintf(c2, sizeof(c2), "%s", diag_bridge_for_wan(cfg, i));
-        const char *row[DIAG_TBL_N] = { c0, c1, c2, "", "", "", "", "" };
-        tbl_row(w, 3, row);
-    }
-    tbl_hline(w, 3);
+    mac_learn_log_runtime_table(NULL, cfg, event);
 }
 
 static void print_policy_table(const struct app_config *cfg) {
@@ -231,7 +175,7 @@ void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cf
             trigger_profile_id);
     fprintf(stderr, "  unchanged: LAN=%d WAN=%d policies=%d\n",
             cfg->local_count, cfg->wan_count, cfg->policy_count);
-    print_iface_table(cfg);
+    print_system_table(cfg, "db-no-update");
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -252,7 +196,7 @@ void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id
     fprintf(stderr, "\n");
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_iface_table(cfg);
+    print_system_table(cfg, "db-load");
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -292,20 +236,20 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
     if (!policy_only)
-        print_iface_table(cfg);
+        print_system_table(cfg, is_reload ? "reload" : "config");
     print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
 
-void main_diag_log_dataplane_ready(struct app_config *cfg) {
-    if (!cfg)
+void main_diag_log_dataplane_ready(struct forwarder *fwd) {
+    if (!fwd || !fwd->cfg)
         return;
 
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
     fprintf(stderr,
             "| mode: single-profile (1 UMEM/process; multi-profile UMEM later) |\n");
-    print_iface_table(cfg);
+    mac_learn_log_runtime_table(fwd, fwd->cfg, "dataplane-ready");
     fprintf(stderr, "\n");
     fflush(stderr);
 }

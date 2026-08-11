@@ -608,7 +608,7 @@ void forwarder_run(struct forwarder *fwd)
     fwd->threads_started = 1;
     if (fwd->cfg) {
         ne_cpu_map_log();
-        main_diag_log_dataplane_ready(fwd->cfg);
+        main_diag_log_dataplane_ready(fwd);
     }
     for (int w = 0; w < local_rx_started; w++)
         pthread_join(fwd->local_rx_threads[w], NULL);
