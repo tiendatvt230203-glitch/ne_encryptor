@@ -489,7 +489,7 @@ void forwarder_cleanup(struct forwarder *fwd)
     wan_admin_shutdown();
     wan_failover_stop();
     // MAC_LEARN
-    mac_learn_persist(&fwd->mac_table);
+    mac_learn_persist(fwd);
     mac_learn_shutdown(&fwd->mac_table);
     // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {

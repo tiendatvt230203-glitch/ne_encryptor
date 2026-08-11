@@ -18,7 +18,6 @@ enum mac_learn_src {
 struct mac_learn_entry {
     uint8_t mac[MAC_LEN];
     char ifname[IF_NAMESIZE];
-    uint32_t spa_be; /* ARP sender IPv4 (0 = unknown); used to replace old MAC */
 };
 
 struct mac_learn_table {
@@ -31,18 +30,13 @@ struct mac_learn_table {
 
 void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
-void mac_learn_persist(struct mac_learn_table *t);
+void mac_learn_persist(struct forwarder *fwd);
 void mac_learn_restore(struct forwarder *fwd);
 void mac_learn_tick(struct forwarder *fwd);
 
 /*
- * Permanent runtime FDB: MAC → LAN ifname (no TTL aging).
- * Only ARP ethertype on LAN populates entries; purge only when the LAN
- * ifname leaves config. Lookup drives WAN→LAN unicast; never floods.
- *
- * Cập nhật khi đổi port/MAC: ARP who-has/reply trên LAN học lại SMAC.
- * Cùng MAC sang LAN khác → MOVE ifname + ghi lại mac_lan.log.
- * Cùng SPA + cùng LAN port + MAC mới → xóa MAC cũ, ghi file ngay (Br0/Br1 không purge lẫn nhau).
+ * L2 FDB: MAC → LAN ifname (no IP — thiết bị bridge L2, client đổi subnet không ảnh hưởng).
+ * Chỉ ARP trên LAN học SMAC; purge khi ifname rời config. Lookup cho WAN→LAN unicast.
  */
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);

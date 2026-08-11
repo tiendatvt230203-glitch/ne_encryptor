@@ -336,8 +336,7 @@ static int arp_profile_owns_local(struct forwarder *fwd, int profile_pi, int fwd
 
 /* who-has (DMAC ff:ff:ff:ff:ff:ff / mcast): flood mọi LAN trong profile.
  * Cần flood all để ARP backup hoạt động: who-has về backup WAN phải tới LAN
- * gốc (Br0 LAN) dù ingress WAN không cùng bridge pair. Host sai subnet không
- * trả lời; false MAC replace được xử lý bằng purge spa_be theo ifname. */
+ * gốc (Br0 LAN) dù ingress WAN không cùng bridge pair. FDB L2 chỉ học SMAC→ifname. */
 static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                                        const uint8_t *pkt, int profile_pi,
                                        char *lans_out, size_t lans_out_sz)
