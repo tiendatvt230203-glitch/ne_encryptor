@@ -6,6 +6,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/interface.h"
+#include "../../../inc/core/wan_failover.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
 
@@ -218,6 +219,8 @@ static int arp_wan_dp_usable(struct forwarder *fwd, int wan_dp)
     if (!ne_pair_wan_live(&fwd->pair, wan_dp))
         return 0;
     if (fwd_wan_is_stopped(wan_dp))
+        return 0;
+    if (wan_failover_dp_excluded(wan_dp))
         return 0;
     return 1;
 }

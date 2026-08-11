@@ -3,6 +3,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/profile_iface_xdp.h"
+#include "../../../inc/core/mac_learn.h"
 
 #include <net/if.h>
 #include <stdio.h>
@@ -651,6 +652,7 @@ int profile_iface_life_rebuild_from_cfg(struct forwarder *fwd,
         return -1;
 
     profile_iface_life_reconcile_counts(fwd);
+    mac_learn_restore(fwd);
     fprintf(stderr,
             "[PROFILE-LIFE] profile %d: rebuild done (lan=%d wan=%d umem_slot=%d)\n",
             trigger_profile_id, fwd->local_count, fwd->wan_count,

@@ -5,7 +5,7 @@ struct forwarder;
 
 
 #ifndef FAILOVER_ENABLE
-#define FAILOVER_ENABLE 0
+#define FAILOVER_ENABLE 1
 #endif
 
 int wan_failover_enabled(void);

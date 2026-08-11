@@ -977,7 +977,7 @@ int main(int argc, char **argv) {
     sig_pqc_start_ipc_server();
     sig_pqc_init_vault();
     libbpf_set_print(libbpf_print_silent);
-    fprintf(stderr, "[NE-BUILD] br-whohas-flood-only-fdb-unicast-v1 (journal marker — verify deploy)\n");
+    fprintf(stderr, "[NE-BUILD] br-mac-fdb-restore-on-edit-v1 (journal marker — verify deploy)\n");
     fflush(stderr);
 
     struct sigaction sa = { .sa_handler = on_stop_signal };

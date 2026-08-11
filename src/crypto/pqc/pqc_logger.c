@@ -9,7 +9,7 @@
 #include <stdbool.h>
 
 #define LOG_DIR "/var/log/NE"
-#define LOG_FILE "/var/log/NE/authen_pqc.log"
+#define LOG_FILE "/var/log/SEP/PQC/ne_pqc.log"
 #define MAX_LOG_LINES 5000
 #define MAX_LINE_LEN 512
 

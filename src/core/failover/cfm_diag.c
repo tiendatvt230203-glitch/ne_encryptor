@@ -43,6 +43,7 @@ typedef struct cfm_link {
     int consecutive_successes;
     uint32_t tx_seq;
     char ifname[IFNAMSIZ];
+    char bridge[IFNAMSIZ];
     uint8_t local_mac[6];
     uint8_t remote_mac[6];
     bool is_up;
@@ -59,6 +60,8 @@ static pthread_mutex_t g_cfm_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static cfm_link_state_cb g_state_cb;
 static void *g_state_cb_user;
 static pthread_mutex_t g_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_cfm_wan_peer_table(const char *event);
 
 static void notify_is_up(cfm_link_t *link, bool old_up)
 {
@@ -81,6 +84,14 @@ static void notify_is_up(cfm_link_t *link, bool old_up)
     pthread_mutex_unlock(&g_cb_lock);
     if (cb)
         cb(wan_dp, link->ifname, old_state, new_state, user);
+    {
+        char ev[80];
+
+        snprintf(ev, sizeof(ev), "%s if=%s",
+                 link->is_up ? "cfm-up" : "cfm-down",
+                 link->ifname[0] ? link->ifname : "-");
+        log_cfm_wan_peer_table(ev);
+    }
 }
 
 static cfm_link_t *find_link_by_wan_dp(int wan_dp)
@@ -103,6 +114,99 @@ static cfm_link_t *find_link_by_cfg_idx(int cfg_idx)
             return &g_links[i];
     }
     return NULL;
+}
+
+static void cfm_bridge_for_wan_dp(const struct app_config *cfg, int wan_dp,
+                                  char out[IFNAMSIZ])
+{
+    out[0] = '\0';
+    if (!cfg || wan_dp < 0)
+        return;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+
+        for (int bi = 0; bi < p->bridge_count; bi++) {
+            if (p->bridges[bi].wan_dp == wan_dp && p->bridges[bi].ifname[0]) {
+                strncpy(out, p->bridges[bi].ifname, IFNAMSIZ - 1);
+                out[IFNAMSIZ - 1] = '\0';
+                return;
+            }
+        }
+    }
+}
+
+static void cfm_wan_tbl_hline(void)
+{
+    fprintf(stderr,
+            "+------+--------------+----------+-------------------+---+----------+\n");
+}
+
+/*
+ * Peer WAN MAC table (failover/CFM) — same shape as interfaces / mac-lan.
+ * role | interface | bridge | peer_mac | up | note
+ */
+static void log_cfm_wan_peer_table(const char *event)
+{
+    int n = g_link_count;
+
+    fprintf(stderr, "\n  [mac-wan] processing: %s | table count=%d\n",
+            event ? event : "update", n);
+    cfm_wan_tbl_hline();
+    fprintf(stderr,
+            "| %-4s | %-12s | %-8s | %-17s | %-1s | %-8s |\n",
+            "role", "interface", "bridge", "peer_mac", "up", "note");
+    cfm_wan_tbl_hline();
+
+    if (n <= 0) {
+        fprintf(stderr,
+                "| %-4s | %-12s | %-8s | %-17s | %-1s | %-8s |\n",
+                "-", "-", "-", "(empty)", "-", "-");
+        cfm_wan_tbl_hline();
+        fflush(stderr);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        char ifname[IFNAMSIZ];
+        char bridge[IFNAMSIZ];
+        char peer_s[24];
+        char note[16];
+        uint8_t remote[6];
+        bool learned;
+        bool is_up;
+
+        pthread_mutex_lock(&g_links[i].lock);
+        strncpy(ifname, g_links[i].ifname, sizeof(ifname) - 1);
+        ifname[sizeof(ifname) - 1] = '\0';
+        strncpy(bridge, g_links[i].bridge, sizeof(bridge) - 1);
+        bridge[sizeof(bridge) - 1] = '\0';
+        memcpy(remote, g_links[i].remote_mac, 6);
+        learned = g_links[i].mac_learned;
+        is_up = g_links[i].is_up;
+        pthread_mutex_unlock(&g_links[i].lock);
+
+        if (learned) {
+            snprintf(peer_s, sizeof(peer_s),
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     remote[0], remote[1], remote[2],
+                     remote[3], remote[4], remote[5]);
+            snprintf(note, sizeof(note), "peer");
+        } else {
+            snprintf(peer_s, sizeof(peer_s), "(learning)");
+            snprintf(note, sizeof(note), "wait");
+        }
+
+        fprintf(stderr,
+                "| %-4s | %-12s | %-8s | %-17s | %-1s | %-8s |\n",
+                "wan",
+                ifname[0] ? ifname : "-",
+                bridge[0] ? bridge : "-",
+                peer_s,
+                is_up ? "Y" : "N",
+                note);
+    }
+    cfm_wan_tbl_hline();
+    fflush(stderr);
 }
 
 static uint64_t get_time_ms(void) {
@@ -267,6 +371,8 @@ static void *cfm_monitor_thread(void *arg) {
                         pthread_mutex_lock(&g_links[j].lock);
                         old_up = g_links[j].is_up;
                         if (!g_links[j].mac_learned) {
+                            char ev[96];
+
                             memcpy(g_links[j].remote_mac, src_mac, 6);
                             g_links[j].remote_mep_id = rx_mep_id;
                             g_links[j].mac_learned = true;
@@ -275,17 +381,42 @@ static void *cfm_monitor_thread(void *arg) {
                             g_links[j].consecutive_fails = 0;
                             g_links[j].consecutive_successes = CFM_UP_CONFIRM;
                             g_links[j].rx_peer_ccm++;
-                            fprintf(stderr,
-                                    "[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x "
-                                    "and MEP %d on %s (dp=%d)\n",
-                                    g_links[j].remote_mac[0], g_links[j].remote_mac[1],
-                                    g_links[j].remote_mac[2], g_links[j].remote_mac[3],
-                                    g_links[j].remote_mac[4], g_links[j].remote_mac[5],
-                                    g_links[j].remote_mep_id, g_links[j].ifname,
-                                    g_links[j].wan_dp);
-                            fflush(stderr);
-                        } else if (rx_mep_id == g_links[j].remote_mep_id &&
-                                   memcmp(src_mac, g_links[j].remote_mac, 6) == 0) {
+                            snprintf(ev, sizeof(ev),
+                                     "learn-peer if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                                     g_links[j].ifname,
+                                     src_mac[0], src_mac[1], src_mac[2],
+                                     src_mac[3], src_mac[4], src_mac[5]);
+                            pthread_mutex_unlock(&g_links[j].lock);
+                            log_cfm_wan_peer_table(ev);
+                            notify_is_up(&g_links[j], old_up);
+                            continue;
+                        } else if (memcmp(src_mac, g_links[j].remote_mac, 6) != 0) {
+                            /* Peer MAC đổi — cập nhật, không giữ MAC cũ. */
+                            char ev[128];
+                            uint8_t old_mac[6];
+
+                            memcpy(old_mac, g_links[j].remote_mac, 6);
+                            memcpy(g_links[j].remote_mac, src_mac, 6);
+                            g_links[j].remote_mep_id = rx_mep_id;
+                            g_links[j].last_recv_time = now;
+                            g_links[j].consecutive_fails = 0;
+                            g_links[j].consecutive_successes = CFM_UP_CONFIRM;
+                            g_links[j].is_up = true;
+                            g_links[j].rx_peer_ccm++;
+                            snprintf(ev, sizeof(ev),
+                                     "peer-mac-change if=%s "
+                                     "old=%02x:%02x:%02x:%02x:%02x:%02x "
+                                     "new=%02x:%02x:%02x:%02x:%02x:%02x",
+                                     g_links[j].ifname,
+                                     old_mac[0], old_mac[1], old_mac[2],
+                                     old_mac[3], old_mac[4], old_mac[5],
+                                     src_mac[0], src_mac[1], src_mac[2],
+                                     src_mac[3], src_mac[4], src_mac[5]);
+                            pthread_mutex_unlock(&g_links[j].lock);
+                            log_cfm_wan_peer_table(ev);
+                            notify_is_up(&g_links[j], old_up);
+                            continue;
+                        } else if (rx_mep_id == g_links[j].remote_mep_id) {
                             g_links[j].last_recv_time = now;
                             g_links[j].consecutive_fails = 0;
                             if (g_links[j].consecutive_successes < CFM_UP_CONFIRM)
@@ -342,33 +473,21 @@ static void *cfm_monitor_thread(void *arg) {
             last_tx_time = now;
         }
 
-        /* Debug: still waiting to learn peer MAC? */
+        /* Waiting for peer MAC: one table, not per-iface spam mixed with traffic. */
         now = get_time_ms();
-        if (now - last_wait_log >= 1000) {
+        if (now - last_wait_log >= 5000) {
+            int waiting = 0;
+
             for (int i = 0; i < g_link_count; i++) {
                 if (g_links[i].sock_fd < 0)
                     continue;
                 pthread_mutex_lock(&g_links[i].lock);
-                if (!g_links[i].mac_learned) {
-                    fprintf(stderr,
-                            "[CFM] %s: chưa học MAC | "
-                            "rx_any=%llu short=%llu not_cfm=%llu bad_ccm=%llu "
-                            "own_skip=%llu peer=%llu "
-                            "local=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                            g_links[i].ifname,
-                            (unsigned long long)g_links[i].rx_any,
-                            (unsigned long long)g_links[i].rx_short,
-                            (unsigned long long)g_links[i].rx_not_cfm,
-                            (unsigned long long)g_links[i].rx_bad_ccm,
-                            (unsigned long long)g_links[i].rx_own_skip,
-                            (unsigned long long)g_links[i].rx_peer_ccm,
-                            g_links[i].local_mac[0], g_links[i].local_mac[1],
-                            g_links[i].local_mac[2], g_links[i].local_mac[3],
-                            g_links[i].local_mac[4], g_links[i].local_mac[5]);
-                    fflush(stderr);
-                }
+                if (!g_links[i].mac_learned)
+                    waiting++;
                 pthread_mutex_unlock(&g_links[i].lock);
             }
+            if (waiting > 0)
+                log_cfm_wan_peer_table("wait-peer");
             last_wait_log = now;
         }
     }
@@ -482,6 +601,7 @@ int cfm_init(const struct app_config *cfg) {
         link->sock_fd = sock;
         link->cfg_wan_idx = i;
         link->wan_dp = config_wan_cfg_to_dp(cfg, i);
+        cfm_bridge_for_wan_dp(cfg, link->wan_dp, link->bridge);
 
         // Query local MAC address dynamically, fallback to DB configuration
         struct ifreq ifr;
@@ -524,15 +644,12 @@ int cfm_init(const struct app_config *cfg) {
         link->is_up = true; // Assume UP initially so we don't disrupt traffic before learning
         pthread_mutex_init(&link->lock, NULL);
 
-        fprintf(stderr, "[CFM-INIT] %s cfg=%d dp=%d mac_learned=%d\n",
-                link->ifname, link->cfg_wan_idx, link->wan_dp, link->mac_learned ? 1 : 0);
-        fflush(stderr);
-
         g_link_count++;
         initialized_links++;
     }
 
     if (initialized_links > 0) {
+        log_cfm_wan_peer_table("init");
         g_cfm_running = true;
         if (pthread_create(&g_cfm_thread, NULL, cfm_monitor_thread, NULL) != 0) {
             fprintf(stderr, "[CFM-INIT] Error: Failed to create CFM monitor thread.\n");
@@ -545,9 +662,11 @@ int cfm_init(const struct app_config *cfg) {
             pthread_mutex_unlock(&g_cfm_init_lock);
             return -1;
         }
-        printf("[CFM-INIT] CFM initialized on %d interfaces.\n", initialized_links);
+        fprintf(stderr, "[CFM-INIT] CFM started on %d WAN(s)\n", initialized_links);
+        fflush(stderr);
     } else {
-        printf("[CFM-INIT] No WAN interfaces initialized for CFM.\n");
+        fprintf(stderr, "[CFM-INIT] No WAN interfaces initialized for CFM.\n");
+        fflush(stderr);
     }
 
     pthread_mutex_unlock(&g_cfm_init_lock);

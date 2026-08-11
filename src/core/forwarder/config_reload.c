@@ -4,6 +4,7 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/profile_iface_xdp.h"
 #include "../../../inc/core/wan_failover.h"
+#include "../../../inc/core/mac_learn.h"
 #include "pqc_l2_handshake.h"
 
 #include <pthread.h>
@@ -140,6 +141,7 @@ static int forwarder_reload_wan_removal_impl(struct forwarder *fwd, struct app_c
     fwd_crypto_sync_flow_table_windows(fwd);
     fwd_crypto_cleanup_stale_profile_slots(cfg);
     wan_failover_on_cfg(fwd);
+    mac_learn_restore(fwd);
     return forwarder_should_stop() ? -1 : rc;
 }
 
@@ -177,6 +179,8 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     fwd_crypto_sync_flow_table_windows(fwd);
     fwd_crypto_cleanup_stale_profile_slots(cfg);
     wan_failover_on_cfg(fwd);
+    /* Re-merge FDB from mac_lan.log after iface/settings hot reload. */
+    mac_learn_restore(fwd);
     return forwarder_should_stop() ? -1 : rc;
 }
 
