@@ -20,47 +20,114 @@ enum mac_upsert_result {
 static uint64_t g_last_purge_log_ms;
 static uint64_t g_last_mismatch_log_ms;
 
-static const char *mac_learn_src_name(enum mac_learn_src src)
-{
-    return src == MAC_LEARN_SRC_ARP ? "arp" : "traffic";
-}
-
-static void log_mac_fmt(const char *event, enum mac_learn_src src,
-                        const uint8_t mac[MAC_LEN], const char *ifname)
-{
-    fprintf(stderr,
-            "[MAC] %s src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s\n",
-            event, mac_learn_src_name(src),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            ifname ? ifname : "-");
-}
-
-static void log_mac_move(enum mac_learn_src src, const uint8_t mac[MAC_LEN],
-                         const char *old_ifname, const char *new_ifname)
-{
-    fprintf(stderr,
-            "[MAC] move src=%s %02x:%02x:%02x:%02x:%02x:%02x iface=%s->%s\n",
-            mac_learn_src_name(src),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            old_ifname ? old_ifname : "-", new_ifname ? new_ifname : "-");
-}
-
-static void log_mac_replace(enum mac_learn_src src,
-                            const uint8_t old_mac[MAC_LEN], const uint8_t new_mac[MAC_LEN],
-                            const char *ifname, uint32_t spa_be)
+static void mac_format_ip(uint32_t spa_be, char *buf, size_t bufsz)
 {
     uint8_t b[4];
 
+    if (!buf || bufsz == 0)
+        return;
+    if (spa_be == 0) {
+        snprintf(buf, bufsz, "-");
+        return;
+    }
     memcpy(b, &spa_be, 4);
+    snprintf(buf, bufsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+/* Snapshot FDB — luôn in sau mỗi thay đổi để biết đang nhớ MAC gì trên LAN nào. */
+static void log_mac_fdb_snapshot_locked(const struct mac_learn_table *t)
+{
+    char line[768];
+    size_t pos = 0;
+    int n;
+
+    if (!t)
+        return;
+
+    n = snprintf(line, sizeof(line), "[MAC-FDB] %d:", t->count);
+    if (n < 0)
+        return;
+    pos = (size_t)n;
+
+    if (t->count == 0) {
+        snprintf(line + pos, sizeof(line) - pos, " (empty)");
+        pos = strlen(line);
+    } else {
+        for (int i = 0; i < t->count; i++) {
+            const struct mac_learn_entry *e = &t->list[i];
+            char ip_s[16];
+            int w;
+
+            mac_format_ip(e->spa_be, ip_s, sizeof(ip_s));
+            w = snprintf(line + pos, sizeof(line) - pos,
+                         "%s%s mac=%02x:%02x:%02x:%02x:%02x:%02x ip=%s",
+                         (i == 0) ? " " : " |",
+                         e->ifname[0] ? e->ifname : "-",
+                         e->mac[0], e->mac[1], e->mac[2],
+                         e->mac[3], e->mac[4], e->mac[5], ip_s);
+            if (w < 0 || (size_t)w >= sizeof(line) - pos) {
+                pos = sizeof(line) - 1;
+                break;
+            }
+            pos += (size_t)w;
+        }
+    }
+
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}
+
+static void log_mac_fmt(const char *event, enum mac_learn_src src,
+                        const uint8_t mac[MAC_LEN], const char *ifname,
+                        uint32_t spa_be)
+{
+    if (spa_be != 0) {
+        char ip_s[16];
+
+        mac_format_ip(spa_be, ip_s, sizeof(ip_s));
+        fprintf(stderr,
+                "[MAC] %-5s %02x:%02x:%02x:%02x:%02x:%02x @%s ip=%s\n",
+                event,
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                ifname ? ifname : "-", ip_s);
+    } else {
+        fprintf(stderr,
+                "[MAC] %-5s %02x:%02x:%02x:%02x:%02x:%02x @%s\n",
+                event,
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                ifname ? ifname : "-");
+    }
+    fflush(stderr);
+}
+
+static void log_mac_move(struct mac_learn_table *t, enum mac_learn_src src,
+                         const uint8_t mac[MAC_LEN],
+                         const char *old_ifname, const char *new_ifname)
+{
+    (void)src;
     fprintf(stderr,
-            "[MAC] replace src=%s "
-            "%02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x "
-            "iface=%s spa=%u.%u.%u.%u\n",
-            mac_learn_src_name(src),
+            "[MAC] move  %02x:%02x:%02x:%02x:%02x:%02x @%s->%s\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            old_ifname ? old_ifname : "-", new_ifname ? new_ifname : "-");
+    fflush(stderr);
+    log_mac_fdb_snapshot_locked(t);
+}
+
+static void log_mac_replace(struct mac_learn_table *t, enum mac_learn_src src,
+                            const uint8_t old_mac[MAC_LEN], const uint8_t new_mac[MAC_LEN],
+                            const char *ifname, uint32_t spa_be)
+{
+    char ip_s[16];
+
+    (void)src;
+    mac_format_ip(spa_be, ip_s, sizeof(ip_s));
+    fprintf(stderr,
+            "[MAC] repl  %02x:%02x:%02x:%02x:%02x:%02x->%02x:%02x:%02x:%02x:%02x:%02x @%s ip=%s\n",
             old_mac[0], old_mac[1], old_mac[2], old_mac[3], old_mac[4], old_mac[5],
             new_mac[0], new_mac[1], new_mac[2], new_mac[3], new_mac[4], new_mac[5],
-            ifname ? ifname : "-",
-            b[0], b[1], b[2], b[3]);
+            ifname ? ifname : "-", ip_s);
+    fflush(stderr);
+    log_mac_fdb_snapshot_locked(t);
 }
 
 static uint64_t monotonic_ms(void)
@@ -113,20 +180,23 @@ static void delete_idx_locked(struct mac_learn_table *t, int idx)
 }
 
 /*
- * Same SPA (client IP) answered with a new MAC after port change:
- * drop the stale MAC entry so FDB switches to the new MAC immediately.
+ * Same SPA + same LAN port, new SMAC: host đổi MAC trên cùng cổng (cắm lại).
+ * Chỉ purge trên cùng ifname — Br0 (f8/172.16.1.1) và Br1 (f9/172.16.2.1) không
+ * bao giờ xóa lẫn nhau dù SPA trùng do ARP nhiễu cross-bridge.
  * Returns 1 if an old MAC was removed.
  */
-static int purge_stale_spa_mac_locked(struct mac_learn_table *t, uint32_t spa_be,
-                                      const uint8_t new_mac[MAC_LEN],
+static int purge_stale_spa_mac_locked(struct mac_learn_table *t, const char *ifname,
+                                      uint32_t spa_be, const uint8_t new_mac[MAC_LEN],
                                       uint8_t old_mac_out[MAC_LEN],
                                       char old_ifname_out[IF_NAMESIZE])
 {
-    if (!t || !new_mac || spa_be == 0)
+    if (!t || !ifname || !ifname[0] || !new_mac || spa_be == 0)
         return 0;
 
     for (int i = 0; i < t->count; i++) {
         if (t->list[i].spa_be != spa_be)
+            continue;
+        if (strcmp(t->list[i].ifname, ifname) != 0)
             continue;
         if (memcmp(t->list[i].mac, new_mac, MAC_LEN) == 0)
             continue;
@@ -215,20 +285,20 @@ static void table_learn(struct mac_learn_table *t, const char *ifname,
         return;
     pthread_spin_lock(&t->lock);
     if (spa_be != 0)
-        did_replace = purge_stale_spa_mac_locked(t, spa_be, mac, replaced_mac,
+        did_replace = purge_stale_spa_mac_locked(t, ifname, spa_be, mac, replaced_mac,
                                                  replaced_ifname);
     r = upsert_locked(t, ifname, mac, spa_be, old_ifname);
-    pthread_spin_unlock(&t->lock);
 
     if (did_replace) {
-        log_mac_replace(src, replaced_mac, mac,
+        log_mac_replace(t, src, replaced_mac, mac,
                         replaced_ifname[0] ? replaced_ifname : ifname, spa_be);
-        return;
+    } else if (r == MAC_UPSERT_NEW) {
+        log_mac_fmt("learn", src, mac, ifname, spa_be);
+        log_mac_fdb_snapshot_locked(t);
+    } else if (r == MAC_UPSERT_MOVE) {
+        log_mac_move(t, src, mac, old_ifname, ifname);
     }
-    if (r == MAC_UPSERT_NEW)
-        log_mac_fmt("learn", src, mac, ifname);
-    else if (r == MAC_UPSERT_MOVE)
-        log_mac_move(src, mac, old_ifname, ifname);
+    pthread_spin_unlock(&t->lock);
 }
 
 static int table_lookup(struct mac_learn_table *t, const uint8_t mac[MAC_LEN],
@@ -358,6 +428,8 @@ static void table_maintain(struct forwarder *fwd)
     /* No TTL aging — only drop entries whose LAN ifname left config. */
     pthread_spin_lock(&fwd->mac_table.lock);
     table_purge_orphan_locked(&fwd->mac_table, fwd, purged_mac, purged_ifname, &purge_count);
+    if (purge_count > 0)
+        log_mac_fdb_snapshot_locked(&fwd->mac_table);
     pthread_spin_unlock(&fwd->mac_table.lock);
 
     if (purge_count > 0) {
@@ -454,7 +526,7 @@ void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint3
         return;
 
     (void)dp_parse_arp_ips(pkt, len, &spa_be, &tpa_be);
-    /* spa_be binds IP→MAC: cùng IP đổi MAC (đổi port) → purge MAC cũ ngay. */
+    /* spa_be binds IP→MAC trên cùng LAN port: đổi MAC cùng port → purge MAC cũ. */
     table_learn(&fwd->mac_table, fwd->locals[ingress_idx].ifname, eth_src, spa_be, src);
 }
 

@@ -171,15 +171,10 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (dp_pkt_is_arp(pkt, job.len)) {
-        char bridge_to[IF_NAMESIZE] = "";
-
         /* ARP: bridge path only — không qua WRR/window_kb (data bandwidth). */
         mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
-        if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
-            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
+        if (arp_bridge_from_local(fwd, &job, pkt, li, NULL) == 0)
             return;
-        }
-        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL);
         goto drop;
     }
 

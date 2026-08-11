@@ -490,16 +490,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     if (crypto_eth_l2_has_arp_marker(pkt, job.len) || dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
-        char bridge_to[IF_NAMESIZE] = "";
         int bridged = -1;
 
         if (wan_dp >= 0)
-            bridged = arp_bridge_from_wan(fwd, &job, pkt, wan_dp, bridge_to);
+            bridged = arp_bridge_from_wan(fwd, &job, pkt, wan_dp, NULL);
 
-        if (bridged == 0) {
-            dp_log_arp_userspace("wan", fwd->wans[wan_dp].ifname, pkt, job.len, bridge_to);
+        if (bridged == 0)
             return;
-        }
         goto drop;
     }
 

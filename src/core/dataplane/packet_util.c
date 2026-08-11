@@ -160,6 +160,29 @@ int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *
     return 0;
 }
 
+int dp_parse_arp_op(const uint8_t *pkt, uint32_t len, uint16_t *op_out)
+{
+    uint32_t off;
+    const uint8_t *arp;
+
+    if (!pkt || !op_out)
+        return -1;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return -1;
+    arp = pkt + off;
+    *op_out = ((uint16_t)arp[6] << 8) | arp[7];
+    return 0;
+}
+
+const char *dp_arp_op_label(uint16_t op, int bcast_hint)
+{
+    if (op == 1)
+        return "who-has";
+    if (op == 2)
+        return "reply";
+    return bcast_hint ? "who-has" : "reply";
+}
+
 static void format_mac(const uint8_t mac[6], char *buf, size_t bufsz)
 {
     snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
