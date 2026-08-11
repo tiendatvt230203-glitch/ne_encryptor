@@ -7,8 +7,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #define MAC_PURGE_LOG_INTERVAL_MS 10000ull
+#define MAC_LAN_LOG_DIR           "/var/log/NE"
+#define MAC_LAN_LOG_PATH          MAC_LAN_LOG_DIR "/mac_lan.log"
+#define MAC_LAN_LOG_TMP           MAC_LAN_LOG_DIR "/mac_lan.log.tmp"
 #define ETH_HEADER_SIZE         14u
 
 enum mac_upsert_result {
@@ -19,6 +25,10 @@ enum mac_upsert_result {
 
 static uint64_t g_last_purge_log_ms;
 static uint64_t g_last_mismatch_log_ms;
+
+static void mac_fdb_persist_save_locked(const struct mac_learn_table *t);
+static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
+                                       const struct forwarder *fwd);
 
 static void mac_format_ip(uint32_t spa_be, char *buf, size_t bufsz)
 {
@@ -298,6 +308,9 @@ static void table_learn(struct mac_learn_table *t, const char *ifname,
     } else if (r == MAC_UPSERT_MOVE) {
         log_mac_move(t, src, mac, old_ifname, ifname);
     }
+    /* Ghi lại file ngay khi FDB đổi — tránh reboot nạp MAC cũ. */
+    if (did_replace || r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE)
+        mac_fdb_persist_save_locked(t);
     pthread_spin_unlock(&t->lock);
 }
 
@@ -340,6 +353,152 @@ static int ifname_in_configured_locals(const struct forwarder *fwd, const char *
         }
     }
     return 0;
+}
+
+static int parse_mac_colon(const char *s, uint8_t mac[MAC_LEN])
+{
+    unsigned m[6];
+
+    if (!s || !mac)
+        return -1;
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+        return -1;
+    for (int i = 0; i < MAC_LEN; i++)
+        mac[i] = (uint8_t)m[i];
+    return 0;
+}
+
+static int parse_ipv4_be(const char *s, uint32_t *ip_be)
+{
+    unsigned a, b, c, d;
+    uint8_t bytes[4];
+
+    if (!s || !ip_be)
+        return -1;
+    if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
+        return -1;
+    if (a > 255u || b > 255u || c > 255u || d > 255u)
+        return -1;
+    bytes[0] = (uint8_t)a;
+    bytes[1] = (uint8_t)b;
+    bytes[2] = (uint8_t)c;
+    bytes[3] = (uint8_t)d;
+    memcpy(ip_be, bytes, 4);
+    return 0;
+}
+
+static int mac_is_zero(const uint8_t mac[MAC_LEN])
+{
+    static const uint8_t zero[MAC_LEN];
+
+    return memcmp(mac, zero, MAC_LEN) == 0;
+}
+
+static int mac_is_multicast(const uint8_t mac[MAC_LEN])
+{
+    return (mac[0] & 0x01u) != 0;
+}
+
+static int mac_fdb_ensure_log_dir(void)
+{
+    if (mkdir(MAC_LAN_LOG_DIR, 0755) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+/* Ghi toàn bộ FDB (không append) — file luôn phản ánh RAM hiện tại sau learn/replace/move. */
+static void mac_fdb_persist_save_locked(const struct mac_learn_table *t)
+{
+    FILE *fp;
+    int fd;
+
+    if (!t || mac_fdb_ensure_log_dir() != 0)
+        return;
+    fp = fopen(MAC_LAN_LOG_TMP, "w");
+    if (!fp) {
+        fprintf(stderr, "[MAC-FDB] persist FAIL write %s\n", MAC_LAN_LOG_TMP);
+        fflush(stderr);
+        return;
+    }
+    fprintf(fp, "# NE MAC LAN FDB v1 — ifname mac ip (rewrite on learn/replace/move/purge)\n");
+    for (int i = 0; i < t->count; i++) {
+        const struct mac_learn_entry *e = &t->list[i];
+        char ip_s[16];
+
+        mac_format_ip(e->spa_be, ip_s, sizeof(ip_s));
+        fprintf(fp, "%s %02x:%02x:%02x:%02x:%02x:%02x %s\n",
+                e->ifname[0] ? e->ifname : "-",
+                e->mac[0], e->mac[1], e->mac[2],
+                e->mac[3], e->mac[4], e->mac[5], ip_s);
+    }
+    fflush(fp);
+    fd = fileno(fp);
+    if (fd >= 0)
+        (void)fsync(fd);
+    fclose(fp);
+    if (rename(MAC_LAN_LOG_TMP, MAC_LAN_LOG_PATH) != 0) {
+        fprintf(stderr, "[MAC-FDB] persist FAIL rename -> %s\n", MAC_LAN_LOG_PATH);
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[MAC-FDB] saved %d -> %s\n", t->count, MAC_LAN_LOG_PATH);
+    fflush(stderr);
+}
+
+static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
+                                       const struct forwarder *fwd)
+{
+    FILE *fp;
+    char line[256];
+    int loaded = 0;
+
+    if (!t || !fwd)
+        return 0;
+    fp = fopen(MAC_LAN_LOG_PATH, "r");
+    if (!fp)
+        return 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char ifname[IF_NAMESIZE];
+        char mac_s[24], ip_s[16];
+        uint8_t mac[MAC_LEN];
+        uint32_t spa_be = 0;
+        int idx;
+
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+        if (sscanf(line, "%15s %23s %15s", ifname, mac_s, ip_s) != 3)
+            continue;
+        if (!ifname_in_configured_locals(fwd, ifname))
+            continue;
+        if (parse_mac_colon(mac_s, mac) != 0)
+            continue;
+        if (mac_is_zero(mac) || mac_is_multicast(mac))
+            continue;
+        (void)parse_ipv4_be(ip_s, &spa_be);
+        if (find_idx_by_mac_locked(t, mac) >= 0)
+            continue;
+        /* Cùng LAN port + IP mà MAC khác (file cũ/stale) → bỏ entry cũ trước. */
+        if (spa_be != 0) {
+            uint8_t dummy_mac[MAC_LEN];
+            char dummy_if[IF_NAMESIZE];
+
+            (void)purge_stale_spa_mac_locked(t, ifname, spa_be, mac, dummy_mac, dummy_if);
+        }
+        if (t->count >= MAC_LEARN_MAX_ENTRIES)
+            break;
+        idx = t->count++;
+        memcpy(t->list[idx].mac, mac, MAC_LEN);
+        strncpy(t->list[idx].ifname, ifname, IF_NAMESIZE - 1);
+        t->list[idx].ifname[IF_NAMESIZE - 1] = '\0';
+        t->list[idx].spa_be = spa_be;
+        loaded++;
+    }
+    fclose(fp);
+    if (loaded > 0)
+        hash_rebuild_locked(t);
+    return loaded;
 }
 
 static void table_purge_orphan_locked(struct mac_learn_table *t, struct forwarder *fwd,
@@ -430,6 +589,8 @@ static void table_maintain(struct forwarder *fwd)
     table_purge_orphan_locked(&fwd->mac_table, fwd, purged_mac, purged_ifname, &purge_count);
     if (purge_count > 0)
         log_mac_fdb_snapshot_locked(&fwd->mac_table);
+    if (purge_count > 0)
+        mac_fdb_persist_save_locked(&fwd->mac_table);
     pthread_spin_unlock(&fwd->mac_table.lock);
 
     if (purge_count > 0) {
@@ -473,18 +634,6 @@ static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname
     return -1;
 }
 
-static int mac_is_zero(const uint8_t mac[MAC_LEN])
-{
-    static const uint8_t zero[MAC_LEN];
-
-    return memcmp(mac, zero, MAC_LEN) == 0;
-}
-
-static int mac_is_multicast(const uint8_t mac[MAC_LEN])
-{
-    return (mac[0] & 0x01u) != 0;
-}
-
 void mac_learn_bootstrap(struct mac_learn_table *t)
 {
     if (!t)
@@ -497,6 +646,34 @@ void mac_learn_shutdown(struct mac_learn_table *t)
     if (!t)
         return;
     pthread_spin_destroy(&t->lock);
+}
+
+void mac_learn_persist(struct mac_learn_table *t)
+{
+    if (!t)
+        return;
+    pthread_spin_lock(&t->lock);
+    mac_fdb_persist_save_locked(t);
+    pthread_spin_unlock(&t->lock);
+}
+
+void mac_learn_restore(struct forwarder *fwd)
+{
+    int loaded;
+
+    if (!fwd)
+        return;
+    pthread_spin_lock(&fwd->mac_table.lock);
+    loaded = mac_fdb_persist_load_locked(&fwd->mac_table, fwd);
+    if (loaded > 0)
+        log_mac_fdb_snapshot_locked(&fwd->mac_table);
+    pthread_spin_unlock(&fwd->mac_table.lock);
+
+    if (loaded > 0)
+        fprintf(stderr, "[MAC-FDB] restored %d from %s\n", loaded, MAC_LAN_LOG_PATH);
+    else
+        fprintf(stderr, "[MAC-FDB] no cache at %s (wait LAN ARP learn)\n", MAC_LAN_LOG_PATH);
+    fflush(stderr);
 }
 
 void mac_learn_tick(struct forwarder *fwd)

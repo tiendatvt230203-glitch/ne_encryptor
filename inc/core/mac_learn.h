@@ -31,6 +31,8 @@ struct mac_learn_table {
 
 void mac_learn_bootstrap(struct mac_learn_table *t);
 void mac_learn_shutdown(struct mac_learn_table *t);
+void mac_learn_persist(struct mac_learn_table *t);
+void mac_learn_restore(struct forwarder *fwd);
 void mac_learn_tick(struct forwarder *fwd);
 
 /*
@@ -39,9 +41,8 @@ void mac_learn_tick(struct forwarder *fwd);
  * ifname leaves config. Lookup drives WAN→LAN unicast; never floods.
  *
  * Cập nhật khi đổi port/MAC: ARP who-has/reply trên LAN học lại SMAC.
- * Cùng MAC sang LAN khác → MOVE ifname. Cùng SPA + cùng LAN port + MAC mới
- * (host đổi NIC trên cùng eno) → xóa MAC cũ trên port đó; Br0/Br1 không purge
- * lẫn nhau.
+ * Cùng MAC sang LAN khác → MOVE ifname + ghi lại mac_lan.log.
+ * Cùng SPA + cùng LAN port + MAC mới → xóa MAC cũ, ghi file ngay (Br0/Br1 không purge lẫn nhau).
  */
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);

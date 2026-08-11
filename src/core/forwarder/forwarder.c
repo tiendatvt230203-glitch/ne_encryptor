@@ -472,6 +472,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     fwd_wan_reset_on_init(fwd);
     // MAC_LEARN
     mac_learn_bootstrap(&fwd->mac_table);
+    mac_learn_restore(fwd);
     // MAC_LEARN
     if (wan_failover_start(fwd) != 0) {
         fprintf(stderr, "[FWD] wan_failover_start failed\n");
@@ -488,6 +489,7 @@ void forwarder_cleanup(struct forwarder *fwd)
     wan_admin_shutdown();
     wan_failover_stop();
     // MAC_LEARN
+    mac_learn_persist(&fwd->mac_table);
     mac_learn_shutdown(&fwd->mac_table);
     // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
