@@ -3,7 +3,6 @@
 #include "../../../inc/core/forwarder_reload.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/wan_failover.h"
-#include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/wan_admin.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane.h"
@@ -12,6 +11,7 @@
 #include "../../../inc/core/main_diag.h"
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/profile_iface_xdp.h"
+#include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/dataplane_stats.h"
 #include "../../../inc/crypto/pqc_l2_handshake.h"
 
@@ -470,7 +470,9 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     }
 
     fwd_wan_reset_on_init(fwd);
+    // MAC_LEARN
     mac_learn_bootstrap(&fwd->mac_table);
+    // MAC_LEARN
     if (wan_failover_start(fwd) != 0) {
         fprintf(stderr, "[FWD] wan_failover_start failed\n");
         fflush(stderr);
@@ -485,7 +487,9 @@ void forwarder_cleanup(struct forwarder *fwd)
         return;
     wan_admin_shutdown();
     wan_failover_stop();
+    // MAC_LEARN
     mac_learn_shutdown(&fwd->mac_table);
+    // MAC_LEARN
     for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
         ne_ring_destroy(&fwd->local_to_mid[w]);
         ne_ring_destroy(&fwd->wan_to_mid[w]);

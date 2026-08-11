@@ -133,35 +133,82 @@ static int arp_payload_offset(const uint8_t *pkt, uint32_t len, uint32_t *off_ou
     return 0;
 }
 
-int dp_parse_arp(const uint8_t *pkt, uint32_t len,
-                 uint16_t *op, uint32_t *spa, uint32_t *tpa)
-{
+int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *tpa) {
     uint32_t off;
     const uint8_t *arp;
 
-    if (!pkt || !op || !spa || !tpa)
+    if (!pkt || !spa || !tpa) {
         return -1;
-    if (arp_payload_offset(pkt, len, &off) != 0)
-        return -1;
-    arp = pkt + off;
-    if (arp[0] != 0x00 || arp[1] != 0x01)
-        return -1;
-    if (arp[2] != 0x08 || arp[3] != 0x00)
-        return -1;
-    if (arp[4] != 6 || arp[5] != 4)
-        return -1;
+    }
 
-    *op = ((uint16_t)arp[6] << 8) | arp[7];
+    if (arp_payload_offset(pkt, len, &off) != 0){
+        return -1;
+    }
+    arp = pkt + off;
+    if (arp[0] != 0x00 || arp[1] != 0x01) {
+        return -1;
+    }
+    if (arp[2] != 0x08 || arp[3] != 0x00) {
+        return -1;
+    }
+    if (arp[4] != 6 || arp[5] != 4) {
+        return -1;
+    }
+
     memcpy(spa, arp + 14, 4);
     memcpy(tpa, arp + 24, 4);
     return 0;
 }
 
-int dp_parse_arp_ips(const uint8_t *pkt, uint32_t len, uint32_t *spa, uint32_t *tpa)
+static void format_mac(const uint8_t mac[6], char *buf, size_t bufsz)
 {
-    uint16_t op;
+    snprintf(buf, bufsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
-    return dp_parse_arp(pkt, len, &op, spa, tpa);
+static void format_ipv4_be32(uint32_t ip_be, char *buf, size_t bufsz)
+{
+    uint8_t b[4];
+
+    memcpy(b, &ip_be, 4);
+    snprintf(buf, bufsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+void dp_log_arp_userspace(const char *dir, const char *iface,
+                          const uint8_t *pkt, uint32_t len,
+                          const char *bridge_to)
+{
+    uint32_t off;
+    const uint8_t *arp;
+    uint16_t op;
+    uint32_t spa_be = 0, tpa_be = 0;
+    char sha[18], tha[18], spa[16], tpa[16];
+    const char *bridge = bridge_to && bridge_to[0] ? bridge_to : "drop";
+
+    if (!dir || !iface || !pkt)
+        return;
+    if (crypto_eth_l2_has_arp_marker(pkt, len))
+        return;
+    if (!dp_pkt_is_arp(pkt, len))
+        return;
+    if (arp_payload_offset(pkt, len, &off) != 0)
+        return;
+    if (dp_parse_arp_ips(pkt, len, &spa_be, &tpa_be) != 0)
+        return;
+
+    arp = pkt + off;
+    op = ((uint16_t)arp[6] << 8) | arp[7];
+    format_mac(arp + 8, sha, sizeof(sha));
+    format_mac(arp + 18, tha, sizeof(tha));
+    format_ipv4_be32(spa_be, spa, sizeof(spa));
+    format_ipv4_be32(tpa_be, tpa, sizeof(tpa));
+
+    fprintf(stderr,
+            "[ARP] userspace dir=%s iface=%s len=%u op=%s "
+            "sha=%s spa=%s tha=%s tpa=%s bridge=%s\n",
+            dir, iface, len,
+            op == 1 ? "request" : (op == 2 ? "reply" : "other"),
+            sha, spa, tha, tpa, bridge);
 }
 
 int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *pkt)

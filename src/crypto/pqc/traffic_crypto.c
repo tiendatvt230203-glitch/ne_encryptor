@@ -160,6 +160,18 @@ void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned ch
     }
 }
 
+int trf_save_key_to_file(const char *filename, const char *data, int mode) {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    ssize_t written = write(fd, data, strlen(data));
+    ssize_t bytes_write = write(fd, "\n", 1);
+    if (bytes_write < 0) {
+        perror("Canot write to file: ");
+    }
+    close(fd);
+    return (written > 0) ? 0 : -1;
+}
+
 // =========================================================
 // DATA PLANE: ENCRYPTION
 // =========================================================
@@ -466,8 +478,8 @@ int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     int written_pub = scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
     int written_priv = scrypt_MlDsaExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    // printf("[DEBUG-DSA] Export Done: Pub=%d/%d, Priv=%d/%d\n", 
-    //         written_pub, *pub_sz, written_priv, *priv_sz);
+    printf("[DEBUG-DSA] Export Done: Pub=%d/%d, Priv=%d/%d\n", 
+            written_pub, *pub_sz, written_priv, *priv_sz);
 
     // CRITICAL FIX: The library gave us 7488 for size but only wrote 4896.
     // We MUST use the actual written size for subsequent imports.
@@ -600,3 +612,5 @@ int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
     
     return TRF_PQC_OK;
 }
+
+

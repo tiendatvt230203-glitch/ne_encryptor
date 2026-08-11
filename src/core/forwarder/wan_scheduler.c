@@ -513,25 +513,27 @@ int fwd_wan_build_profile_pool(struct forwarder *fwd, const struct profile_confi
         int dp;
         int ramp;
 
+        /*
+         * weight=0: XDP vẫn gắn, ARP bridge vẫn TX — nhưng không vào WRR data
+         * (tcp/udp/icmp/ospf). Không redistribute dead_weight (cố ý 0).
+         */
         if (base <= 0)
-            base = (p->wan_bandwidth_weight[i] > 0) ? p->wan_bandwidth_weight[i] : 0;
+            continue;
 
         dp = fwd_wan_live_dp_for_cfg(fwd, wi);
         if (dp < 0) {
-            if (base > 0)
-                dead_weight += base;
+            dead_weight += base;
             continue;
         }
 
         ramp = wan_join_ramp_pct(wi);
         if (ramp == 0) {
-            if (base > 0)
-                dead_weight += base;
+            dead_weight += base;
             continue;
         }
 
         live_cfg[live_n] = wi;
-        live_w[live_n] = base > 0 ? base : 1;
+        live_w[live_n] = base;
         if (ramp > 0 && ramp < 100) {
             live_w[live_n] = (live_w[live_n] * ramp) / 100;
             if (live_w[live_n] <= 0)
@@ -604,13 +606,11 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
 
     if (profile_idx >= 0 && profile_idx < fwd->cfg->profile_count) {
         struct profile_config *p = &fwd->cfg->profiles[profile_idx];
-        int sumw = 0;
+
         profile_pool = p->wan_count > 0;
-        for (int i = 0; i < p->wan_count; i++)
-            if (p->wan_bandwidth_weight[i] > 0)
-                sumw += p->wan_bandwidth_weight[i];
         for (int i = 0; i < p->wan_count; i++) {
-            if (sumw > 0 && p->wan_bandwidth_weight[i] <= 0)
+            /* weight=0: ARP-only — never pick for data fallback. */
+            if (p->wan_bandwidth_weight[i] <= 0)
                 continue;
             int dp = fwd_wan_live_dp_for_cfg(fwd, p->wan_indices[i]);
             if (dp < 0 || !fwd_wan_has_tx_room(fwd, dp))

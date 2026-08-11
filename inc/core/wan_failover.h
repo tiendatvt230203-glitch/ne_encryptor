@@ -3,7 +3,7 @@
 
 struct forwarder;
 
-/* 1 = CFM failover: WAN down → ip link down paired LAN. 0 = off. */
+
 #ifndef FAILOVER_ENABLE
 #define FAILOVER_ENABLE 0
 #endif

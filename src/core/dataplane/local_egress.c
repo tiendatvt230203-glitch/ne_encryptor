@@ -6,6 +6,7 @@
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/crypto_route.h"
+#include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
 
@@ -170,8 +171,15 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
 
     if (dp_pkt_is_arp(pkt, job.len)) {
-        if (arp_bridge_from_local(fwd, &job, pkt, li, NULL) == 0)
+        char bridge_to[IF_NAMESIZE] = "";
+
+        /* ARP: học/cập nhật SMAC↔LAN; cùng SPA đổi MAC → replace ngay. */
+        mac_learn(fwd, li, pkt, job.len, MAC_LEARN_SRC_ARP);
+        if (arp_bridge_from_local(fwd, &job, pkt, li, bridge_to) == 0) {
+            dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, bridge_to);
             return;
+        }
+        dp_log_arp_userspace("local", fwd->locals[li].ifname, pkt, job.len, NULL);
         goto drop;
     }
 
