@@ -23,7 +23,7 @@
 #define ARP_DEFAULT_AES_BITS     256
 #define ARP_ETH_HDR_LEN          14u
 
-/* 1 = mã hóa ARP L2-PQC (key/option riêng), 0 = bridge ARP plaintext.
+/* 1 = mã hóa ARP L2-PQC (key/option riêng), độc lập bảng policy/data crypto.
  * Decrypt vẫn chạy nếu wire có ARP marker (peer vẫn encrypt). */
 #ifndef ARP_ENCRYPT_ENABLE
 #define ARP_ENCRYPT_ENABLE 1
@@ -50,8 +50,8 @@ static uint64_t arp_monotonic_ms(void)
 
 static void arp_crypto_ctx_init(const struct app_config *cfg)
 {
-    if (!cfg || !cfg->crypto_enabled)
-        return;
+    (void)cfg;
+
     if (!g_arp_key_loaded) {
         if (parse_hex_bytes_pub(g_arp_hardcoded_master_key_hex,
                                 g_arp_default_master_key, AES_MAX_KEY_SIZE) != 0) {
@@ -196,7 +196,7 @@ void arp_bridge_reload_policies(struct app_config *cfg)
         return;
     arp_crypto_ctx_init(cfg);
     fprintf(stderr,
-            "[ARP] mode=mac-fdb+flood-whohas-only | arp_encrypt=%d | key=arp-default | opt=L2-PQC/ARP\n",
+            "[ARP] mode=mac-fdb+flood-whohas-only | arp_encrypt=%d (policy-independent) | key=arp-default | opt=L2-PQC/ARP\n",
             ARP_ENCRYPT_ENABLE);
 }
 
@@ -569,11 +569,6 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
             *skip_why = "arp-encrypt-disabled";
         return 0;
     }
-    if (!fwd->cfg->crypto_enabled) {
-        if (skip_why)
-            *skip_why = "crypto-disabled";
-        return 0;
-    }
     arp_crypto_ctx_init(fwd->cfg);
     if (!g_arp_crypto_ctx_ready) {
         if (skip_why)
@@ -620,10 +615,6 @@ static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, 
     if (!crypto_eth_l2_has_arp_marker(pkt, job->len))
         return -1; /* not ARP wire */
 
-    if (!fwd->cfg || !fwd->cfg->crypto_enabled) {
-        fail_why = "crypto-disabled";
-        goto decrypt_fail;
-    }
     arp_crypto_ctx_init(fwd->cfg);
     if (!g_arp_crypto_ctx_ready) {
         fail_why = "arp-crypto-not-ready";
@@ -755,8 +746,8 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
                         local_ifname(fwd, ingress_li));
             return -1;
         }
-        encrypted = arp_try_encrypt_l2_pqc(fwd, job, mut, profile_pi, &skip_why);
 
+        /* Parse/log fields trước encrypt — mut==pkt, sau encrypt payload ARP không còn plaintext. */
         arp_op = arp_op_from_pkt(pkt, job->len);
         is_req = arp_eth_dmac_is_broadcast(pkt, job->len);
         op_tag = arp_op_tag_from_pkt(pkt, job->len, is_req);
@@ -769,6 +760,8 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
         arp_format_mac(pkt, dmac_s, sizeof(dmac_s));
         arp_format_mac(pkt + MAC_LEN, smac_s, sizeof(smac_s));
         arp_format_mac(tha_mac, tha_s, sizeof(tha_s));
+
+        encrypted = arp_try_encrypt_l2_pqc(fwd, job, mut, profile_pi, &skip_why);
 
         {
             const char *mac_tag = "broadcast";
