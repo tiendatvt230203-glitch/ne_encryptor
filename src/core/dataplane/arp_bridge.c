@@ -627,6 +627,18 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     if (!mut)
         return -1;
 
+    if (job->len >= ARP_ETH_HDR_LEN) {
+        uint32_t spa = 0, tpa = 0;
+
+        if (dp_parse_arp_ips(pkt, job->len, &spa, &tpa) == 0) {
+            /* WAN relay echo (request/reply): không học MAC xa, không gửi lại WAN. */
+            if (mac_relay_recent(pkt + MAC_LEN, spa))
+                return 0;
+            /* Chỉ học chiều LAN->WAN (request hoặc reply). */
+            mac_learn(fwd, ingress_li, pkt, job->len, MAC_LEARN_SRC_ARP);
+        }
+    }
+
     profile_pi = profile_pi_for_fwd_local(fwd, ingress_li);
     if (profile_pi < 0) {
         static uint64_t last_no_profile_ms;
@@ -835,6 +847,7 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     if (have_ips) {
         arp_format_ipv4_be32(spa, spa_s, sizeof(spa_s));
         arp_format_ipv4_be32(tpa, tpa_s, sizeof(tpa_s));
+        mac_relay_stamp(mut + MAC_LEN, spa);
     }
 
     if (dec == 1)

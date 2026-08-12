@@ -28,6 +28,7 @@ enum mac_upsert_result {
 
 static uint64_t g_last_purge_log_ms;
 static uint64_t g_last_mismatch_log_ms;
+static pthread_mutex_t g_mac_table_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
                                         const struct forwarder *fwd);
@@ -90,6 +91,8 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
     int lan_n = 0;
     struct mac_learn_entry lan_copy[MAC_LEARN_MAX_ENTRIES];
     int printed = 0;
+
+    pthread_mutex_lock(&g_mac_table_log_lock);
 
     if (!cfg && fwd)
         cfg = fwd->cfg;
@@ -239,6 +242,7 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
     }
     mac_tbl_hline();
     fflush(stderr);
+    pthread_mutex_unlock(&g_mac_table_log_lock);
 }
 
 /* Caller already holds mac_table.lock — only used from learn/purge/restore paths. */
@@ -257,6 +261,74 @@ static uint64_t monotonic_ms(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+#define MAC_RELAY_STAMP_MAX 32
+#define MAC_RELAY_TTL_MS     3000ull
+
+struct mac_relay_entry {
+    uint8_t smac[MAC_LEN];
+    uint32_t spa_be;
+    uint64_t expire_ms;
+};
+
+static struct {
+    struct mac_relay_entry entries[MAC_RELAY_STAMP_MAX];
+    int next;
+    pthread_spinlock_t lock;
+    int inited;
+} g_mac_relay;
+
+static void mac_relay_init_once(void)
+{
+    if (g_mac_relay.inited)
+        return;
+    pthread_spin_init(&g_mac_relay.lock, PTHREAD_PROCESS_PRIVATE);
+    g_mac_relay.inited = 1;
+}
+
+void mac_relay_stamp(const uint8_t smac[MAC_LEN], uint32_t spa_be)
+{
+    struct mac_relay_entry *e;
+    uint64_t now_ms;
+
+    if (!smac)
+        return;
+    mac_relay_init_once();
+
+    now_ms = monotonic_ms();
+    pthread_spin_lock(&g_mac_relay.lock);
+    e = &g_mac_relay.entries[g_mac_relay.next];
+    g_mac_relay.next = (g_mac_relay.next + 1) % MAC_RELAY_STAMP_MAX;
+    memcpy(e->smac, smac, MAC_LEN);
+    e->spa_be = spa_be;
+    e->expire_ms = now_ms + MAC_RELAY_TTL_MS;
+    pthread_spin_unlock(&g_mac_relay.lock);
+}
+
+int mac_relay_recent(const uint8_t smac[MAC_LEN], uint32_t spa_be)
+{
+    uint64_t now_ms;
+    int hit = 0;
+
+    if (!smac)
+        return 0;
+    mac_relay_init_once();
+
+    now_ms = monotonic_ms();
+    pthread_spin_lock(&g_mac_relay.lock);
+    for (int i = 0; i < MAC_RELAY_STAMP_MAX; i++) {
+        const struct mac_relay_entry *e = &g_mac_relay.entries[i];
+
+        if (e->expire_ms <= now_ms)
+            continue;
+        if (e->spa_be == spa_be && memcmp(e->smac, smac, MAC_LEN) == 0) {
+            hit = 1;
+            break;
+        }
+    }
+    pthread_spin_unlock(&g_mac_relay.lock);
+    return hit;
 }
 
 static uint8_t mac_hash_key(const uint8_t mac[MAC_LEN])
@@ -324,6 +396,7 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
     /* Replace existing MAC bound to this LAN port (one MAC per ifname). */
     if (if_idx >= 0) {
         memcpy(t->list[if_idx].mac, mac, MAC_LEN);
+        hash_rebuild_locked(t);
         return MAC_UPSERT_REFRESH;
     }
 
@@ -392,14 +465,17 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
                      "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x "
                      "replace=%02x:%02x:%02x:%02x:%02x:%02x",
                      ifname,
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                     old_mac[0], old_mac[1], old_mac[2],
-                     old_mac[3], old_mac[4], old_mac[5]);
+                     (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+                     (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5],
+                     (unsigned)old_mac[0], (unsigned)old_mac[1],
+                     (unsigned)old_mac[2], (unsigned)old_mac[3],
+                     (unsigned)old_mac[4], (unsigned)old_mac[5]);
         } else {
             snprintf(ev, sizeof(ev),
                      "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
                      ifname,
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                     (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+                     (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
         }
         log_mac_runtime_table_from_locked(fwd, ev);
     } else if (r == MAC_UPSERT_MOVE) {
@@ -494,6 +570,30 @@ static int mac_is_local_iface_locked(const struct mac_learn_table *t, const uint
     return 0;
 }
 
+static void refresh_iface_macs_add(struct mac_learn_table *t, int sock, const char *ifname)
+{
+    struct ifreq ifr;
+    uint8_t hw[MAC_LEN];
+
+    if (!t || !ifname || !ifname[0] || t->iface_mac_count >= MAX_INTERFACES)
+        return;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0)
+        return;
+    memcpy(hw, ifr.ifr_hwaddr.sa_data, MAC_LEN);
+    if (mac_is_zero(hw) || mac_is_multicast(hw))
+        return;
+    for (int i = 0; i < t->iface_mac_count; i++) {
+        if (memcmp(t->iface_macs[i], hw, MAC_LEN) == 0)
+            return;
+    }
+    memcpy(t->iface_macs[t->iface_mac_count], hw, MAC_LEN);
+    t->iface_mac_count++;
+}
+
 static void refresh_iface_macs_locked(struct mac_learn_table *t, const struct forwarder *fwd)
 {
     int sock;
@@ -505,22 +605,11 @@ static void refresh_iface_macs_locked(struct mac_learn_table *t, const struct fo
     if (sock < 0)
         return;
 
-    for (int i = 0; i < fwd->local_count && t->iface_mac_count < MAX_INTERFACES; i++) {
-        struct ifreq ifr;
-        uint8_t hw[MAC_LEN];
-
-        if (!fwd->locals[i].ifname[0])
-            continue;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, fwd->locals[i].ifname, IFNAMSIZ - 1);
-        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-        if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0)
-            continue;
-        memcpy(hw, ifr.ifr_hwaddr.sa_data, MAC_LEN);
-        if (mac_is_zero(hw) || mac_is_multicast(hw))
-            continue;
-        memcpy(t->iface_macs[t->iface_mac_count], hw, MAC_LEN);
-        t->iface_mac_count++;
+    for (int i = 0; i < fwd->local_count; i++)
+        refresh_iface_macs_add(t, sock, fwd->locals[i].ifname);
+    if (fwd->cfg) {
+        for (int i = 0; i < fwd->cfg->local_count; i++)
+            refresh_iface_macs_add(t, sock, fwd->cfg->locals[i].ifname);
     }
     close(sock);
 }

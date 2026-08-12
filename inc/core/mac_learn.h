@@ -42,13 +42,20 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
                                  const char *event);
 
 /*
- * L2 FDB: one client MAC per LAN ifname (replace on learn). Chỉ ARP LAN học SMAC.
+ * L2 FDB: one client MAC per LAN ifname (replace on learn).
+ * Chỉ học SMAC từ ARP Request của client cắm dây (arp_bridge_from_local).
+ * ARP relay WAN→LAN được stamp — không học / không re-bridge (tránh MAC client xa).
  * WAN→LAN forward: lookup DMAC; miss → paired LAN (mac_fwd_local_for_wan_dp).
  */
 void mac_learn_refresh_iface_macs(struct forwarder *fwd);
+void mac_relay_stamp(const uint8_t smac[MAC_LEN], uint32_t spa_be);
+int mac_relay_recent(const uint8_t smac[MAC_LEN], uint32_t spa_be);
 void mac_learn(struct forwarder *fwd, int ingress_idx, const uint8_t *pkt, uint32_t len,
                enum mac_learn_src src);
 int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN]);
+
+/* Map config local_idx -> live fwd local slot. */
+int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li);
 
 /* Map ingress WAN dp → live fwd local slot via bridge pair (for WAN ARP/data). */
 int mac_fwd_local_for_wan_dp(struct forwarder *fwd, int profile_pi, int wan_dp);
