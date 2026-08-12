@@ -39,10 +39,8 @@ static int mac_is_zero(const uint8_t mac[MAC_LEN]);
 static int mac_is_multicast(const uint8_t mac[MAC_LEN]);
 static int mac_is_local_iface_locked(const struct mac_learn_table *t,
                                      const uint8_t mac[MAC_LEN]);
-static int evict_other_macs_on_ifname_locked(struct mac_learn_table *t,
-                                             const char *ifname,
-                                             const uint8_t keep_mac[MAC_LEN]);
 static void purge_local_iface_macs_locked(struct mac_learn_table *t);
+static void enforce_one_mac_per_ifname_locked(struct mac_learn_table *t);
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname);
 
 /* Bridge name for a LAN ifname (same idea as main_diag iface table). */
@@ -294,33 +292,39 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
  */
 static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const char *ifname,
                                             const uint8_t mac[MAC_LEN],
-                                            enum mac_learn_src src,
                                             char old_ifname_out[IF_NAMESIZE])
 {
     int mac_idx = find_idx_by_mac_locked(t, mac);
+    int if_idx = -1;
 
     if (old_ifname_out)
         old_ifname_out[0] = '\0';
 
-    if (mac_idx >= 0) {
-        char old_ifname[IF_NAMESIZE];
-
-        strncpy(old_ifname, t->list[mac_idx].ifname, sizeof(old_ifname) - 1);
-        old_ifname[sizeof(old_ifname) - 1] = '\0';
-        if (strcmp(old_ifname, ifname) == 0) {
-            if (src == MAC_LEARN_SRC_WAN_ARP)
-                t->list[mac_idx].from_wan = 1;
-            return MAC_UPSERT_REFRESH;
+    for (int i = 0; i < t->count; i++) {
+        if (strcmp(t->list[i].ifname, ifname) == 0) {
+            if_idx = i;
+            break;
         }
+    }
+
+    /* Same MAC already on this port — refresh only. */
+    if (mac_idx >= 0) {
+        if (strcmp(t->list[mac_idx].ifname, ifname) == 0)
+            return MAC_UPSERT_REFRESH;
 
         if (old_ifname_out) {
-            memcpy(old_ifname_out, old_ifname, IF_NAMESIZE);
+            strncpy(old_ifname_out, t->list[mac_idx].ifname, IF_NAMESIZE - 1);
             old_ifname_out[IF_NAMESIZE - 1] = '\0';
         }
         strncpy(t->list[mac_idx].ifname, ifname, IF_NAMESIZE - 1);
         t->list[mac_idx].ifname[IF_NAMESIZE - 1] = '\0';
-        t->list[mac_idx].from_wan = (src == MAC_LEARN_SRC_WAN_ARP) ? 1 : 0;
         return MAC_UPSERT_MOVE;
+    }
+
+    /* Replace existing MAC bound to this LAN port (one MAC per ifname). */
+    if (if_idx >= 0) {
+        memcpy(t->list[if_idx].mac, mac, MAC_LEN);
+        return MAC_UPSERT_REFRESH;
     }
 
     if (t->count >= MAC_LEARN_MAX_ENTRIES) {
@@ -334,7 +338,6 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
         memcpy(t->list[i].mac, mac, MAC_LEN);
         strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
         t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
-        t->list[i].from_wan = (src == MAC_LEARN_SRC_WAN_ARP) ? 1 : 0;
         hash_rebuild_locked(t);
     }
     return MAC_UPSERT_NEW;
@@ -354,9 +357,12 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
 {
     enum mac_upsert_result r;
     char old_ifname[IF_NAMESIZE];
-    int evicted = 0;
+    char old_mac[MAC_LEN];
+    int replaced = 0;
 
     if (!t || !ifname || !mac || ifname[0] == '\0')
+        return;
+    if (src != MAC_LEARN_SRC_ARP)
         return;
     if (mac_is_zero(mac) || mac_is_multicast(mac))
         return;
@@ -367,20 +373,28 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
         return;
     }
 
-    if (src == MAC_LEARN_SRC_ARP)
-        evicted = evict_other_macs_on_ifname_locked(t, ifname, mac);
+    for (int i = 0; i < t->count; i++) {
+        if (strcmp(t->list[i].ifname, ifname) == 0 &&
+            memcmp(t->list[i].mac, mac, MAC_LEN) != 0) {
+            memcpy(old_mac, t->list[i].mac, MAC_LEN);
+            replaced = 1;
+            break;
+        }
+    }
 
-    r = upsert_locked(t, ifname, mac, src, old_ifname);
+    r = upsert_locked(t, ifname, mac, old_ifname);
 
-    if (r == MAC_UPSERT_NEW || evicted > 0) {
-        char ev[128];
+    if (r == MAC_UPSERT_NEW || replaced) {
+        char ev[160];
 
-        if (evicted > 0) {
+        if (replaced) {
             snprintf(ev, sizeof(ev),
-                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x evict=%d",
+                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x "
+                     "replace=%02x:%02x:%02x:%02x:%02x:%02x",
                      ifname,
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                     evicted);
+                     old_mac[0], old_mac[1], old_mac[2],
+                     old_mac[3], old_mac[4], old_mac[5]);
         } else {
             snprintf(ev, sizeof(ev),
                      "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
@@ -397,7 +411,7 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         log_mac_runtime_table_from_locked(fwd, ev);
     }
-    if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE || evicted > 0)
+    if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE || replaced)
         mac_fdb_persist_save_locked(t, fwd);
     pthread_spin_unlock(&t->lock);
 }
@@ -497,8 +511,6 @@ static void refresh_iface_macs_locked(struct mac_learn_table *t, const struct fo
 
         if (!fwd->locals[i].ifname[0])
             continue;
-        if (!ne_pair_local_live(&fwd->pair, i))
-            continue;
         memset(&ifr, 0, sizeof(ifr));
         strncpy(ifr.ifr_name, fwd->locals[i].ifname, IFNAMSIZ - 1);
         ifr.ifr_name[IFNAMSIZ - 1] = '\0';
@@ -511,35 +523,6 @@ static void refresh_iface_macs_locked(struct mac_learn_table *t, const struct fo
         t->iface_mac_count++;
     }
     close(sock);
-}
-
-/* One client per LAN port: drop stale MACs when a new one is learned locally. */
-static int evict_other_macs_on_ifname_locked(struct mac_learn_table *t,
-                                             const char *ifname,
-                                             const uint8_t keep_mac[MAC_LEN])
-{
-    int w = 0;
-    int evicted = 0;
-
-    if (!t || !ifname || !ifname[0])
-        return 0;
-
-    for (int i = 0; i < t->count; i++) {
-        if (strcmp(t->list[i].ifname, ifname) == 0 &&
-            memcmp(t->list[i].mac, keep_mac, MAC_LEN) != 0 &&
-            !t->list[i].from_wan) {
-            evicted++;
-            continue;
-        }
-        if (w != i)
-            t->list[w] = t->list[i];
-        w++;
-    }
-    if (evicted > 0) {
-        t->count = w;
-        hash_rebuild_locked(t);
-    }
-    return evicted;
 }
 
 static void purge_local_iface_macs_locked(struct mac_learn_table *t)
@@ -557,6 +540,35 @@ static void purge_local_iface_macs_locked(struct mac_learn_table *t)
     }
     if (w != t->count) {
         t->count = w;
+        hash_rebuild_locked(t);
+    }
+}
+
+/* Collapse duplicates: last entry per ifname wins. */
+static void enforce_one_mac_per_ifname_locked(struct mac_learn_table *t)
+{
+    struct mac_learn_entry tmp[MAC_LEARN_MAX_ENTRIES];
+    int n = 0;
+
+    if (!t)
+        return;
+    for (int i = 0; i < t->count; i++) {
+        int idx = -1;
+
+        for (int j = 0; j < n; j++) {
+            if (strcmp(tmp[j].ifname, t->list[i].ifname) == 0) {
+                idx = j;
+                break;
+            }
+        }
+        if (idx >= 0)
+            tmp[idx] = t->list[i];
+        else if (n < MAC_LEARN_MAX_ENTRIES)
+            tmp[n++] = t->list[i];
+    }
+    if (n != t->count) {
+        memcpy(t->list, tmp, (size_t)n * sizeof(tmp[0]));
+        t->count = n;
         hash_rebuild_locked(t);
     }
 }
@@ -711,7 +723,7 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
         return;
     }
     fprintf(out,
-            "# NE MAC LAN FDB v2 — ifname mac (L2 only; merge on learn/persist)\n");
+            "# NE MAC LAN FDB v2 — ifname mac (one client MAC per LAN port)\n");
     for (int i = 0; i < merged_count; i++) {
         const struct mac_learn_entry *e = &merged[i];
 
@@ -788,6 +800,24 @@ static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
             skip_other++;
             continue;
         }
+
+        /* One MAC per LAN port: later lines in file replace earlier. */
+        {
+            int if_idx = -1;
+
+            for (int i = 0; i < t->count; i++) {
+                if (strcmp(t->list[i].ifname, ifname) == 0) {
+                    if_idx = i;
+                    break;
+                }
+            }
+            if (if_idx >= 0) {
+                memcpy(t->list[if_idx].mac, mac, MAC_LEN);
+                loaded++;
+                continue;
+            }
+        }
+
         if (find_idx_by_mac_locked(t, mac) >= 0) {
             skip_other++;
             continue;
@@ -801,8 +831,10 @@ static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
         loaded++;
     }
     fclose(fp);
-    if (loaded > 0)
+    if (loaded > 0) {
+        enforce_one_mac_per_ifname_locked(t);
         hash_rebuild_locked(t);
+    }
     if (skipped_ifname_out)
         *skipped_ifname_out = skip_ifname;
     if (skipped_other_out)
@@ -1012,6 +1044,7 @@ void mac_learn_restore(struct forwarder *fwd)
     loaded = mac_fdb_persist_load_locked(&fwd->mac_table, fwd,
                                          &skip_ifname, &skip_other);
     purge_local_iface_macs_locked(&fwd->mac_table);
+    enforce_one_mac_per_ifname_locked(&fwd->mac_table);
     if (loaded > 0) {
         char ev[64];
 
@@ -1074,26 +1107,4 @@ int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
         return -1;
     li = ingress_idx_by_ifname(fwd, ifname);
     return li;
-}
-
-void mac_learn_wan_arp(struct forwarder *fwd, int ingress_wan_dp, int profile_pi,
-                       const uint8_t smac[MAC_LEN])
-{
-    char ifname[IF_NAMESIZE];
-    int li;
-
-    if (!fwd || !smac)
-        return;
-    if (mac_is_zero(smac) || mac_is_multicast(smac))
-        return;
-
-    li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
-    if (li < 0 || li >= fwd->local_count)
-        return;
-    if (!fwd->locals[li].ifname[0])
-        return;
-    strncpy(ifname, fwd->locals[li].ifname, IF_NAMESIZE - 1);
-    ifname[IF_NAMESIZE - 1] = '\0';
-
-    table_learn(fwd, &fwd->mac_table, ifname, smac, MAC_LEARN_SRC_WAN_ARP);
 }

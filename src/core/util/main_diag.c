@@ -249,6 +249,7 @@ void main_diag_log_dataplane_ready(struct forwarder *fwd) {
     fprintf(stderr, "+-- DATAPLANE ready --+\n");
     fprintf(stderr,
             "| mode: single-profile (1 UMEM/process; multi-profile UMEM later) |\n");
+    mac_learn_refresh_iface_macs(fwd);
     mac_learn_log_runtime_table(fwd, fwd->cfg, "dataplane-ready");
     fprintf(stderr, "\n");
     fflush(stderr);
