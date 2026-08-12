@@ -548,6 +548,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     fwd_wan_reset_on_init(fwd);
     // MAC_LEARN
     mac_learn_bootstrap(&fwd->mac_table);
+    mac_learn_refresh_iface_macs(fwd);
     mac_learn_restore(fwd);
     // MAC_LEARN
     if (wan_failover_start(fwd) != 0) {

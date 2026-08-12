@@ -442,7 +442,8 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 }
 
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
-                                const uint8_t *wire_pkt, uint32_t wire_len)
+                                const uint8_t *wire_pkt, uint32_t wire_len,
+                                int ingress_wan_dp)
 {
     uint8_t *pkt;
     int profile_pi;
@@ -460,9 +461,11 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (profile_pi < 0)
         return -1;
 
-    /* Data / unicast → LAN: always dest MAC → FDB (nền cho failover). Miss → drop.
-     * ARP never reaches here (bridged earlier); only who-has floods. */
     li = mac_lookup(fwd, pkt);
+    if (li < 0 || !profile_owns_local(fwd, profile_pi, li)) {
+        if (ingress_wan_dp >= 0)
+            li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
+    }
     if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
@@ -518,7 +521,8 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
     }
 
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len) != 0)
+    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len,
+                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)
         goto drop;
     ne_dp_stats_wan_fwd(1);
     return;

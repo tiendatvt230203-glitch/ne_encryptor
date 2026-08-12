@@ -846,6 +846,10 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     else
         crypto_state = "plain";
 
+    /* Remote SMAC → FDB (paired LAN) so WAN→LAN unicast ARP/data can forward. */
+    if (job->len >= ARP_ETH_HDR_LEN)
+        mac_learn_wan_arp(fwd, ingress_wan_dp, profile_pi, mut + MAC_LEN);
+
     /* who-has: flood mọi LAN (backup WAN → who-has vẫn tới LAN gốc). */
     if (is_bcast) {
         const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
@@ -873,6 +877,12 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
         const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
 
         deliver_li = mac_lookup(fwd, mut);
+        if (deliver_li < 0 || !arp_profile_owns_local(fwd, profile_pi, deliver_li)) {
+            /* Unicast ARP to local client MAC before LAN-side learn: use BR pair. */
+            deliver_li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
+            if (deliver_li >= 0 && job->len >= ARP_ETH_HDR_LEN)
+                mac_learn_wan_arp(fwd, ingress_wan_dp, profile_pi, mut);
+        }
         if (deliver_li < 0 || !arp_profile_owns_local(fwd, profile_pi, deliver_li)) {
             static uint64_t last_miss_ms;
 

@@ -11,6 +11,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 
 #define MAC_PURGE_LOG_INTERVAL_MS 10000ull
 #define MAC_LAN_LOG_DIR           "/var/log/NE"
@@ -33,6 +35,15 @@ static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
                                        const struct forwarder *fwd,
                                        int *skipped_ifname_out,
                                        int *skipped_other_out);
+static int mac_is_zero(const uint8_t mac[MAC_LEN]);
+static int mac_is_multicast(const uint8_t mac[MAC_LEN]);
+static int mac_is_local_iface_locked(const struct mac_learn_table *t,
+                                     const uint8_t mac[MAC_LEN]);
+static int evict_other_macs_on_ifname_locked(struct mac_learn_table *t,
+                                             const char *ifname,
+                                             const uint8_t keep_mac[MAC_LEN]);
+static void purge_local_iface_macs_locked(struct mac_learn_table *t);
+static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname);
 
 /* Bridge name for a LAN ifname (same idea as main_diag iface table). */
 static const char *mac_bridge_for_lan_ifname(const struct forwarder *fwd,
@@ -283,6 +294,7 @@ static int find_idx_by_mac_locked(const struct mac_learn_table *t, const uint8_t
  */
 static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const char *ifname,
                                             const uint8_t mac[MAC_LEN],
+                                            enum mac_learn_src src,
                                             char old_ifname_out[IF_NAMESIZE])
 {
     int mac_idx = find_idx_by_mac_locked(t, mac);
@@ -295,8 +307,11 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
 
         strncpy(old_ifname, t->list[mac_idx].ifname, sizeof(old_ifname) - 1);
         old_ifname[sizeof(old_ifname) - 1] = '\0';
-        if (strcmp(old_ifname, ifname) == 0)
+        if (strcmp(old_ifname, ifname) == 0) {
+            if (src == MAC_LEARN_SRC_WAN_ARP)
+                t->list[mac_idx].from_wan = 1;
             return MAC_UPSERT_REFRESH;
+        }
 
         if (old_ifname_out) {
             memcpy(old_ifname_out, old_ifname, IF_NAMESIZE);
@@ -304,6 +319,7 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
         }
         strncpy(t->list[mac_idx].ifname, ifname, IF_NAMESIZE - 1);
         t->list[mac_idx].ifname[IF_NAMESIZE - 1] = '\0';
+        t->list[mac_idx].from_wan = (src == MAC_LEARN_SRC_WAN_ARP) ? 1 : 0;
         return MAC_UPSERT_MOVE;
     }
 
@@ -318,6 +334,7 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
         memcpy(t->list[i].mac, mac, MAC_LEN);
         strncpy(t->list[i].ifname, ifname, IF_NAMESIZE - 1);
         t->list[i].ifname[IF_NAMESIZE - 1] = '\0';
+        t->list[i].from_wan = (src == MAC_LEARN_SRC_WAN_ARP) ? 1 : 0;
         hash_rebuild_locked(t);
     }
     return MAC_UPSERT_NEW;
@@ -337,20 +354,39 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
 {
     enum mac_upsert_result r;
     char old_ifname[IF_NAMESIZE];
+    int evicted = 0;
 
-    (void)src;
     if (!t || !ifname || !mac || ifname[0] == '\0')
         return;
+    if (mac_is_zero(mac) || mac_is_multicast(mac))
+        return;
+
     pthread_spin_lock(&t->lock);
-    r = upsert_locked(t, ifname, mac, old_ifname);
+    if (mac_is_local_iface_locked(t, mac)) {
+        pthread_spin_unlock(&t->lock);
+        return;
+    }
 
-    if (r == MAC_UPSERT_NEW) {
-        char ev[96];
+    if (src == MAC_LEARN_SRC_ARP)
+        evicted = evict_other_macs_on_ifname_locked(t, ifname, mac);
 
-        snprintf(ev, sizeof(ev),
-                 "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                 ifname,
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    r = upsert_locked(t, ifname, mac, src, old_ifname);
+
+    if (r == MAC_UPSERT_NEW || evicted > 0) {
+        char ev[128];
+
+        if (evicted > 0) {
+            snprintf(ev, sizeof(ev),
+                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x evict=%d",
+                     ifname,
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                     evicted);
+        } else {
+            snprintf(ev, sizeof(ev),
+                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                     ifname,
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
         log_mac_runtime_table_from_locked(fwd, ev);
     } else if (r == MAC_UPSERT_MOVE) {
         char ev[128];
@@ -361,8 +397,8 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         log_mac_runtime_table_from_locked(fwd, ev);
     }
-    if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE)
-        mac_fdb_persist_save_locked(t, NULL);
+    if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE || evicted > 0)
+        mac_fdb_persist_save_locked(t, fwd);
     pthread_spin_unlock(&t->lock);
 }
 
@@ -431,6 +467,98 @@ static int mac_is_zero(const uint8_t mac[MAC_LEN])
 static int mac_is_multicast(const uint8_t mac[MAC_LEN])
 {
     return (mac[0] & 0x01u) != 0;
+}
+
+static int mac_is_local_iface_locked(const struct mac_learn_table *t, const uint8_t mac[MAC_LEN])
+{
+    if (!t || !mac)
+        return 0;
+    for (int i = 0; i < t->iface_mac_count; i++) {
+        if (memcmp(t->iface_macs[i], mac, MAC_LEN) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void refresh_iface_macs_locked(struct mac_learn_table *t, const struct forwarder *fwd)
+{
+    int sock;
+
+    if (!t || !fwd)
+        return;
+    t->iface_mac_count = 0;
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+        return;
+
+    for (int i = 0; i < fwd->local_count && t->iface_mac_count < MAX_INTERFACES; i++) {
+        struct ifreq ifr;
+        uint8_t hw[MAC_LEN];
+
+        if (!fwd->locals[i].ifname[0])
+            continue;
+        if (!ne_pair_local_live(&fwd->pair, i))
+            continue;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, fwd->locals[i].ifname, IFNAMSIZ - 1);
+        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+        if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0)
+            continue;
+        memcpy(hw, ifr.ifr_hwaddr.sa_data, MAC_LEN);
+        if (mac_is_zero(hw) || mac_is_multicast(hw))
+            continue;
+        memcpy(t->iface_macs[t->iface_mac_count], hw, MAC_LEN);
+        t->iface_mac_count++;
+    }
+    close(sock);
+}
+
+/* One client per LAN port: drop stale MACs when a new one is learned locally. */
+static int evict_other_macs_on_ifname_locked(struct mac_learn_table *t,
+                                             const char *ifname,
+                                             const uint8_t keep_mac[MAC_LEN])
+{
+    int w = 0;
+    int evicted = 0;
+
+    if (!t || !ifname || !ifname[0])
+        return 0;
+
+    for (int i = 0; i < t->count; i++) {
+        if (strcmp(t->list[i].ifname, ifname) == 0 &&
+            memcmp(t->list[i].mac, keep_mac, MAC_LEN) != 0 &&
+            !t->list[i].from_wan) {
+            evicted++;
+            continue;
+        }
+        if (w != i)
+            t->list[w] = t->list[i];
+        w++;
+    }
+    if (evicted > 0) {
+        t->count = w;
+        hash_rebuild_locked(t);
+    }
+    return evicted;
+}
+
+static void purge_local_iface_macs_locked(struct mac_learn_table *t)
+{
+    int w = 0;
+
+    if (!t)
+        return;
+    for (int i = 0; i < t->count; i++) {
+        if (mac_is_local_iface_locked(t, t->list[i].mac))
+            continue;
+        if (w != i)
+            t->list[w] = t->list[i];
+        w++;
+    }
+    if (w != t->count) {
+        t->count = w;
+        hash_rebuild_locked(t);
+    }
 }
 
 static int mac_fdb_ensure_log_dir(void)
@@ -522,6 +650,8 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
             if (parse_mac_colon(mac_s, mac) != 0)
                 continue;
             if (mac_is_zero(mac) || mac_is_multicast(mac))
+                continue;
+            if (t && mac_is_local_iface_locked(t, mac))
                 continue;
             if (merge_find_mac(merged, merged_count, mac) >= 0)
                 continue;
@@ -651,6 +781,10 @@ static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
             continue;
         }
         if (mac_is_zero(mac) || mac_is_multicast(mac)) {
+            skip_other++;
+            continue;
+        }
+        if (mac_is_local_iface_locked(t, mac)) {
             skip_other++;
             continue;
         }
@@ -790,6 +924,37 @@ int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li)
     return -1;
 }
 
+int mac_fwd_local_for_wan_dp(struct forwarder *fwd, int profile_pi, int wan_dp)
+{
+    const struct profile_config *prof;
+    char ifname[IF_NAMESIZE];
+
+    if (!fwd || !fwd->cfg || profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
+        return -1;
+    prof = &fwd->cfg->profiles[profile_pi];
+    if (!prof->enabled)
+        return -1;
+
+    ifname[0] = '\0';
+    for (int i = 0; i < prof->bridge_count; i++) {
+        int ci;
+
+        if (prof->bridges[i].wan_dp != wan_dp)
+            continue;
+        ci = prof->bridges[i].local_idx;
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (!fwd->cfg->locals[ci].ifname[0])
+            continue;
+        strncpy(ifname, fwd->cfg->locals[ci].ifname, IF_NAMESIZE - 1);
+        ifname[IF_NAMESIZE - 1] = '\0';
+        break;
+    }
+    if (!ifname[0])
+        return -1;
+    return ingress_idx_by_ifname(fwd, ifname);
+}
+
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname)
 {
     for (int i = 0; i < fwd->local_count; i++) {
@@ -806,6 +971,16 @@ void mac_learn_bootstrap(struct mac_learn_table *t)
     if (!t)
         return;
     table_init(t);
+}
+
+void mac_learn_refresh_iface_macs(struct forwarder *fwd)
+{
+    if (!fwd)
+        return;
+    pthread_spin_lock(&fwd->mac_table.lock);
+    refresh_iface_macs_locked(&fwd->mac_table, fwd);
+    purge_local_iface_macs_locked(&fwd->mac_table);
+    pthread_spin_unlock(&fwd->mac_table.lock);
 }
 
 void mac_learn_shutdown(struct mac_learn_table *t)
@@ -832,9 +1007,11 @@ void mac_learn_restore(struct forwarder *fwd)
 
     if (!fwd)
         return;
+    mac_learn_refresh_iface_macs(fwd);
     pthread_spin_lock(&fwd->mac_table.lock);
     loaded = mac_fdb_persist_load_locked(&fwd->mac_table, fwd,
                                          &skip_ifname, &skip_other);
+    purge_local_iface_macs_locked(&fwd->mac_table);
     if (loaded > 0) {
         char ev[64];
 
@@ -897,4 +1074,26 @@ int mac_lookup(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
         return -1;
     li = ingress_idx_by_ifname(fwd, ifname);
     return li;
+}
+
+void mac_learn_wan_arp(struct forwarder *fwd, int ingress_wan_dp, int profile_pi,
+                       const uint8_t smac[MAC_LEN])
+{
+    char ifname[IF_NAMESIZE];
+    int li;
+
+    if (!fwd || !smac)
+        return;
+    if (mac_is_zero(smac) || mac_is_multicast(smac))
+        return;
+
+    li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
+    if (li < 0 || li >= fwd->local_count)
+        return;
+    if (!fwd->locals[li].ifname[0])
+        return;
+    strncpy(ifname, fwd->locals[li].ifname, IF_NAMESIZE - 1);
+    ifname[IF_NAMESIZE - 1] = '\0';
+
+    table_learn(fwd, &fwd->mac_table, ifname, smac, MAC_LEARN_SRC_WAN_ARP);
 }
