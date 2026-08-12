@@ -1104,6 +1104,18 @@ void mac_learn_refresh_iface_macs(struct forwarder *fwd)
     pthread_spin_unlock(&fwd->mac_table.lock);
 }
 
+int mac_is_appliance_mac(struct forwarder *fwd, const uint8_t mac[MAC_LEN])
+{
+    int hit;
+
+    if (!fwd || !mac)
+        return 0;
+    pthread_spin_lock(&fwd->mac_table.lock);
+    hit = mac_is_local_iface_locked(&fwd->mac_table, mac);
+    pthread_spin_unlock(&fwd->mac_table.lock);
+    return hit;
+}
+
 void mac_learn_shutdown(struct mac_learn_table *t)
 {
     if (!t)
