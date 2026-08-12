@@ -30,9 +30,17 @@ static atomic_uint_fast64_t s_tx_wan_bytes[NE_TX_WAN_SLOTS];
 static atomic_uint_fast64_t s_tx_full_lan[NE_TX_SLOTS];
 static atomic_uint_fast64_t s_tx_full_wan[NE_TX_WAN_SLOTS];
 
+static atomic_uint_fast64_t s_crypto_lan_pkts[NE_CRYPTO_WORKERS];
+static atomic_uint_fast64_t s_crypto_wan_pkts[NE_CRYPTO_WORKERS];
+static atomic_uint_fast64_t s_crypto_ring_drop[NE_CRYPTO_WORKERS];
+
 static uint64_t s_prev[4];
+static uint64_t s_prev_crypto_lan[NE_CRYPTO_WORKERS];
+static uint64_t s_prev_crypto_wan[NE_CRYPTO_WORKERS];
 static struct timespec s_last_ts;
 static uint32_t s_tick_count;
+
+#define NE_DP_CRYPTO_Q_WATERMARK (NE_RING / 4u)
 
 void ne_dp_stats_init(void)
 {
@@ -44,6 +52,8 @@ void ne_dp_stats_init(void)
     }
     clock_gettime(CLOCK_MONOTONIC, &s_last_ts);
     memset(s_prev, 0, sizeof(s_prev));
+    memset(s_prev_crypto_lan, 0, sizeof(s_prev_crypto_lan));
+    memset(s_prev_crypto_wan, 0, sizeof(s_prev_crypto_wan));
     s_tick_count = 0;
 }
 
@@ -123,6 +133,27 @@ void ne_dp_stats_tx_full_wan(int slot, uint32_t n)
     if (!ne_dp_stats_on() || slot < 0 || slot >= (int)NE_TX_WAN_SLOTS)
         return;
     atomic_fetch_add(&s_tx_full_wan[slot], n);
+}
+
+void ne_dp_stats_crypto_lan(int worker, uint32_t n)
+{
+    if (!ne_dp_stats_on() || worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    atomic_fetch_add(&s_crypto_lan_pkts[worker], n);
+}
+
+void ne_dp_stats_crypto_wan(int worker, uint32_t n)
+{
+    if (!ne_dp_stats_on() || worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    atomic_fetch_add(&s_crypto_wan_pkts[worker], n);
+}
+
+void ne_dp_stats_crypto_ring_drop(int worker, uint32_t n)
+{
+    if (!ne_dp_stats_on() || worker < 0 || worker >= (int)NE_CRYPTO_WORKERS)
+        return;
+    atomic_fetch_add(&s_crypto_ring_drop[worker], n);
 }
 
 static uint64_t load64(const atomic_uint_fast64_t *a)
@@ -244,11 +275,68 @@ void ne_dp_stats_tick(struct forwarder *fwd)
         fprintf(stderr,
                 "[DP-STATS] ring_depth lan_to_mid=%u wan_to_mid=%u "
                 "mid_to_wan=%u mid_to_local=%u tx_no_free(wan0)=%llu "
-                "pool_free=%u\n",
+                "tx_full(lan=%llu wan=%llu) pool_free=%u\n",
                 lan_q, wan_q, mid_wan_q, mid_lan_q,
                 fwd->wan_count > 0
                     ? (unsigned long long)fwd->pair.wans[0].tx_no_free : 0ULL,
+                (unsigned long long)load64(&s_tx_full_lan[0]),
+                (unsigned long long)load64(&s_tx_full_wan[0]),
                 ne_pool_free_count(&fwd->pair));
+
+        {
+            char pps_buf[256];
+            char qlan_buf[128];
+            char qwan_buf[128];
+            char drop_buf[128];
+            size_t pps_n = 0, qlan_n = 0, qwan_n = 0, drop_n = 0;
+            int busy_w = 0;
+            uint32_t busy_depth = 0;
+
+            pps_buf[0] = qlan_buf[0] = qwan_buf[0] = drop_buf[0] = '\0';
+            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+                uint64_t cur_lan = load64(&s_crypto_lan_pkts[w]);
+                uint64_t cur_wan = load64(&s_crypto_wan_pkts[w]);
+                uint64_t d_lan = cur_lan - s_prev_crypto_lan[w];
+                uint64_t d_wan = cur_wan - s_prev_crypto_wan[w];
+                uint32_t w_lan = ne_ring_count(&fwd->local_to_mid[w]);
+                uint32_t w_wan = ne_ring_count(&fwd->wan_to_mid[w]);
+                uint32_t w_depth = w_lan + w_wan;
+                unsigned long long pps = 0;
+
+                s_prev_crypto_lan[w] = cur_lan;
+                s_prev_crypto_wan[w] = cur_wan;
+                if (sec > 0.0)
+                    pps = (unsigned long long)(((double)(d_lan + d_wan) / sec) + 0.5);
+                pps_n += (size_t)snprintf(pps_buf + pps_n, sizeof(pps_buf) - pps_n,
+                                          "%sw%d:%llu", pps_n ? " " : "", w, pps);
+                qlan_n += (size_t)snprintf(qlan_buf + qlan_n, sizeof(qlan_buf) - qlan_n,
+                                           "%s%u", qlan_n ? "," : "", w_lan);
+                qwan_n += (size_t)snprintf(qwan_buf + qwan_n, sizeof(qwan_buf) - qwan_n,
+                                           "%s%u", qwan_n ? "," : "", w_wan);
+                drop_n += (size_t)snprintf(drop_buf + drop_n, sizeof(drop_buf) - drop_n,
+                                           "%s%llu", drop_n ? "," : "",
+                                           (unsigned long long)load64(&s_crypto_ring_drop[w]));
+                if (pps_n >= sizeof(pps_buf))
+                    pps_n = sizeof(pps_buf) - 1;
+                if (qlan_n >= sizeof(qlan_buf))
+                    qlan_n = sizeof(qlan_buf) - 1;
+                if (qwan_n >= sizeof(qwan_buf))
+                    qwan_n = sizeof(qwan_buf) - 1;
+                if (drop_n >= sizeof(drop_buf))
+                    drop_n = sizeof(drop_buf) - 1;
+                if (w_depth > busy_depth) {
+                    busy_depth = w_depth;
+                    busy_w = w;
+                }
+            }
+            fprintf(stderr,
+                    "[DP-STATS] crypto pps=[%s] q_lan=[%s] q_wan=[%s] drop=[%s]\n",
+                    pps_buf, qlan_buf, qwan_buf, drop_buf);
+            if (busy_depth >= NE_DP_CRYPTO_Q_WATERMARK)
+                fprintf(stderr,
+                        "[DP-STATS] busiest_crypto=w%d depth=%u (watermark=%u)\n",
+                        busy_w, busy_depth, NE_DP_CRYPTO_Q_WATERMARK);
+        }
     }
     fflush(stderr);
 }

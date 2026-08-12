@@ -1485,6 +1485,8 @@ static void refill_fq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     for (uint32_t i = 0; i < got; i++)
         *xsk_ring_prod__fill_addr(&slot->fq, idx + i) = addrs[i];
     xsk_ring_prod__submit(&slot->fq, got);
+    if (slot->xsk && xsk_ring_prod__needs_wakeup(&slot->fq))
+        (void)recvfrom(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
 static void refill_fq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int rx_slot,
@@ -1531,6 +1533,102 @@ void ne_refill_fq_wan(struct ne_pair *p)
 {
     for (int s = 0; s < (int)NE_RX_WAN_SLOTS; s++)
         ne_refill_fq_wan_slot(p, s);
+}
+
+static void kick_fq_queue(struct ne_xsk_queue *slot)
+{
+    if (!slot || !slot->xsk)
+        return;
+    if (!xsk_ring_prod__needs_wakeup(&slot->fq))
+        return;
+    (void)recvfrom(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
+}
+
+static void kick_fq_iface_slot(struct ne_iface *iface, int rx_slot, int rx_slots)
+{
+    int nq;
+
+    if (!iface)
+        return;
+    nq = iface->queue_count;
+    for (int q = 0; q < nq; q++) {
+        if (!xsk_queue_for_rx_slot(q, rx_slot, nq, rx_slots))
+            continue;
+        kick_fq_queue(&iface->queues[q]);
+    }
+}
+
+void ne_kick_fq_local_slot(struct ne_pair *p, int rx_slot)
+{
+    if (!p || rx_slot < 0 || rx_slot >= (int)NE_RX_LAN_SLOTS)
+        return;
+    for (int i = 0; i < p->local_count; i++) {
+        if (!p->local_live[i])
+            continue;
+        kick_fq_iface_slot(&p->locals[i], rx_slot, (int)NE_RX_LAN_SLOTS);
+    }
+}
+
+void ne_kick_fq_wan_slot(struct ne_pair *p, int rx_slot)
+{
+    if (!p || rx_slot < 0 || rx_slot >= (int)NE_RX_WAN_SLOTS)
+        return;
+    for (int i = 0; i < p->wan_count; i++) {
+        if (!p->wan_live[i])
+            continue;
+        kick_fq_iface_slot(&p->wans[i], rx_slot, (int)NE_RX_WAN_SLOTS);
+    }
+}
+
+static int collect_iface_rx_fds(struct ne_iface *iface, int rx_slot, int rx_slots,
+                                int *fds, int max, int n)
+{
+    int nq;
+
+    if (!iface || !fds || n >= max)
+        return n;
+    nq = iface->queue_count;
+    for (int q = 0; q < nq && n < max; q++) {
+        int fd;
+
+        if (!xsk_queue_for_rx_slot(q, rx_slot, nq, rx_slots))
+            continue;
+        if (!iface->queues[q].xsk)
+            continue;
+        fd = xsk_socket__fd(iface->queues[q].xsk);
+        if (fd < 0)
+            continue;
+        fds[n++] = fd;
+    }
+    return n;
+}
+
+int ne_rx_local_fds(struct ne_pair *p, int rx_slot, int *fds, int max)
+{
+    int n = 0;
+
+    if (!p || !fds || max <= 0 || rx_slot < 0 || rx_slot >= (int)NE_RX_LAN_SLOTS)
+        return 0;
+    for (int i = 0; i < p->local_count && n < max; i++) {
+        if (!p->local_live[i])
+            continue;
+        n = collect_iface_rx_fds(&p->locals[i], rx_slot, (int)NE_RX_LAN_SLOTS, fds, max, n);
+    }
+    return n;
+}
+
+int ne_rx_wan_fds(struct ne_pair *p, int rx_slot, int *fds, int max)
+{
+    int n = 0;
+
+    if (!p || !fds || max <= 0 || rx_slot < 0 || rx_slot >= (int)NE_RX_WAN_SLOTS)
+        return 0;
+    for (int i = 0; i < p->wan_count && n < max; i++) {
+        if (!p->wan_live[i])
+            continue;
+        n = collect_iface_rx_fds(&p->wans[i], rx_slot, (int)NE_RX_WAN_SLOTS, fds, max, n);
+    }
+    return n;
 }
 
 // TX
@@ -1659,4 +1757,54 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
     return tx_drain_iface_all_rings(&p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot);
+}
+
+static int collect_iface_tx_fds(struct ne_iface *iface, int tx_slot, int *fds, int max, int n)
+{
+    int nq;
+
+    if (!iface || !fds || n >= max)
+        return n;
+    nq = iface->queue_count;
+    for (int q = 0; q < nq && n < max; q++) {
+        int fd;
+
+        if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
+            continue;
+        if (!iface->queues[q].xsk)
+            continue;
+        fd = xsk_socket__fd(iface->queues[q].xsk);
+        if (fd < 0)
+            continue;
+        fds[n++] = fd;
+    }
+    return n;
+}
+
+int ne_tx_local_fds(struct ne_pair *p, int tx_slot, int *fds, int max)
+{
+    int n = 0;
+
+    if (!p || !fds || max <= 0 || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+        return 0;
+    for (int i = 0; i < p->local_count && n < max; i++) {
+        if (!p->local_live[i])
+            continue;
+        n = collect_iface_tx_fds(&p->locals[i], tx_slot, fds, max, n);
+    }
+    return n;
+}
+
+int ne_tx_wan_fds(struct ne_pair *p, int tx_slot, int *fds, int max)
+{
+    int n = 0;
+
+    if (!p || !fds || max <= 0 || tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+        return 0;
+    for (int i = 0; i < p->wan_count && n < max; i++) {
+        if (!p->wan_live[i])
+            continue;
+        n = collect_iface_tx_fds(&p->wans[i], tx_slot, fds, max, n);
+    }
+    return n;
 }

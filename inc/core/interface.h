@@ -167,4 +167,11 @@ int ne_rx_lan_slots_for(int local_queue_total);
 int ne_rx_wan_slots_for(int wan_queue_total);
 void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total);
 
+int ne_rx_local_fds(struct ne_pair *p, int rx_slot, int *fds, int max);
+int ne_rx_wan_fds(struct ne_pair *p, int rx_slot, int *fds, int max);
+int ne_tx_local_fds(struct ne_pair *p, int tx_slot, int *fds, int max);
+int ne_tx_wan_fds(struct ne_pair *p, int tx_slot, int *fds, int max);
+void ne_kick_fq_local_slot(struct ne_pair *p, int rx_slot);
+void ne_kick_fq_wan_slot(struct ne_pair *p, int rx_slot);
+
 #endif

@@ -1779,7 +1779,7 @@
 #include <net/if.h>
 
 #define PQC_RX_PKT_MAX     10000
-#define KEY_ROTATION_INTERVAL_MS 60000
+#define KEY_ROTATION_INTERVAL_MS (30ULL * 24ULL * 60ULL * 60ULL * 1000ULL) /* 1 month */
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {

@@ -6,6 +6,7 @@
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/interface.h"
+#include "../../../inc/core/dp_idle.h"
 #include "../../../inc/core/wan_failover.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
@@ -381,6 +382,7 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
             job->local_idx = (uint8_t)li;
             if (ne_ring_try_push(ring, job) != 0)
                 return -1;
+            ne_dp_idle_wake(NE_DP_WAKE_TX_LAN);
             sent = 1;
         } else {
             struct ne_packet clone = {
@@ -396,6 +398,7 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
                 ne_frame_free(&fwd->pair, clone.addr);
                 break;
             }
+            ne_dp_idle_wake(NE_DP_WAKE_TX_LAN);
         }
         if (li < (int)(sizeof(sent_mask) * 8))
             sent_mask |= (1u << li);

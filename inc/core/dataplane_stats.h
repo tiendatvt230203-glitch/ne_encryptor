@@ -24,6 +24,10 @@ void ne_dp_stats_tx_wan(int slot, uint32_t pkts, uint64_t bytes);
 void ne_dp_stats_tx_full_lan(int slot, uint32_t n);
 void ne_dp_stats_tx_full_wan(int slot, uint32_t n);
 
+void ne_dp_stats_crypto_lan(int worker, uint32_t n);
+void ne_dp_stats_crypto_wan(int worker, uint32_t n);
+void ne_dp_stats_crypto_ring_drop(int worker, uint32_t n);
+
 void ne_dp_stats_tick(struct forwarder *fwd);
 
 #endif

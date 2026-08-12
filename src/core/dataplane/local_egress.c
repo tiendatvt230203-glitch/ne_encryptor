@@ -9,6 +9,7 @@
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/dp_idle.h"
 
 #include <netinet/in.h>
 #include <string.h>
@@ -50,9 +51,12 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
+    ne_dp_idle_wake(NE_DP_WAKE_TX_WAN);
     if (ne_ring_try_push(tx, tail) != 0) {
         /* Head already queued; drop only the tail fragment. */
         ne_frame_free(&fwd->pair, tail->addr);
+    } else {
+        ne_dp_idle_wake(NE_DP_WAKE_TX_WAN);
     }
     return 0;
 }
