@@ -77,20 +77,43 @@ static void dp_burst_drain_cq_wan(struct forwarder *fwd, int tx_slot)
         ne_drain_cq_wan(&fwd->pair, tx_slot);
 }
 
+/*
+ * TX worker affinity: each mid_to_*[w] ring has a single TX consumer
+ * (w % nslots == tx_slot). Prevents multi-TX MPSC reorder on one flow.
+ */
+static int tx_collect_worker_rings(struct ne_ring *out[], struct ne_ring *per_worker,
+                                   int tx_slot, int nslots)
+{
+    int n = 0;
+
+    if (nslots < 1)
+        nslots = 1;
+    if (tx_slot < 0 || tx_slot >= nslots)
+        return 0;
+    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++) {
+        if ((w % nslots) != tx_slot)
+            continue;
+        out[n++] = &per_worker[w];
+    }
+    return n;
+}
+
 static int dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int nring;
     int total = 0;
 
     if (!ne_pair_local_live(&fwd->pair, local_idx))
         return 0;
 
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[w] = &fwd->mid_to_local[local_idx][w];
+    nring = tx_collect_worker_rings(rings, fwd->mid_to_local[local_idx], tx_slot,
+                                    (int)NE_TX_SLOTS);
+    if (nring <= 0)
+        return 0;
 
     for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_local_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
-                                         local_idx, tx_slot);
+        int sent = ne_tx_drain_local_all(&fwd->pair, rings, nring, local_idx, tx_slot);
         if (sent <= 0)
             break;
         total += sent;
@@ -101,17 +124,23 @@ static int dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
 static int dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
 {
     struct ne_ring *rings[NE_CRYPTO_WORKERS];
+    int nring;
     int total = 0;
+    int nslots = (int)NE_TX_WAN_SLOTS;
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
         return 0;
 
-    for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
-        rings[w] = &fwd->mid_to_wan[wan_idx][w];
+    /* wan_tx thread count follows NE_TX_SLOTS; never claim more slots than that. */
+    if (nslots > (int)NE_TX_SLOTS)
+        nslots = (int)NE_TX_SLOTS;
+
+    nring = tx_collect_worker_rings(rings, fwd->mid_to_wan[wan_idx], tx_slot, nslots);
+    if (nring <= 0)
+        return 0;
 
     for (int burst = 0; burst < DP_TX_BURST_MAX; burst++) {
-        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, NE_CRYPTO_WORKERS,
-                                       wan_idx, tx_slot);
+        int sent = ne_tx_drain_wan_all(&fwd->pair, rings, nring, wan_idx, tx_slot);
         if (sent <= 0)
             break;
         total += sent;

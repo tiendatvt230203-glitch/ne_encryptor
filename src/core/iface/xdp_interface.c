@@ -1699,15 +1699,22 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
                                int tx_slot)
 {
     int nq = iface->queue_count;
+    int primary = -1;
 
+    /*
+     * Sticky primary queue per TX slot. Falling through to q+slots when the
+     * first queue is full reorders a single crypto-worker flow on the wire.
+     * Prefer backpressure (return 0) over multi-queue spray.
+     */
     for (int q = 0; q < nq; q++) {
         if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
-        int sent = tx_drain_queue(&iface->queues[q], src, max_frame, &iface->tx_no_free);
-        if (sent > 0)
-            return sent;
+        primary = q;
+        break;
     }
-    return 0;
+    if (primary < 0)
+        return 0;
+    return tx_drain_queue(&iface->queues[primary], src, max_frame, &iface->tx_no_free);
 }
 
 static __thread uint32_t tls_tx_drain_rr;
