@@ -56,6 +56,18 @@ static inline int crypto_pqc_generate_nonce(byte nonce[CRYPTO_PQC_NONCE_BYTES])
     return trf_pqc_generate_nonce(nonce) == TRF_PQC_OK ? 0 : -1;
 }
 
+/* One CipherCtx per worker thread; CipherInit still runs every packet. */
+static inline SCryptCipherCtx *crypto_pqc_tls_cipher(int enc)
+{
+    static __thread SCryptCipherCtx *tls_enc;
+    static __thread SCryptCipherCtx *tls_dec;
+    SCryptCipherCtx **slot = enc ? &tls_enc : &tls_dec;
+
+    if (!*slot)
+        *slot = scrypt_CipherCtxNew();
+    return *slot;
+}
+
 static inline int crypto_pqc_encrypt_payload(const crypto_pqc_sess_t *sess,
                                              const byte nonce[CRYPTO_PQC_NONCE_BYTES],
                                              byte *data, int len, int *out_len)
@@ -65,12 +77,11 @@ static inline int crypto_pqc_encrypt_payload(const crypto_pqc_sess_t *sess,
 
     if (!sess || !sess->key || !data || len <= 0 || !out_len)
         return -1;
-    c = scrypt_CipherCtxNew();
+    c = crypto_pqc_tls_cipher(1);
     if (!c)
         return -1;
     rc = trf_encrypt_payload_gcm(c, sess->key, nonce, CRYPTO_PQC_NONCE_BYTES,
                                  sess->aad, sess->aad_len, data, len, out_len);
-    scrypt_CipherCtxFree(c);
     return rc == TRF_PQC_OK ? 0 : -1;
 }
 
@@ -83,12 +94,11 @@ static inline int crypto_pqc_decrypt_payload(const crypto_pqc_sess_t *sess,
 
     if (!sess || !sess->key || !data || len <= 0 || !out_len)
         return -1;
-    c = scrypt_CipherCtxNew();
+    c = crypto_pqc_tls_cipher(0);
     if (!c)
         return -1;
     rc = trf_decrypt_payload_gcm(c, sess->key, nonce, CRYPTO_PQC_NONCE_BYTES,
                                  sess->aad, sess->aad_len, data, len, out_len);
-    scrypt_CipherCtxFree(c);
     return rc == TRF_PQC_OK ? 0 : -1;
 }
 

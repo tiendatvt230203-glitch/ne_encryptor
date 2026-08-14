@@ -24,11 +24,11 @@
 
 struct opt_entry {
     uint16_t pkt_id;
-    uint8_t  first[1600];
+    uint8_t *held;
+    uint32_t held_len;
+    uint64_t held_addr;
     uint8_t  second[1600];
-    uint32_t first_len;
     uint32_t second_len;
-    uint8_t  eth_hdr[ETH_L2_HDR_MAX];
     uint8_t  eth_len;
     uint64_t timestamp_ns;
     uint8_t  got_first;
@@ -40,6 +40,48 @@ struct opt_table {
 };
 
 static struct opt_table *g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS];
+
+static __thread struct ne_pair *tls_pair;
+static __thread uint64_t tls_cur_addr;
+static __thread int tls_held;
+static __thread uint64_t tls_out_addr;
+
+void crypto_l2_pqc_bind_pair(struct ne_pair *p)
+{
+    tls_pair = p;
+}
+
+void crypto_l2_pqc_reasm_set_addr(uint64_t addr)
+{
+    tls_cur_addr = addr;
+    tls_held = 0;
+    tls_out_addr = 0;
+}
+
+int crypto_l2_pqc_reasm_held(void)
+{
+    return tls_held;
+}
+
+uint64_t crypto_l2_pqc_reasm_out_addr(void)
+{
+    return tls_out_addr;
+}
+
+static void opt_release_held(struct opt_entry *entry)
+{
+    if (entry->held_addr && tls_pair)
+        ne_frame_free(tls_pair, entry->held_addr);
+    entry->held = NULL;
+    entry->held_addr = 0;
+    entry->held_len = 0;
+}
+
+static void opt_clear_entry(struct opt_entry *entry)
+{
+    opt_release_held(entry);
+    memset(entry, 0, sizeof(*entry));
+}
 
 static uint64_t opt_time_ns(void)
 {
@@ -67,7 +109,7 @@ static void opt_prepare_entry(struct opt_entry *entry, uint16_t pkt_id, uint64_t
     if (entry->pkt_id != pkt_id ||
         ((entry->got_first || entry->got_second) &&
          (now - entry->timestamp_ns) > OPT_FRAG_TIMEOUT_NS))
-        memset(entry, 0, sizeof(*entry));
+        opt_clear_entry(entry);
     entry->pkt_id = pkt_id;
     entry->timestamp_ns = now;
 }
@@ -86,7 +128,7 @@ static int opt_pick_slot(struct opt_table *ft, uint16_t pkt_id, uint64_t now)
         int occupied = (e->got_first || e->got_second);
 
         if (occupied && (now - e->timestamp_ns) > OPT_FRAG_TIMEOUT_NS) {
-            memset(e, 0, sizeof(*e));
+            opt_clear_entry(e);
             occupied = 0;
         }
         if (!occupied) {
@@ -112,20 +154,22 @@ static int opt_pick_slot(struct opt_table *ft, uint16_t pkt_id, uint64_t now)
     return base;
 }
 
-static int opt_store_first(struct opt_entry *entry, uint16_t pkt_id,
-                           const uint8_t *eth, uint8_t eth_len,
-                           const uint8_t *data, uint32_t data_len, uint64_t now)
+static int opt_hold_first(struct opt_entry *entry, uint16_t pkt_id,
+                          uint8_t *frame, uint32_t frame_len, uint8_t eth_len, uint64_t now)
 {
-    if (data_len > sizeof(entry->first))
+    if (!frame || frame_len == 0 || frame_len > NE_FRAME)
         return -1;
-    if (eth_len == 0 || eth_len > sizeof(entry->eth_hdr))
+    if (eth_len == 0 || eth_len > ETH_L2_HDR_MAX)
         return -1;
     opt_prepare_entry(entry, pkt_id, now);
-    entry->first_len = data_len;
-    memcpy(entry->first, data, data_len);
-    memcpy(entry->eth_hdr, eth, eth_len);
+    if (entry->held_addr && entry->held_addr != tls_cur_addr)
+        opt_release_held(entry);
+    entry->held = frame;
+    entry->held_len = frame_len;
+    entry->held_addr = tls_cur_addr;
     entry->eth_len = eth_len;
     entry->got_first = 1;
+    tls_held = 1;
     return 0;
 }
 
@@ -138,28 +182,30 @@ static int opt_store_second(struct opt_entry *entry, uint16_t pkt_id,
     entry->second_len = data_len;
     memcpy(entry->second, data, data_len);
     entry->got_second = 1;
+    tls_held = 0;
     return 0;
 }
 
-static int opt_emit_join(struct opt_entry *entry, uint8_t *out_buf, uint32_t *out_len)
+static int opt_emit_join(struct opt_entry *entry, uint32_t *out_len)
 {
     if (!entry->got_first || !entry->got_second)
         return 0;
-    int eth_len = entry->eth_len ? entry->eth_len : (int)ETH_HEADER_SIZE;
-    if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_FRAME) {
-        memset(entry, 0, sizeof(*entry));
+    if (!entry->held || !entry->held_len)
+        return -1;
+    if (entry->held_len + entry->second_len > NE_FRAME) {
+        opt_clear_entry(entry);
         return -1;
     }
-    int off = 0;
-    memcpy(out_buf, entry->eth_hdr, (size_t)eth_len);
-    off += eth_len;
-    memcpy(out_buf + off, entry->first, entry->first_len);
-    off += (int)entry->first_len;
-    if (entry->second_len > 0) {
-        memcpy(out_buf + off, entry->second, entry->second_len);
-        off += (int)entry->second_len;
-    }
-    *out_len = (uint32_t)off;
+    if (entry->second_len > 0)
+        memcpy(entry->held + entry->held_len, entry->second, entry->second_len);
+    *out_len = entry->held_len + entry->second_len;
+    if (entry->eth_len >= 2)
+        crypto_eth_set_ipv4_et(entry->held, entry->eth_len - 2);
+    if (tls_cur_addr != entry->held_addr)
+        tls_out_addr = entry->held_addr;
+    entry->held = NULL;
+    entry->held_addr = 0;
+    entry->held_len = 0;
     memset(entry, 0, sizeof(*entry));
     return 1;
 }
@@ -170,7 +216,7 @@ static void opt_frag_gc_table(struct opt_table *ft, uint64_t now_ns)
         struct opt_entry *e = &ft->entries[i];
         if ((e->got_first || e->got_second) &&
             (now_ns - e->timestamp_ns) > OPT_FRAG_TIMEOUT_NS)
-            memset(e, 0, sizeof(*e));
+            opt_clear_entry(e);
     }
 }
 
@@ -574,9 +620,9 @@ static int l2_split(struct packet_crypto_ctx *ctx, uint8_t *pkt_data, uint32_t p
     return 0;
 }
 
-static int l2_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t pkt_len,
+static int l2_reassemble(struct opt_table *ft, uint8_t *pkt_data, uint32_t pkt_len,
                          uint16_t pkt_id, uint8_t frag_index,
-                         uint8_t *out_buf, uint32_t *out_len)
+                         uint32_t *out_len)
 {
     int wire_eth = l2_wire_prefix_len(pkt_data, pkt_len);
     const uint8_t *inner;
@@ -587,7 +633,7 @@ static int l2_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t
 
     if (wire_eth < 0 || wire_eth > (int)ETH_L2_HDR_MAX)
         return -1;
-    if (pkt_len < (uint32_t)(wire_eth + 20))
+    if (pkt_len < (uint32_t)wire_eth)
         return -1;
     inner = pkt_data + wire_eth;
     inner_len = pkt_len - (uint32_t)wire_eth;
@@ -601,34 +647,17 @@ static int l2_reassemble(struct opt_table *ft, const uint8_t *pkt_data, uint32_t
         ip_hdr_len = (inner[0] & 0x0F) * 4;
         if (ip_hdr_len < 20 || inner_len < (uint32_t)ip_hdr_len)
             return -1;
-        if (opt_store_first(entry, pkt_id, pkt_data, (uint8_t)wire_eth, inner, inner_len, now) != 0)
+        if (opt_hold_first(entry, pkt_id, pkt_data, pkt_len, (uint8_t)wire_eth, now) != 0)
             return -1;
-        {
-            int joined = opt_emit_join(entry, out_buf, out_len);
-            if (joined < 0)
-                return -1;
-            if (joined == 0)
-                return 0;
-            crypto_eth_set_ipv4_et(out_buf, wire_eth - 2);
-            return 1;
-        }
+        return opt_emit_join(entry, out_len);
     }
     if (frag_index == 1) {
         if ((entry->got_first || entry->got_second) && entry->pkt_id == pkt_id &&
             (now - entry->timestamp_ns) > OPT_FRAG_TIMEOUT_NS)
-            memset(entry, 0, sizeof(*entry));
+            opt_clear_entry(entry);
         if (opt_store_second(entry, pkt_id, inner, inner_len, now) != 0)
             return -1;
-        {
-            int out_eth_len = entry->eth_len ? entry->eth_len : wire_eth;
-            int joined = opt_emit_join(entry, out_buf, out_len);
-            if (joined < 0)
-                return -1;
-            if (joined == 0)
-                return 0;
-            crypto_eth_set_ipv4_et(out_buf, out_eth_len - 2);
-            return 1;
-        }
+        return opt_emit_join(entry, out_len);
     }
     return -1;
 }
@@ -726,7 +755,7 @@ static int l2_udp_reasm(int profile_slot, int worker_idx, struct packet_crypto_c
     if (!ft)
         return -1;
     rr = l2_reassemble(ft, pkt_data, *pkt_len,
-                     opid, ofidx, out_buf, out_len);
+                     opid, ofidx, out_len);
     if (rr == 1)
         *pkt_len = *out_len;
     return rr;

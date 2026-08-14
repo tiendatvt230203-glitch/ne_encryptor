@@ -16,6 +16,9 @@
 #include <string.h>
 #include <net/if.h>
 
+/* L2 UDP fragment marker (shared by all L2 frag options including PQC). */
+#define WAN_L2_FRAG_MAGIC  0x5Bu
+
 static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id)
 {
     if (!fwd || !fwd->cfg)
@@ -95,13 +98,12 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
 }
 
 static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
-                         uint8_t policy_id, int *pending)
+                         uint8_t policy_id, uint64_t addr, int *pending)
 {
     struct packet_crypto_ctx *ctx;
     const struct crypto_policy *cp;
     crypto_option_id opt;
     int slot, rr;
-    uint8_t buf[4096];
     uint32_t blen = 0;
 
     ctx = fwd_crypto_ctx_for_wire_id(policy_id);
@@ -113,17 +115,66 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
         return -1;
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, policy_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
+    crypto_l2_pqc_reasm_set_addr(addr);
     rr = crypto_option_reassemble(opt, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
-                                  ctx, pkt, len, buf, &blen);
+                                  ctx, pkt, len, pkt, &blen);
     if (rr == 0) {
-        *pending = 1;
+        *pending = crypto_l2_pqc_reasm_held() ? 2 : 1;
         return 0;
     }
     if (rr != 1)
         return -1;
-    memcpy(pkt, buf, blen);
     *len = blen;
     return 0;
+}
+
+/*
+ * RX fast path: L2 PQC UDP fragment — skip decrypt_l2 fail + L2 is_fragment scans.
+ * Returns 1 if handled, 0 if not applicable, -1 on error.
+ */
+static int wan_try_l2_pqc_frag(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
+                               uint64_t addr, int *pending)
+{
+    const struct crypto_policy *cp;
+    uint8_t wire_pol = 0;
+    int mark_off;
+    int ns = PACKET_CRYPTO_NONCE_BYTES;
+
+    if (!crypto_eth_l2_has_marker(pkt, *len))
+        return 0;
+
+    mark_off = crypto_eth_l2_frag_magic_off(pkt, *len, ns);
+    if (mark_off < 0 || *len <= (uint32_t)mark_off ||
+        pkt[mark_off] != WAN_L2_FRAG_MAGIC)
+        return 0;
+
+    if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_pol) != 0)
+        return -1;
+
+    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_pol);
+    if (!cp || cp->crypto_mode != CRYPTO_MODE_PQC)
+        return 0;
+
+    if (!fwd_crypto_ctx_for_wire_id(wire_pol))
+        return -1;
+
+    if (reassemble_l2(fwd, pkt, len, wire_pol, addr, pending) != 0)
+        return -1;
+    return 1;
+}
+
+/* L2 UDP fragment on wire: profile lookup only needs L2 header + policy_id. */
+static int wan_l2_is_frag(const uint8_t *pkt, uint32_t len)
+{
+    int mark_off;
+    int ns = PACKET_CRYPTO_NONCE_BYTES;
+
+    if (!crypto_eth_l2_has_marker(pkt, len))
+        return 0;
+    mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
+    if (mark_off < 0 || len <= (uint32_t)mark_off)
+        return 0;
+    return pkt[mark_off] == WAN_L2_FRAG_MAGIC;
 }
 
 static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
@@ -207,42 +258,65 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         return 0;
 
     {
-        int frag_mark = 0;
-        int ns = PACKET_CRYPTO_NONCE_BYTES;
-        int mark_off;
-        uint32_t orig_len = len;
-        uint8_t wire_pol = 0;
+        int l2_fast = wan_try_l2_pqc_frag(fwd, pkt, &len, job->addr, &pending);
 
-        mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
-        if (mark_off >= 0 && len > (uint32_t)mark_off)
-            frag_mark = (pkt[mark_off] == 0x5B);
+        if (l2_fast < 0)
+            return -1;
+        if (l2_fast == 1) {
+            uint64_t out_addr;
 
-        int need_backup = frag_mark ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-            crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx);
-        if (need_backup && orig_len <= sizeof(scratch))
-            memcpy(scratch, pkt, orig_len);
-        if (decrypt_l2(fwd, pkt, &len) != 0 || !wan_l2_plain_ok(pkt, len)) {
-            if (need_backup)
-                memcpy(pkt, scratch, orig_len);
-            len = orig_len;
-            if (crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
+            if (pending == 2)
+                return 2;
+            if (pending)
+                return 1;
+            out_addr = crypto_l2_pqc_reasm_out_addr();
+            if (out_addr && out_addr != job->addr) {
+                ne_frame_free(&fwd->pair, job->addr);
+                job->addr = out_addr;
+            }
+            job->len = len;
+            return 0;
+        }
+        if (l2_fast == 0) {
+            int frag_mark = 0;
+            int ns = PACKET_CRYPTO_NONCE_BYTES;
+            int mark_off;
+            uint32_t orig_len = len;
+            uint8_t wire_pol = 0;
+
+            mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
+            if (mark_off >= 0 && len > (uint32_t)mark_off)
+                frag_mark = (pkt[mark_off] == WAN_L2_FRAG_MAGIC);
+
+            int need_backup = frag_mark ||
+                crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
-                crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
-                if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0)
+                crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx);
+            if (need_backup && orig_len <= sizeof(scratch))
+                memcpy(scratch, pkt, orig_len);
+            if (decrypt_l2(fwd, pkt, &len) != 0 || !wan_l2_plain_ok(pkt, len)) {
+                if (need_backup)
+                    memcpy(pkt, scratch, orig_len);
+                len = orig_len;
+                if (crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
+                    crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
+                    crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
+                    crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
+                    crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
+                    if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0)
+                        return -1;
+                    if (reassemble_l2(fwd, pkt, &len, wire_pol, job->addr, &pending) != 0)
+                        return -1;
+                } else {
                     return -1;
-                if (reassemble_l2(fwd, pkt, &len, wire_pol, &pending) != 0)
-                    return -1;
-            } else {
-                return -1;
+                }
             }
         }
     }
+    if (pending == 2)
+        return 2;
     if (pending)
         return 1;
 
@@ -289,6 +363,14 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     if (pending)
         return 1;
 
+    {
+        uint64_t out_addr = crypto_l2_pqc_reasm_out_addr();
+
+        if (out_addr && out_addr != job->addr) {
+            ne_frame_free(&fwd->pair, job->addr);
+            job->addr = out_addr;
+        }
+    }
     job->len = len;
     return 0;
 }
@@ -489,7 +571,15 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     wire_len = job.len;
     if (wire_len < 14u || wire_len > NE_FRAME)
         goto drop;
-    memcpy(wire_buf, pkt, wire_len);
+    /* L2 frag pending is freed after decrypt; snapshot header only (policy_id). */
+    if (wan_l2_is_frag(pkt, wire_len)) {
+        uint32_t snap = wire_len < 64u ? wire_len : 64u;
+
+        memcpy(wire_buf, pkt, snap);
+        wire_len = snap;
+    } else {
+        memcpy(wire_buf, pkt, wire_len);
+    }
 
     if (crypto_eth_l2_has_arp_marker(pkt, job.len) || dp_pkt_is_arp(pkt, job.len)) {
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
@@ -512,8 +602,11 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             ne_frame_free(&fwd->pair, job.addr);
             return;
         }
+        if (dec == 2)
+            return;
         if (dec != 0)
             goto drop;
+        pkt = ne_packet_data(&fwd->pair, job.addr);
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
 

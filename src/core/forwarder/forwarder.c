@@ -417,6 +417,7 @@ static void *crypto_worker_thread(void *arg)
     pin_cpu(ctx->cpu_id);
     dp_crypto_worker_bind(ctx->worker_idx);
     crypto_option_bind_worker_idx((uint8_t)ctx->worker_idx);
+    crypto_l2_pqc_bind_pair(&fwd->pair);
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;

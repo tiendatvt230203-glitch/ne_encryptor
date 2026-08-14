@@ -20,6 +20,12 @@
 void crypto_option_bind_worker_idx(uint8_t worker_idx);
 uint8_t crypto_option_worker_idx(void);
 
+struct ne_pair;
+void crypto_l2_pqc_bind_pair(struct ne_pair *p);
+void crypto_l2_pqc_reasm_set_addr(uint64_t addr);
+int crypto_l2_pqc_reasm_held(void);
+uint64_t crypto_l2_pqc_reasm_out_addr(void);
+
 /* --- ingress: extract policy id from wire --- */
 
 int crypto_l3_extract_policy_id(const struct app_config *cfg,
