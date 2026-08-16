@@ -16,8 +16,32 @@
 #include <string.h>
 #include <net/if.h>
 
-/* L2 UDP fragment marker (shared by all L2 frag options including PQC). */
-#define WAN_L2_FRAG_MAGIC  0x5Bu
+/* L2 UDP fragment ONLY (need_split: pkt+35 > MTU 1500). Wire after nonce:
+ *   [0x5B][pkt_id:2][frag_index:0|1][reserved:0][ciphertext...]
+ * TCP / UDP that fits MTU never write this — that offset is ciphertext. */
+#define WAN_L2_FRAG_MAGIC    0x5Bu
+#define WAN_L2_FRAG_TAG_LEN  4u
+
+static int wan_l2_is_udp_frag(const uint8_t *pkt, uint32_t len)
+{
+    int mark_off;
+    uint8_t frag_index;
+    uint8_t reserved;
+
+    if (!pkt || !crypto_eth_l2_has_marker(pkt, len))
+        return 0;
+    mark_off = crypto_eth_l2_frag_magic_off(pkt, len, PACKET_CRYPTO_NONCE_BYTES);
+    if (mark_off < 0)
+        return 0;
+    if (len < (uint32_t)mark_off + 1u + WAN_L2_FRAG_TAG_LEN)
+        return 0;
+    if (pkt[mark_off] != WAN_L2_FRAG_MAGIC)
+        return 0;
+    /* Same layout as opt_write_frag_tag / l2_udp_is_fragment */
+    frag_index = pkt[mark_off + 3];
+    reserved = pkt[mark_off + 4];
+    return frag_index <= 1u && reserved == 0u;
+}
 
 static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id)
 {
@@ -129,52 +153,48 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 }
 
 /*
- * RX fast path: L2 PQC UDP fragment — skip decrypt_l2 fail + L2 is_fragment scans.
- * Returns 1 if handled, 0 if not applicable, -1 on error.
+ * 0x5B = UDP mảnh (vượt MTU). Không có 0x5B = gói đủ → decrypt bình thường.
+ * Không drop ở đây. Ráp không được (ciphertext trùng 0x5B) cũng trả 0 cho decrypt_l2.
  */
 static int wan_try_l2_pqc_frag(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
                                uint64_t addr, int *pending)
 {
     const struct crypto_policy *cp;
     uint8_t wire_pol = 0;
-    int mark_off;
-    int ns = PACKET_CRYPTO_NONCE_BYTES;
+    uint8_t scratch[NE_FRAME];
+    uint32_t orig_len;
 
-    if (!crypto_eth_l2_has_marker(pkt, *len))
-        return 0;
-
-    mark_off = crypto_eth_l2_frag_magic_off(pkt, *len, ns);
-    if (mark_off < 0 || *len <= (uint32_t)mark_off ||
-        pkt[mark_off] != WAN_L2_FRAG_MAGIC)
+    if (!wan_l2_is_udp_frag(pkt, *len))
         return 0;
 
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_pol) != 0)
-        return -1;
+        return 0;
 
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_pol);
     if (!cp || cp->crypto_mode != CRYPTO_MODE_PQC)
         return 0;
 
     if (!fwd_crypto_ctx_for_wire_id(wire_pol))
-        return -1;
+        return 0;
 
-    if (reassemble_l2(fwd, pkt, len, wire_pol, addr, pending) != 0)
-        return -1;
+    orig_len = *len;
+    if (orig_len > NE_FRAME)
+        return 0;
+    memcpy(scratch, pkt, orig_len);
+    if (reassemble_l2(fwd, pkt, len, wire_pol, addr, pending) != 0) {
+        memcpy(pkt, scratch, orig_len);
+        *len = orig_len;
+        if (pending)
+            *pending = 0;
+        return 0;
+    }
     return 1;
 }
 
 /* L2 UDP fragment on wire: profile lookup only needs L2 header + policy_id. */
 static int wan_l2_is_frag(const uint8_t *pkt, uint32_t len)
 {
-    int mark_off;
-    int ns = PACKET_CRYPTO_NONCE_BYTES;
-
-    if (!crypto_eth_l2_has_marker(pkt, len))
-        return 0;
-    mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
-    if (mark_off < 0 || len <= (uint32_t)mark_off)
-        return 0;
-    return pkt[mark_off] == WAN_L2_FRAG_MAGIC;
+    return wan_l2_is_udp_frag(pkt, len);
 }
 
 static int reassemble_l3(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
@@ -278,17 +298,9 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
             return 0;
         }
         if (l2_fast == 0) {
-            int frag_mark = 0;
-            int ns = PACKET_CRYPTO_NONCE_BYTES;
-            int mark_off;
             uint32_t orig_len = len;
             uint8_t wire_pol = 0;
-
-            mark_off = crypto_eth_l2_frag_magic_off(pkt, len, ns);
-            if (mark_off >= 0 && len > (uint32_t)mark_off)
-                frag_mark = (pkt[mark_off] == WAN_L2_FRAG_MAGIC);
-
-            int need_backup = frag_mark ||
+            int need_backup = wan_l2_is_udp_frag(pkt, len) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_CTR128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_CTR256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                 crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||

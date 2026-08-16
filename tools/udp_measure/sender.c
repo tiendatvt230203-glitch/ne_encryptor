@@ -19,6 +19,29 @@
 #define HDR 24
 #define BATCH 64
 #define MAX_C 64
+#define PAYLOAD_BYTE 0xA5u
+#define PAYLOAD_BAD  0xA7u
+
+enum {
+    MODE_OK = 0,
+    MODE_SHUFFLE,
+    MODE_MISS,
+    MODE_BAD
+};
+
+static const char *mode_name(int m)
+{
+    switch (m) {
+    case MODE_SHUFFLE:
+        return "shuffle-seq";
+    case MODE_MISS:
+        return "miss-seq";
+    case MODE_BAD:
+        return "bad-payload";
+    default:
+        return "ok";
+    }
+}
 
 #pragma pack(push, 1)
 struct hdr {
@@ -58,7 +81,7 @@ static int parse_bps(const char *s, double *out)
 
 struct args {
     char src[64], dst[64];
-    int dport, connects, pkt, sport0, ends;
+    int dport, connects, pkt, sport0, ends, mode;
     double bps, dur;
 };
 
@@ -84,7 +107,7 @@ static void *worker(void *arg)
     struct mmsghdr msgs[BATCH];
     struct iovec iov[BATCH];
     double t0, report_t, bps_B;
-    uint64_t seq = 0, sent_bytes = 0, report_b = 0;
+    uint64_t seq = 0, sent_bytes = 0, report_b = 0, max_wire = 0;
     uint64_t ts_be;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -122,13 +145,16 @@ static void *worker(void *arg)
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &din;
         msgs[i].msg_hdr.msg_namelen = sizeof(din);
-        /* fixed header fields */
         {
             struct hdr *h = (struct hdr *)bufs[i];
             h->magic = htonl(MAGIC);
             h->ver = VER;
             h->flags = 0;
             h->flow = htons((uint16_t)w->id);
+            if (a->pkt > HDR)
+                memset(bufs[i] + HDR,
+                       a->mode == MODE_BAD ? PAYLOAD_BAD : PAYLOAD_BYTE,
+                       (size_t)(a->pkt - HDR));
         }
     }
 
@@ -158,11 +184,22 @@ static void *worker(void *arg)
             continue;
         }
 
-        ts_be = bswap64((uint64_t)(t * 1e9)); /* monotonic ok for relative */
+        ts_be = bswap64((uint64_t)(t * 1e9));
         for (i = 0; i < BATCH; i++) {
             struct hdr *h = (struct hdr *)bufs[i];
-            h->seq = bswap64(seq + (uint64_t)i);
+            uint64_t s = seq + (uint64_t)i;
+
+            if (a->mode == MODE_SHUFFLE) {
+                if ((i & 1) == 0 && i + 1 < BATCH)
+                    s = seq + (uint64_t)(i + 1);
+                else if (i & 1)
+                    s = seq + (uint64_t)(i - 1);
+            } else if (a->mode == MODE_MISS)
+                s = (s < 5) ? s : (1000000ull + (s - 5ull));
+            h->seq = bswap64(s);
             h->ts = ts_be;
+            if (s > max_wire)
+                max_wire = s;
         }
 
         sent_ok = sendmmsg(fd, msgs, BATCH, 0);
@@ -200,7 +237,7 @@ done:
         h->ver = VER;
         h->flags = FLAG_END;
         h->flow = htons((uint16_t)w->id);
-        h->seq = bswap64(seq);
+        h->seq = bswap64(max_wire + 1);
         for (i = 0; i < a->ends; i++)
             sendto(fd, endb, HDR, 0, (struct sockaddr *)&din, sizeof(din));
     }
@@ -217,7 +254,13 @@ done:
 static void usage(const char *p)
 {
     fprintf(stderr,
-            "usage: %s --src-ip IP --dst-ip IP --dst-port P [-c N] [-b BPS] [-t SEC] [-l BYTES]\n",
+            "usage: %s --src-ip IP --dst-ip IP --dst-port P [-c N] [-b BPS] [-t SEC] [-l BYTES]\n"
+            "         [--mode ok|shuffle|miss|bad]\n"
+            "  ok       gui dung (mac dinh)\n"
+            "  shuffle  xao cap seq (0,1 -> 1,0)  → receiver reorder\n"
+            "  miss     gui 0 1 2 3 4 roi nhay seq 1000000 (bo 5..999999)\n"
+            "           → receiver loss, khong can bao truoc cho receiver\n"
+            "  bad      payload 0xA7 khong 0xA5   → receiver corrupt\n",
             p);
 }
 
@@ -236,6 +279,7 @@ int main(int argc, char **argv)
     a.ends = 8;
     a.bps = 1e9;
     a.dur = 10;
+    a.mode = MODE_OK;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--src-ip") && i + 1 < argc)
@@ -257,6 +301,21 @@ int main(int argc, char **argv)
             a.pkt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--src-port-base") && i + 1 < argc)
             a.sport0 = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "ok"))
+                a.mode = MODE_OK;
+            else if (!strcmp(m, "shuffle"))
+                a.mode = MODE_SHUFFLE;
+            else if (!strcmp(m, "miss"))
+                a.mode = MODE_MISS;
+            else if (!strcmp(m, "bad"))
+                a.mode = MODE_BAD;
+            else {
+                fprintf(stderr, "bad --mode (ok|shuffle|miss|bad)\n");
+                return 2;
+            }
+        }
         else {
             usage(argv[0]);
             return 2;
@@ -272,8 +331,8 @@ int main(int argc, char **argv)
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    printf("sender: %d connect x %.3f Gbps = %.3f Gbps  pkt=%d dur=%.1fs\n", a.connects,
-           a.bps / 1e9, a.connects * a.bps / 1e9, a.pkt, a.dur);
+    printf("sender: mode=%s  %d connect x %.3f Gbps = %.3f Gbps  pkt=%d dur=%.1fs\n",
+           mode_name(a.mode), a.connects, a.bps / 1e9, a.connects * a.bps / 1e9, a.pkt, a.dur);
 
     for (i = 0; i < a.connects; i++) {
         wa[i].a = &a;

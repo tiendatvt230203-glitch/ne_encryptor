@@ -733,6 +733,8 @@ static int l2_udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_d
     if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L2, CRYPTO_MODE_PQC, 256, wire_pol))
         return 0;
     opt_read_frag_tag(pkt_data + tag_off + 1, pkt_id, frag_index);
+    if (pkt_data[tag_off + 4] != 0) /* reserved, always 0 on split */
+        return 0;
     return (*frag_index <= 1) ? 1 : 0;
 }
 

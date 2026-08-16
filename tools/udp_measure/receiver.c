@@ -19,6 +19,9 @@
 #define BATCH 128
 #define MAX_C 64
 #define JSON "result.json"
+#define PAYLOAD_BYTE 0xA5u
+/* 1 = check seq (loss/reorder/dup). 0 = chi check payload dung/sai. */
+#define CHECK_SEQ 1
 /* 8MB bitmap = 64M seq — du cho 5G x vai chuc giay @1400B */
 #define BITMAP_PRE  (8u * 1024u * 1024u)
 
@@ -51,13 +54,14 @@ static void on_sig(int s)
 struct flow {
     uint8_t *bits;
     size_t bits_bytes;
-    uint64_t recv, dup, reorder, max_seq, end_seq;
+    uint64_t recv, dup, reorder, max_seq, end_seq, corrupt;
     int ended;
     int64_t max_seen;
 };
 
 static struct flow g_fl[MAX_C];
 static int g_expect;
+static int g_pkt; /* 0 = khong ep size; >0 = phai dung -l */
 static uint64_t g_invalid;
 
 static int bit_set(struct flow *f, uint64_t seq)
@@ -122,7 +126,28 @@ static void handle(const uint8_t *buf, int len)
         return;
     }
 
+    if (g_pkt > 0 && len != g_pkt) {
+        f->corrupt++;
+        return;
+    }
+    {
+        int b;
+        for (b = HDR; b < len; b++) {
+            if (buf[b] != PAYLOAD_BYTE) {
+                f->corrupt++;
+                return;
+            }
+        }
+    }
+
+    /* toi day: payload dung — moi tinh la goi tot */
     f->recv++;
+    if (seq > f->max_seq)
+        f->max_seq = seq;
+
+    if (!CHECK_SEQ)
+        return;
+
     r = bit_set(f, seq);
     if (r == 0) {
         f->dup++;
@@ -135,8 +160,6 @@ static void handle(const uint8_t *buf, int len)
         f->reorder++;
     if ((int64_t)seq > f->max_seen)
         f->max_seen = (int64_t)seq;
-    if (seq > f->max_seq)
-        f->max_seq = seq;
 }
 
 static uint64_t count_loss(struct flow *f, uint64_t expected)
@@ -152,41 +175,44 @@ static void write_json(void)
 {
     FILE *fp = fopen(JSON, "w");
     int i, first = 1;
-    uint64_t te = 0, tr = 0, tl = 0, tro = 0, td = 0;
+        uint64_t te = 0, tr = 0, tl = 0, tro = 0, td = 0, tc = 0;
 
-    if (!fp) {
-        perror(JSON);
-        return;
-    }
-    fprintf(fp, "{\n  \"status\": \"done\",\n  \"per_connect\": [\n");
-    for (i = 0; i < g_expect; i++) {
-        struct flow *f = &g_fl[i];
-        uint64_t exp = f->ended ? f->end_seq : (f->max_seq ? f->max_seq + 1 : 0);
-        uint64_t loss = count_loss(f, exp);
-        te += exp;
-        tr += f->recv;
-        tl += loss;
-        tro += f->reorder;
-        td += f->dup;
-        if (!first)
-            fprintf(fp, ",\n");
-        first = 0;
+        if (!fp) {
+            perror(JSON);
+            return;
+        }
+        fprintf(fp, "{\n  \"status\": \"done\",\n  \"per_connect\": [\n");
+        for (i = 0; i < g_expect; i++) {
+            struct flow *f = &g_fl[i];
+            uint64_t exp = f->ended ? f->end_seq : (f->max_seq ? f->max_seq + 1 : 0);
+            uint64_t loss = CHECK_SEQ ? count_loss(f, exp) : 0;
+            te += exp;
+            tr += f->recv;
+            tl += loss;
+            tro += f->reorder;
+            td += f->dup;
+            tc += f->corrupt;
+            if (!first)
+                fprintf(fp, ",\n");
+            first = 0;
+            fprintf(fp,
+                    "    {\"connect\": %d, \"expected\": %llu, \"recv\": %llu, "
+                    "\"loss\": %llu, \"reorder\": %llu, \"dup\": %llu, "
+                    "\"corrupt\": %llu, \"loss_pct\": %.4f}",
+                    i, (unsigned long long)exp, (unsigned long long)f->recv,
+                    (unsigned long long)loss, (unsigned long long)f->reorder,
+                    (unsigned long long)f->dup, (unsigned long long)f->corrupt,
+                    exp ? (100.0 * loss / exp) : 0.0);
+        }
         fprintf(fp,
-                "    {\"connect\": %d, \"expected\": %llu, \"recv\": %llu, "
-                "\"loss\": %llu, \"reorder\": %llu, \"dup\": %llu, \"loss_pct\": %.4f}",
-                i, (unsigned long long)exp, (unsigned long long)f->recv,
-                (unsigned long long)loss, (unsigned long long)f->reorder,
-                (unsigned long long)f->dup, exp ? (100.0 * loss / exp) : 0.0);
-    }
-    fprintf(fp,
-            "\n  ],\n  \"summary\": {\n"
-            "    \"connects\": %d, \"expected\": %llu, \"recv\": %llu,\n"
-            "    \"loss\": %llu, \"reorder\": %llu, \"dup\": %llu,\n"
-            "    \"loss_pct\": %.4f, \"invalid\": %llu\n"
-            "  }\n}\n",
-            g_expect, (unsigned long long)te, (unsigned long long)tr, (unsigned long long)tl,
-            (unsigned long long)tro, (unsigned long long)td, te ? (100.0 * tl / te) : 0.0,
-            (unsigned long long)g_invalid);
+                "\n  ],\n  \"summary\": {\n"
+                "    \"connects\": %d, \"expected\": %llu, \"recv\": %llu,\n"
+                "    \"loss\": %llu, \"reorder\": %llu, \"dup\": %llu, \"corrupt\": %llu,\n"
+                "    \"loss_pct\": %.4f, \"invalid\": %llu\n"
+                "  }\n}\n",
+                g_expect, (unsigned long long)te, (unsigned long long)tr, (unsigned long long)tl,
+                (unsigned long long)tro, (unsigned long long)td, (unsigned long long)tc,
+                te ? (100.0 * tl / te) : 0.0, (unsigned long long)g_invalid);
     fclose(fp);
     printf(">>> wrote %s\n", JSON);
 }
@@ -194,28 +220,32 @@ static void write_json(void)
 static void report(void)
 {
     int i;
-    uint64_t te = 0, tr = 0, tl = 0, tro = 0, td = 0;
+    uint64_t te = 0, tr = 0, tl = 0, tro = 0, td = 0, tc = 0;
 
     printf("\n========== PER CONNECT ==========\n");
     for (i = 0; i < g_expect; i++) {
         struct flow *f = &g_fl[i];
         uint64_t exp = f->ended ? f->end_seq : (f->max_seq ? f->max_seq + 1 : 0);
-        uint64_t loss = count_loss(f, exp);
+        uint64_t loss = CHECK_SEQ ? count_loss(f, exp) : 0;
         te += exp;
         tr += f->recv;
         tl += loss;
         tro += f->reorder;
         td += f->dup;
-        printf("connect %d: expected=%llu recv=%llu loss=%llu reorder=%llu dup=%llu loss%%=%.4f\n",
+        tc += f->corrupt;
+        printf("connect %d: expected=%llu recv=%llu loss=%llu reorder=%llu dup=%llu corrupt=%llu loss%%=%.4f\n",
                i, (unsigned long long)exp, (unsigned long long)f->recv, (unsigned long long)loss,
                (unsigned long long)f->reorder, (unsigned long long)f->dup,
-               exp ? (100.0 * loss / exp) : 0.0);
+               (unsigned long long)f->corrupt, exp ? (100.0 * loss / exp) : 0.0);
     }
     printf("========== SUMMARY ==========\n");
-    printf("connects=%d expected=%llu recv=%llu loss=%llu reorder=%llu dup=%llu loss%%=%.4f invalid=%llu\n",
+    printf("connects=%d expected=%llu recv=%llu loss=%llu reorder=%llu dup=%llu corrupt=%llu loss%%=%.4f invalid=%llu\n",
            g_expect, (unsigned long long)te, (unsigned long long)tr, (unsigned long long)tl,
-           (unsigned long long)tro, (unsigned long long)td, te ? (100.0 * tl / te) : 0.0,
-           (unsigned long long)g_invalid);
+           (unsigned long long)tro, (unsigned long long)td, (unsigned long long)tc,
+           te ? (100.0 * tl / te) : 0.0, (unsigned long long)g_invalid);
+    if (tc)
+        printf("*** PAYLOAD SAI: sender PAYLOAD_BYTE khac 0x%02X (corrupt=%llu, recv tot=%llu) ***\n",
+               PAYLOAD_BYTE, (unsigned long long)tc, (unsigned long long)tr);
 }
 
 int main(int argc, char **argv)
@@ -241,13 +271,19 @@ int main(int argc, char **argv)
             port = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-c") || !strcmp(argv[i], "--expect-connects")) && i + 1 < argc)
             g_expect = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-l") || !strcmp(argv[i], "--packet-size")) && i + 1 < argc)
+            g_pkt = atoi(argv[++i]);
         else {
-            fprintf(stderr, "usage: %s --bind-ip IP --port P -c N\n", argv[0]);
+            fprintf(stderr, "usage: %s --bind-ip IP --port P -c N [-l BYTES]\n", argv[0]);
             return 2;
         }
     }
     if (port <= 0 || g_expect < 1 || g_expect > MAX_C) {
-        fprintf(stderr, "usage: %s --bind-ip IP --port P -c N\n", argv[0]);
+        fprintf(stderr, "usage: %s --bind-ip IP --port P -c N [-l BYTES]\n", argv[0]);
+        return 2;
+    }
+    if (g_pkt != 0 && (g_pkt < HDR || g_pkt > 2048)) {
+        fprintf(stderr, "-l must be 0 (any) or %d..2048\n", HDR);
         return 2;
     }
 
@@ -307,7 +343,9 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
-    printf("receiver %s:%d expect_connects=%d\n", bip, port, g_expect);
+    printf("receiver %s:%d expect_connects=%d pkt=%d%s payload=0x%02X seq_check=%s\n",
+           bip, port, g_expect, g_pkt, g_pkt ? "" : " (any size)", PAYLOAD_BYTE,
+           CHECK_SEQ ? "ON" : "OFF");
     printf("*** sender -c PHAI = %d ***\n", g_expect);
 
     last_rep = last_pkt = now_s();
@@ -336,13 +374,17 @@ int main(int argc, char **argv)
         }
 
         if (t - last_rep >= 1.0) {
+            uint64_t tc = 0, tr = 0;
             double dt = t - last_rep;
             ended = 0;
-            for (i = 0; i < g_expect; i++)
+            for (i = 0; i < g_expect; i++) {
                 if (g_fl[i].ended)
                     ended++;
-            printf("  [live] ended=%d/%d %.3f Mbps\n", ended, g_expect,
-                   (live_b * 8.0 / dt) / 1e6);
+                tc += g_fl[i].corrupt;
+                tr += g_fl[i].recv;
+            }
+            printf("  [live] ended=%d/%d %.3f Mbps  recv=%llu corrupt=%llu\n", ended, g_expect,
+                   (live_b * 8.0 / dt) / 1e6, (unsigned long long)tr, (unsigned long long)tc);
             fflush(stdout);
             live_b = 0;
             last_rep = t;
