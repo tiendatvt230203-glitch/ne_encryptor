@@ -404,7 +404,7 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
         job->local_idx = (uint8_t)li;
         if (ne_ring_try_push(ring, job) != 0)
             return -1;
-        ne_dp_idle_wake(NE_DP_WAKE_TX_LAN);
+        ne_dp_idle_wake(NE_DP_WAKE_TX);
         *sent = 1;
         return 0;
     }
@@ -423,7 +423,7 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
             ne_frame_free(&fwd->pair, clone.addr);
             return -1;
         }
-        ne_dp_idle_wake(NE_DP_WAKE_TX_LAN);
+        ne_dp_idle_wake(NE_DP_WAKE_TX);
     }
     return 0;
 }

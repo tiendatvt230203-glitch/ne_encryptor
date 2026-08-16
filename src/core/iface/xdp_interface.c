@@ -1815,3 +1815,12 @@ int ne_tx_wan_fds(struct ne_pair *p, int tx_slot, int *fds, int max)
     }
     return n;
 }
+
+int ne_tx_fds(struct ne_pair *p, int tx_slot, int *fds, int max)
+{
+    int n = ne_tx_local_fds(p, tx_slot, fds, max);
+
+    if (n >= max)
+        return n;
+    return n + ne_tx_wan_fds(p, tx_slot, fds + n, max - n);
+}

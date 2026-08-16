@@ -50,12 +50,12 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
-    ne_dp_idle_wake(NE_DP_WAKE_TX_WAN);
+    ne_dp_idle_wake(NE_DP_WAKE_TX);
     if (ne_ring_try_push(tx, tail) != 0) {
         /* Head already queued; drop only the tail fragment. */
         ne_frame_free(&fwd->pair, tail->addr);
     } else {
-        ne_dp_idle_wake(NE_DP_WAKE_TX_WAN);
+        ne_dp_idle_wake(NE_DP_WAKE_TX);
     }
     return 0;
 }
