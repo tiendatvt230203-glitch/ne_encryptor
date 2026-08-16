@@ -762,28 +762,6 @@ static void clear_iface_queues_after_delete(struct ne_pair *p, struct ne_iface *
     iface->xdp_flags = 0;
 }
 
-#ifndef MAP_HUGETLB
-#define MAP_HUGETLB 0x40000
-#endif
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21 << 26)
-#endif
-
-static void *ne_umem_mmap(size_t bufsize)
-{
-    const char *e = getenv("NE_XSK_HUGEPAGE");
-    void *p;
-
-    if (e && e[0] == '1') {
-        p = mmap(NULL, bufsize, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-        if (p != MAP_FAILED)
-            return p;
-    }
-    return mmap(NULL, bufsize, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-}
-
 static int xsk_create_queue(struct ne_pair *p, struct ne_iface *iface, const char *ifname,
                             int q, uint32_t xdp_flags)
 {
@@ -924,7 +902,8 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
     p->n_frames = NE_N_FRAMES;
     p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
 
-    p->bufs = ne_umem_mmap(p->bufsize);
+    p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p->bufs == MAP_FAILED)
         return -1;
 
