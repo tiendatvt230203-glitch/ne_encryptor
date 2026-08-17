@@ -1803,6 +1803,8 @@ static l2_dispatcher_t g_l2_dispatchers[MAX_L2_DISPATCHERS];
 static int g_l2_dispatchers_count = 0;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
+static void pqc_wait_worker_exit_locked(policy_key_binding_t *b);
+static void pqc_release_binding_locked(policy_key_binding_t *b);
 
 // Helper to calculate SHA256 hash
 static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t *out_key) {
@@ -2832,16 +2834,23 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
                 strncpy(g_policy_bindings[i].peer_ip, peer_ip, sizeof(g_policy_bindings[i].peer_ip) - 1);
                 g_policy_bindings[i].peer_ip[sizeof(g_policy_bindings[i].peer_ip) - 1] = '\0';
             }
-            if (!g_policy_bindings[i].thread_started) {
-                g_policy_bindings[i].thread_started = true;
-                if (pthread_create(&g_policy_bindings[i].thread_id, NULL, pqc_policy_handshake_worker_run, &g_policy_bindings[i]) == 0) {
-                    pthread_detach(g_policy_bindings[i].thread_id);
-                    fprintf(stderr, "[PQC-HS] Spawned Handshake Worker for Policy %d (Profile %d)\n", 
-                            g_policy_bindings[i].policy_id, profile_id);
+            policy_key_binding_t *pb = &g_policy_bindings[i];
+            if (pb->thread_started && !pb->key_ready) {
+                fprintf(stderr,
+                        "[PQC-HS] Policy %d worker stale (key not ready) — restarting handshake worker\n",
+                        pb->policy_id);
+                pqc_wait_worker_exit_locked(pb);
+            }
+            if (!pb->thread_started) {
+                pb->thread_started = true;
+                if (pthread_create(&pb->thread_id, NULL, pqc_policy_handshake_worker_run, pb) == 0) {
+                    pthread_detach(pb->thread_id);
+                    fprintf(stderr, "[PQC-HS] Spawned Handshake Worker for Policy %d (Profile %d)\n",
+                            pb->policy_id, profile_id);
                 } else {
-                    g_policy_bindings[i].thread_started = false;
-                    fprintf(stderr, "[PQC-HS] ERROR: Failed to spawn Handshake Worker for Policy %d\n", 
-                            g_policy_bindings[i].policy_id);
+                    pb->thread_started = false;
+                    fprintf(stderr, "[PQC-HS] ERROR: Failed to spawn Handshake Worker for Policy %d\n",
+                            pb->policy_id);
                 }
             }
         }
@@ -3301,6 +3310,71 @@ void sig_pqc_load_keys_from_disk(void) {
         }
     }
     closedir(dir);
+}
+
+static void pqc_wait_worker_exit_locked(policy_key_binding_t *b)
+{
+    if (!b || !b->thread_started)
+        return;
+    b->thread_exit_sig = true;
+    while (b->thread_started) {
+        pthread_mutex_unlock(&g_key_mutex);
+        usleep(1000);
+        pthread_mutex_lock(&g_key_mutex);
+    }
+    b->thread_exit_sig = false;
+}
+
+static void pqc_release_binding_locked(policy_key_binding_t *b)
+{
+    if (!b)
+        return;
+    pqc_wait_worker_exit_locked(b);
+    for (int j = 0; j < PQC_RX_QUEUE_SIZE; j++) {
+        if (b->rx_queue[j]) {
+            free(b->rx_queue[j]);
+            b->rx_queue[j] = NULL;
+        }
+    }
+    if (b->local_priv) {
+        free(b->local_priv);
+        b->local_priv = NULL;
+    }
+    if (b->local_pub) {
+        free(b->local_pub);
+        b->local_pub = NULL;
+    }
+    if (b->peer_pub) {
+        free(b->peer_pub);
+        b->peer_pub = NULL;
+    }
+    pthread_mutex_destroy(&b->rx_mutex);
+    pthread_cond_destroy(&b->rx_cond);
+}
+
+void sig_pqc_shutdown_dataplane(void)
+{
+    int n_bindings;
+
+    pthread_mutex_lock(&g_key_mutex);
+    g_dispatcher_running = false;
+    n_bindings = g_policy_bindings_count;
+    for (int i = 0; i < n_bindings; i++)
+        pqc_release_binding_locked(&g_policy_bindings[i]);
+    g_policy_bindings_count = 0;
+    memset(g_policy_bindings, 0, sizeof(g_policy_bindings));
+    memset(g_policy_bindings_active, 0, sizeof(g_policy_bindings_active));
+    memset(g_policy_key_version, 0, sizeof(g_policy_key_version));
+    memset(g_datapath_key_version, 0, sizeof(g_datapath_key_version));
+    g_l2_dispatchers_count = 0;
+    pthread_mutex_unlock(&g_key_mutex);
+
+    /* Let detached UDP/L2 dispatcher threads observe stop and release port 7090. */
+    usleep(50000);
+    fprintf(stderr,
+            "[PQC-SHUTDOWN] session state cleared (%d binding(s); identity registry kept)\n",
+            n_bindings);
+    fflush(stderr);
 }
 
 void sig_pqc_prepare_reload(void) {
