@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L
+#include "../../../inc/core/main_diag.h"
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
@@ -194,6 +195,7 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         fprintf(stderr,
                 "[NE-PQC-SYNC] profile=%d policy db_id=%d: session key loaded (handshake callback)\n",
                 profile_id, policy_crypto_ctx[i].policy_id);
+        main_diag_log_ne_policy_key(i, policy_crypto_ctx[i].policy_id);
     }
 }
 
@@ -246,12 +248,15 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
             fprintf(stderr,
                     "[NE-PQC-SYNC] policy db_id=%d profile=%d: session key loaded into dataplane\n",
                     cp->db_id, prof->id);
+            main_diag_log_ne_policy_key(ctx_i, cp->db_id);
         }
     }
 
     if (synced == 0 && pending == 0)
         return;
     fprintf(stderr, "[NE-PQC-SYNC] done synced=%d pending=%d\n", synced, pending);
+    if (synced > 0)
+        main_diag_log_ne_keys_table(cfg);
     fflush(stderr);
 }
 int fwd_crypto_rebuild(struct app_config *cfg)
@@ -361,6 +366,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     }
 
     arp_bridge_reload_policies(cfg);
+    main_diag_log_ne_keys_table(cfg);
     return 0;
 }
 

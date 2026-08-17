@@ -110,37 +110,29 @@ static int key_prefix_nonzero(const uint8_t *key, size_t len)
     return 0;
 }
 
-static void format_key_prefix_hex(char *out, size_t outsz, const uint8_t *key, size_t key_len)
-{
-    if (!key || key_len < 4 || !key_prefix_nonzero(key, 4)) {
-        snprintf(out, outsz, "-");
-        return;
-    }
-    snprintf(out, outsz, "%02X%02X%02X%02X",
-             key[0], key[1], key[2], key[3]);
-}
-
-static void policy_ne_key_prefix(char *out, size_t outsz, const struct crypto_policy *cp,
-                                 int policy_index)
+static void policy_ne_key_prefix_loaded(char *out, size_t outsz, int policy_index)
 {
     struct packet_crypto_ctx *live_ctx = NULL;
+    const uint8_t *key;
 
-    if (cp->action == POLICY_ACTION_BYPASS) {
-        snprintf(out, outsz, "-");
+    if (policy_index < 0 || !fwd_crypto_policy_ready(policy_index)) {
+        out[0] = '\0';
         return;
     }
 
-    if (policy_index >= 0 && fwd_crypto_policy_ready(policy_index))
-        live_ctx = fwd_crypto_policy_ctx(policy_index);
-
+    live_ctx = fwd_crypto_policy_ctx(policy_index);
     if (!live_ctx || !live_ctx->initialized) {
-        snprintf(out, outsz, "n/a");
+        out[0] = '\0';
         return;
     }
 
-    format_key_prefix_hex(out, outsz,
-                          packet_crypto_get_key(live_ctx, KEY_SLOT_CURRENT),
-                          AES_KEY_LEN);
+    key = packet_crypto_get_key(live_ctx, KEY_SLOT_CURRENT);
+    if (!key_prefix_nonzero(key, 4)) {
+        out[0] = '\0';
+        return;
+    }
+
+    snprintf(out, outsz, "%02X%02X%02X%02X", key[0], key[1], key[2], key[3]);
 }
 
 static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_t outsz) {
@@ -164,21 +156,17 @@ static void print_system_table(const struct app_config *cfg, const char *event)
 
 static void print_policy_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = {
-        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 8, 0
+        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
     };
     static const char *hdr[DIAG_TBL_N] = {
         "db_id", "priority", "pkt_tag", "layer", "crypto", "proto",
-        "src", "dst", "sport", "dport", "key", ""
+        "src", "dst", "sport", "dport", "", ""
     };
-    const int ncol = 11;
+    const int ncol = 10;
 
     fprintf(stderr, "\n  [policies] count=%d\n", cfg->policy_count);
     fprintf(stderr,
             "  priority = match order (lower first); pkt_tag = ID in encrypted packet (not DB id)\n");
-    fprintf(stderr,
-            "  key = NE dataplane KEY_SLOT_CURRENT (8 hex); compare with [PQC-HS] Key prefix\n");
-    fprintf(stderr,
-            "        n/a = ctx not loaded; - = ctx loaded but key empty (likely PQC/NE mismatch)\n");
     tbl_hline(w, ncol);
     tbl_row(w, ncol, hdr);
     tbl_hline(w, ncol);
@@ -191,7 +179,7 @@ static void print_policy_table(const struct app_config *cfg) {
                 continue;
             const struct crypto_policy *cp = &cfg->policies[pix];
             char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
-            char c8[12], c9[12], c10[DIAG_KEY_PREFIX_LEN];
+            char c8[12], c9[12];
             char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
 
             snprintf(c0, sizeof(c0), "%d", cp->db_id);
@@ -206,15 +194,106 @@ static void print_policy_table(const struct app_config *cfg) {
                               cp->dst_net, cp->dst_mask);
             policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
             policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
-            policy_ne_key_prefix(c10, sizeof(c10), cp, pix);
 
             const char *row[DIAG_TBL_N] = {
-                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, c10, ""
+                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
             };
             tbl_row(w, ncol, row);
         }
     }
     tbl_hline(w, ncol);
+}
+
+static void print_ne_keys_table(const struct app_config *cfg) {
+    static const int w[DIAG_TBL_N] = {
+        6, 8, 7, 6, 10, 8, 8, 0, 0, 0, 0, 0
+    };
+    static const char *hdr[DIAG_TBL_N] = {
+        "db_id", "priority", "pkt_tag", "layer", "crypto", "proto", "ne_key", "", "", "", "", ""
+    };
+    const int ncol = 7;
+    int loaded = 0;
+
+    if (!cfg)
+        return;
+
+    for (int pr = 0; pr < cfg->profile_count; pr++) {
+        const struct profile_config *p = &cfg->profiles[pr];
+        for (int j = 0; j < p->policy_count; j++) {
+            int pix = p->policy_indices[j];
+            char keybuf[DIAG_KEY_PREFIX_LEN];
+
+            if (pix < 0 || pix >= cfg->policy_count)
+                continue;
+            if (cfg->policies[pix].action == POLICY_ACTION_BYPASS)
+                continue;
+            policy_ne_key_prefix_loaded(keybuf, sizeof(keybuf), pix);
+            if (keybuf[0])
+                loaded++;
+        }
+    }
+
+    if (loaded == 0)
+        return;
+
+    fprintf(stderr,
+            "\n  [NE-KEY-TBL] %d policy key(s) loaded in dataplane "
+            "(compare ne_key with [PQC-HS] Key prefix)\n",
+            loaded);
+    tbl_hline(w, ncol);
+    tbl_row(w, ncol, hdr);
+    tbl_hline(w, ncol);
+
+    for (int pr = 0; pr < cfg->profile_count; pr++) {
+        const struct profile_config *p = &cfg->profiles[pr];
+        for (int j = 0; j < p->policy_count; j++) {
+            int pix = p->policy_indices[j];
+            if (pix < 0 || pix >= cfg->policy_count)
+                continue;
+            const struct crypto_policy *cp = &cfg->policies[pix];
+            char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12], c6[DIAG_KEY_PREFIX_LEN];
+
+            if (cp->action == POLICY_ACTION_BYPASS)
+                continue;
+            policy_ne_key_prefix_loaded(c6, sizeof(c6), pix);
+            if (!c6[0])
+                continue;
+
+            snprintf(c0, sizeof(c0), "%d", cp->db_id);
+            snprintf(c1, sizeof(c1), "%d", cp->priority);
+            snprintf(c2, sizeof(c2), "%d", cp->id);
+            snprintf(c3, sizeof(c3), "%s", policy_action_name(cp->action));
+            policy_crypto_label(cp, c4, sizeof(c4));
+            snprintf(c5, sizeof(c5), "%s", policy_proto_str(cp->protocol));
+
+            const char *row[DIAG_TBL_N] = {
+                c0, c1, c2, c3, c4, c5, c6, "", "", "", "", ""
+            };
+            tbl_row(w, ncol, row);
+        }
+    }
+    tbl_hline(w, ncol);
+    fflush(stderr);
+}
+
+void main_diag_log_ne_policy_key(int policy_index, int db_id)
+{
+    char prefix[DIAG_KEY_PREFIX_LEN];
+
+    policy_ne_key_prefix_loaded(prefix, sizeof(prefix), policy_index);
+    if (!prefix[0])
+        return;
+
+    fprintf(stderr,
+            "[NE-KEY] policy db_id=%d NE-dp Key prefix: %s "
+            "(compare with [PQC-HS] Key prefix for same policy)\n",
+            db_id, prefix);
+    fflush(stderr);
+}
+
+void main_diag_log_ne_keys_table(const struct app_config *cfg)
+{
+    print_ne_keys_table(cfg);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {
@@ -302,7 +381,6 @@ void main_diag_log_dataplane_ready(struct forwarder *fwd) {
             "| mode: single-profile (1 UMEM/process; multi-profile UMEM later) |\n");
     mac_learn_refresh_iface_macs(fwd);
     mac_learn_log_runtime_table(fwd, fwd->cfg, "dataplane-ready");
-    print_policy_table(fwd->cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
