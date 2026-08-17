@@ -16,8 +16,7 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
                                   int is_reload, int policy_only);
 void main_diag_log_dataplane_ready(struct forwarder *fwd);
 
-/* Log NE dataplane key only when KEY_SLOT_CURRENT is non-zero (after load/handshake). */
+/* [NE-KEY] when KEY_SLOT_CURRENT is loaded for a policy (PQC/CTR/GCM). */
 void main_diag_log_ne_policy_key(int policy_index, int db_id);
-void main_diag_log_ne_keys_table(const struct app_config *cfg);
 
 #endif
