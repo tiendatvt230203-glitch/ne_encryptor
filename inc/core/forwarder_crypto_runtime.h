@@ -31,5 +31,6 @@ struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index);
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len);
 
 void forwarder_pre_diversify_pqc_keys(int profile_id);
+void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg);
 
 #endif

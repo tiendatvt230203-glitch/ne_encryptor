@@ -6,6 +6,7 @@
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/traffic_crypto.h"
+#include "../../../inc/crypto/pqc_handshake.h"
 
 #include <sched.h>
 #include <stdio.h>
@@ -190,7 +191,68 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         if (policy_crypto_ctx[i].profile_id != profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+        fprintf(stderr,
+                "[NE-PQC-SYNC] profile=%d policy db_id=%d: session key loaded (handshake callback)\n",
+                profile_id, policy_crypto_ctx[i].policy_id);
     }
+}
+
+void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
+{
+    int synced = 0;
+    int pending = 0;
+
+    if (!cfg || !cfg->crypto_enabled)
+        return;
+
+    for (int pidx = 0; pidx < cfg->profile_count; pidx++) {
+        const struct profile_config *prof = &cfg->profiles[pidx];
+
+        for (int j = 0; j < prof->policy_count; j++) {
+            int pi = prof->policy_indices[j];
+            const struct crypto_policy *cp;
+            int ctx_i = -1;
+            uint8_t probe[PQC_TRAFFIC_KEY_SZ];
+
+            if (pi < 0 || pi >= cfg->policy_count)
+                continue;
+            cp = &cfg->policies[pi];
+            if (cp->crypto_mode != CRYPTO_MODE_PQC)
+                continue;
+
+            for (int i = 0; i < active_policy_count; i++) {
+                if (active_policies[i].db_id == cp->db_id) {
+                    ctx_i = i;
+                    break;
+                }
+            }
+            if (ctx_i < 0 || !policy_crypto_ready[ctx_i])
+                continue;
+
+            policy_crypto_ctx[ctx_i].profile_id = prof->id;
+            policy_crypto_ctx[ctx_i].policy_id = cp->db_id;
+            policy_crypto_ctx[ctx_i].wire_id = (uint8_t)cp->id;
+
+            if (sig_pqc_diversify_key(prof->id, cp->db_id, probe) != 0) {
+                pending++;
+                fprintf(stderr,
+                        "[NE-PQC-SYNC] policy db_id=%d profile=%d: PQC handshake key not ready yet\n",
+                        cp->db_id, prof->id);
+                continue;
+            }
+
+            packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[ctx_i]);
+            synced++;
+            fprintf(stderr,
+                    "[NE-PQC-SYNC] policy db_id=%d profile=%d: session key loaded into dataplane\n",
+                    cp->db_id, prof->id);
+        }
+    }
+
+    if (synced == 0 && pending == 0)
+        return;
+    fprintf(stderr, "[NE-PQC-SYNC] done synced=%d pending=%d\n", synced, pending);
+    fflush(stderr);
 }
 int fwd_crypto_rebuild(struct app_config *cfg)
 {

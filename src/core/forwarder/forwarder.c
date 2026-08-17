@@ -15,7 +15,6 @@
 #include "../../../inc/core/dataplane_stats.h"
 #include "../../../inc/core/dp_idle.h"
 #include "../../../inc/crypto/pqc_l2_handshake.h"
-#include "../../../inc/crypto/pqc_handshake.h"
 
 #include <net/if.h>
 #include <pthread.h>
@@ -584,7 +583,6 @@ void forwarder_cleanup(struct forwarder *fwd)
             ne_ring_destroy(&fwd->mid_to_local[i][w]);
     }
     fwd_crypto_cleanup_all_profile_slots();
-    sig_pqc_shutdown_dataplane();
     ne_pair_close(&fwd->pair, fwd->cfg);
     ne_dp_idle_shutdown();
 }
@@ -675,6 +673,7 @@ void forwarder_run(struct forwarder *fwd)
     fwd->threads_started = 1;
     if (fwd->cfg) {
         ne_cpu_map_log();
+        fwd_crypto_sync_pqc_session_keys(fwd->cfg);
         main_diag_log_dataplane_ready(fwd);
     }
     for (int w = 0; w < local_rx_started; w++)

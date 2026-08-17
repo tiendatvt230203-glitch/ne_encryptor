@@ -31,6 +31,7 @@
 #define MAX_ACTIVE_PROFILE_IDS 32
 
 static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_service_restart_requested = 0;
 static volatile sig_atomic_t g_stop_logged = 0;
 static volatile sig_atomic_t g_stop_signal_count = 0;
 
@@ -830,8 +831,12 @@ static int handle_profile_notify(struct runtime_state *rt,
     }
 
     if (!active_ids_remove(active_ids, active_id_count, profile_id)) {
-        fprintf(stderr, "[DELETE] profile %d (not in DB, not active — nothing to stop)\n",
+        fprintf(stderr,
+                "[DELETE] profile %d (not in DB, not active — requesting service restart)\n",
                 profile_id);
+        fflush(stderr);
+        g_service_restart_requested = 1;
+        g_stop_requested = 1;
         return 0;
     }
 
@@ -839,15 +844,22 @@ static int handle_profile_notify(struct runtime_state *rt,
             profile_id);
     fflush(stderr);
 
-    if (*active_id_count == 0)
-        return runtime_stop_forwarder(rt);
+    if (*active_id_count > 0) {
+        fprintf(stderr,
+                "[VALIDATE] REJECT: delete left %d other active profile(s) — "
+                "single-profile mode unexpected state\n",
+                *active_id_count);
+        fflush(stderr);
+    }
+
+    (void)runtime_stop_forwarder(rt);
 
     fprintf(stderr,
-            "[VALIDATE] REJECT: delete left %d other active profile(s) — "
-            "single-profile mode unexpected state\n",
-            *active_id_count);
+            "[DELETE] requesting service restart (clean PQC/dataplane state)\n");
     fflush(stderr);
-    return runtime_stop_forwarder(rt);
+    g_service_restart_requested = 1;
+    g_stop_requested = 1;
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -1049,5 +1061,10 @@ int main(int argc, char **argv) {
     free(rt);
     PQfinish(listen_conn);
     trf_pqc_cleanup();
+    if (g_service_restart_requested) {
+        fprintf(stderr,
+                "[DELETE] daemon exiting — systemd Restart=always will bring up a clean process\n");
+        fflush(stderr);
+    }
     return 0;
 }

@@ -4,9 +4,12 @@
 
 #include "../../../inc/core/config.h"
 #include "../../../inc/core/forwarder.h"
+#include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/mac_learn.h"
+#include "../../../inc/crypto/packet_crypto.h"
 
 #define DIAG_TBL_N     12
+#define DIAG_KEY_PREFIX_LEN 9
 #define DIAG_CIDR_LEN  24
 
 static void tbl_hline(const int *w, int n) {
@@ -98,6 +101,48 @@ static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
         snprintf(out, outsz, "%.*s", (int)(outsz > 1 ? outsz - 1 : 0), cidr);
 }
 
+static int key_prefix_nonzero(const uint8_t *key, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (key[i])
+            return 1;
+    }
+    return 0;
+}
+
+static void format_key_prefix_hex(char *out, size_t outsz, const uint8_t *key, size_t key_len)
+{
+    if (!key || key_len < 4 || !key_prefix_nonzero(key, 4)) {
+        snprintf(out, outsz, "-");
+        return;
+    }
+    snprintf(out, outsz, "%02X%02X%02X%02X",
+             key[0], key[1], key[2], key[3]);
+}
+
+static void policy_ne_key_prefix(char *out, size_t outsz, const struct crypto_policy *cp,
+                                 int policy_index)
+{
+    struct packet_crypto_ctx *live_ctx = NULL;
+
+    if (cp->action == POLICY_ACTION_BYPASS) {
+        snprintf(out, outsz, "-");
+        return;
+    }
+
+    if (policy_index >= 0 && fwd_crypto_policy_ready(policy_index))
+        live_ctx = fwd_crypto_policy_ctx(policy_index);
+
+    if (!live_ctx || !live_ctx->initialized) {
+        snprintf(out, outsz, "n/a");
+        return;
+    }
+
+    format_key_prefix_hex(out, outsz,
+                          packet_crypto_get_key(live_ctx, KEY_SLOT_CURRENT),
+                          AES_KEY_LEN);
+}
+
 static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_t outsz) {
     if (cp->action == POLICY_ACTION_BYPASS) {
         snprintf(out, outsz, "bypass");
@@ -119,19 +164,24 @@ static void print_system_table(const struct app_config *cfg, const char *event)
 
 static void print_policy_table(const struct app_config *cfg) {
     static const int w[DIAG_TBL_N] = {
-        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
+        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 8, 0
     };
     static const char *hdr[DIAG_TBL_N] = {
         "db_id", "priority", "pkt_tag", "layer", "crypto", "proto",
-        "src", "dst", "sport", "dport", "", ""
+        "src", "dst", "sport", "dport", "key", ""
     };
+    const int ncol = 11;
 
     fprintf(stderr, "\n  [policies] count=%d\n", cfg->policy_count);
     fprintf(stderr,
             "  priority = match order (lower first); pkt_tag = ID in encrypted packet (not DB id)\n");
-    tbl_hline(w, 10);
-    tbl_row(w, 10, hdr);
-    tbl_hline(w, 10);
+    fprintf(stderr,
+            "  key = NE dataplane KEY_SLOT_CURRENT (8 hex); compare with [PQC-HS] Key prefix\n");
+    fprintf(stderr,
+            "        n/a = ctx not loaded; - = ctx loaded but key empty (likely PQC/NE mismatch)\n");
+    tbl_hline(w, ncol);
+    tbl_row(w, ncol, hdr);
+    tbl_hline(w, ncol);
 
     for (int pr = 0; pr < cfg->profile_count; pr++) {
         const struct profile_config *p = &cfg->profiles[pr];
@@ -141,7 +191,7 @@ static void print_policy_table(const struct app_config *cfg) {
                 continue;
             const struct crypto_policy *cp = &cfg->policies[pix];
             char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
-            char c8[12], c9[12];
+            char c8[12], c9[12], c10[DIAG_KEY_PREFIX_LEN];
             char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
 
             snprintf(c0, sizeof(c0), "%d", cp->db_id);
@@ -156,14 +206,15 @@ static void print_policy_table(const struct app_config *cfg) {
                               cp->dst_net, cp->dst_mask);
             policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
             policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
+            policy_ne_key_prefix(c10, sizeof(c10), cp, pix);
 
             const char *row[DIAG_TBL_N] = {
-                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
+                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, c10, ""
             };
-            tbl_row(w, 10, row);
+            tbl_row(w, ncol, row);
         }
     }
-    tbl_hline(w, 10);
+    tbl_hline(w, ncol);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {
@@ -251,6 +302,7 @@ void main_diag_log_dataplane_ready(struct forwarder *fwd) {
             "| mode: single-profile (1 UMEM/process; multi-profile UMEM later) |\n");
     mac_learn_refresh_iface_macs(fwd);
     mac_learn_log_runtime_table(fwd, fwd->cfg, "dataplane-ready");
+    print_policy_table(fwd->cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }

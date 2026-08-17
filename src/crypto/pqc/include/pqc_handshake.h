@@ -199,9 +199,6 @@ int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_ma
 void sig_pqc_prepare_reload(void);
 void sig_pqc_finalize_reload(void);
 
-/** Stop PQC workers/dispatchers and clear session bindings (identity registry kept). */
-void sig_pqc_shutdown_dataplane(void);
-
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
 
 #endif
