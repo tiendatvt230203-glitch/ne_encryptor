@@ -61,16 +61,13 @@ static int profile_iface_ifname_safe(const char *ifname)
 static void profile_iface_xdp_link_off(const char *ifname)
 {
     char cmd[160];
-    unsigned int ifindex;
 
     if (!profile_iface_ifname_safe(ifname))
         return;
 
     profile_xdp_stop_log("detach begin", ifname);
-    ifindex = if_nametoindex(ifname);
-    if (ifindex != 0)
-        (void)bpf_xdp_detach((int)ifindex, XDP_FLAGS_DRV_MODE, NULL);
-
+    /* ip link only — bpf_xdp_detach on ice can block forever when no prog
+     * is attached (post-crash scrub) or after bpf_object__close already ran. */
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off >/dev/null 2>&1",
              ifname);
     (void)system(cmd);
@@ -105,12 +102,12 @@ void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li)
             p->locals[pair_li].ifname, pair_li);
     fflush(stderr);
     ne_pair_delete_local_xsks(p, pair_li);
-    profile_iface_xdp_link_off(p->locals[pair_li].ifname);
     if (p->bpf_locals[pair_li]) {
         bpf_object__close(p->bpf_locals[pair_li]);
         p->bpf_locals[pair_li] = NULL;
     }
     p->xdp_local_on[pair_li] = 0;
+    profile_iface_xdp_link_off(p->locals[pair_li].ifname);
 }
 
 void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
@@ -124,12 +121,12 @@ void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
             p->wans[dp_slot].ifname, dp_slot);
     fflush(stderr);
     ne_pair_delete_wan_xsks(p, dp_slot);
-    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (p->bpf_wans[dp_slot]) {
         bpf_object__close(p->bpf_wans[dp_slot]);
         p->bpf_wans[dp_slot] = NULL;
     }
     p->xdp_wan_on[dp_slot] = 0;
+    profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
 }
 
 void profile_iface_xdp_prepare_init(const struct app_config *cfg)

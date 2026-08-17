@@ -739,21 +739,6 @@ static void stop_log_step(const char *step)
     fflush(stderr);
 }
 
-static void stop_scrub_ifaces(const char lan_names[][IF_NAMESIZE], int nlan,
-                              const char wan_names[][IF_NAMESIZE], int nwan,
-                              const char *pass_label)
-{
-    char msg[128];
-    int i;
-
-    snprintf(msg, sizeof(msg), "scrub XDP %s: %d LAN + %d WAN", pass_label, nlan, nwan);
-    stop_log_step(msg);
-    for (i = 0; i < nlan; i++)
-        profile_iface_xdp_detach_ifname(lan_names[i]);
-    for (i = 0; i < nwan; i++)
-        profile_iface_xdp_detach_ifname(wan_names[i]);
-}
-
 static int runtime_stop_forwarder(struct runtime_state *rt) {
     char lan_names[MAX_INTERFACES][IF_NAMESIZE];
     char wan_names[MAX_INTERFACES][IF_NAMESIZE];
@@ -778,7 +763,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         }
     }
 
-    fprintf(stderr, "[STOP] stopping dataplane (XSK/UMEM first, then XDP scrub)...\n");
+    fprintf(stderr, "[STOP] stopping dataplane (XSK/UMEM first, then BPF close)...\n");
     fflush(stderr);
     stop_log_step("forwarder_stop");
     forwarder_stop();
@@ -789,7 +774,8 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     forwarder_cleanup(&rt->fwd);
     stop_log_step("forwarder_cleanup done");
 
-    stop_scrub_ifaces(lan_names, nlan, wan_names, nwan, "pass1");
+    /* ne_pair_close() already deleted XSK + closed BPF. Re-scrubbing via
+     * bpf_xdp_detach here can hang ice (enp2s0f0) after prog is already gone. */
     {
         struct app_config scrub;
 
@@ -808,10 +794,7 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
         interface_promisc_off_config(&scrub);
     }
 
-    usleep(250000);
-    stop_scrub_ifaces(lan_names, nlan, wan_names, nwan, "pass2");
-
-    stop_log_step("done (ifaces scrubbed; daemon still running)");
+    stop_log_step("done (dataplane stopped; daemon still running)");
     rt->has_thread = 0;
     rt->running = 0;
     return 0;
