@@ -990,26 +990,30 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
 
 fail:
     profile_iface_xdp_detach_config(cfg);
-    ne_pair_close(p);
+    ne_pair_close(p, cfg);
     return -1;
 #undef NE_TRY
 }
 
-void ne_pair_close(struct ne_pair *p)
+void ne_pair_close(struct ne_pair *p, const struct app_config *cfg)
 {
     if (!p)
         return;
 
     /*
-     * ice (and other drv-mode NICs): delete AF_XDP sockets while the XDP
-     * program is still attached. Closing bpf_object first unloads the prog
-     * and can trigger "Preparing device for XDP attach failed" / hang.
+     * Canonical dataplane teardown (single place — stop/restart/reload all use this).
+     * Order matters on Intel ice (drv-mode XDP + AF_XDP):
+     *   1) delete XSK while prog still attached
+     *   2) bpf_object__close (unload prog from BPF)
+     *   3) ip link set xdp off (clear xdp/id on netdev — ice needs this)
+     *   4) delete UMEM / unmap
+     * Never call bpf_xdp_detach here after step 2 — ice can hang (D-state).
      */
-    fprintf(stderr, "[STOP] ne_pair_close: delete XSK (prog still attached)\n");
+    fprintf(stderr, "[STOP] ne_pair_close: (1/4) delete XSK\n");
     fflush(stderr);
     delete_all_live_xsks(p);
 
-    fprintf(stderr, "[STOP] ne_pair_close: close BPF / unload XDP prog\n");
+    fprintf(stderr, "[STOP] ne_pair_close: (2/4) close BPF\n");
     fflush(stderr);
     for (int i = 0; i < p->local_count; i++) {
         if (p->bpf_locals[i]) {
@@ -1026,7 +1030,22 @@ void ne_pair_close(struct ne_pair *p)
         p->xdp_wan_on[i] = 0;
     }
 
-    fprintf(stderr, "[STOP] ne_pair_close: delete UMEM\n");
+    fprintf(stderr, "[STOP] ne_pair_close: (3/4) ip link xdp off\n");
+    fflush(stderr);
+    if (cfg)
+        profile_iface_xdp_detach_config(cfg);
+    else {
+        for (int i = 0; i < p->local_count; i++) {
+            if (p->locals[i].ifname[0])
+                profile_iface_xdp_detach_ifname(p->locals[i].ifname);
+        }
+        for (int i = 0; i < p->wan_count; i++) {
+            if (p->wans[i].ifname[0])
+                profile_iface_xdp_detach_ifname(p->wans[i].ifname);
+        }
+    }
+
+    fprintf(stderr, "[STOP] ne_pair_close: (4/4) delete UMEM\n");
     fflush(stderr);
     if (p->umem) {
         xsk_umem__delete(p->umem);

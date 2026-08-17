@@ -583,7 +583,7 @@ void forwarder_cleanup(struct forwarder *fwd)
             ne_ring_destroy(&fwd->mid_to_local[i][w]);
     }
     fwd_crypto_cleanup_all_profile_slots();
-    ne_pair_close(&fwd->pair);
+    ne_pair_close(&fwd->pair, fwd->cfg);
     ne_dp_idle_shutdown();
 }
 

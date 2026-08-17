@@ -740,30 +740,10 @@ static void stop_log_step(const char *step)
 }
 
 static int runtime_stop_forwarder(struct runtime_state *rt) {
-    char lan_names[MAX_INTERFACES][IF_NAMESIZE];
-    char wan_names[MAX_INTERFACES][IF_NAMESIZE];
-    int nlan = 0;
-    int nwan = 0;
-
     if (!rt->has_thread)
         return 0;
 
-    {
-        const struct app_config *cfg = &rt->cfg_slots[rt->active_slot];
-
-        for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++) {
-            snprintf(lan_names[nlan], sizeof(lan_names[nlan]), "%s",
-                     cfg->locals[i].ifname);
-            nlan++;
-        }
-        for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++) {
-            snprintf(wan_names[nwan], sizeof(wan_names[nwan]), "%s",
-                     cfg->wans[i].ifname);
-            nwan++;
-        }
-    }
-
-    fprintf(stderr, "[STOP] stopping dataplane (XSK/UMEM first, then BPF close)...\n");
+    fprintf(stderr, "[STOP] stopping dataplane...\n");
     fflush(stderr);
     stop_log_step("forwarder_stop");
     forwarder_stop();
@@ -774,27 +754,10 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
     forwarder_cleanup(&rt->fwd);
     stop_log_step("forwarder_cleanup done");
 
-    /* ne_pair_close() already deleted XSK + closed BPF. Re-scrubbing via
-     * bpf_xdp_detach here can hang ice (enp2s0f0) after prog is already gone. */
-    {
-        struct app_config scrub;
+    stop_log_step("promisc off");
+    interface_promisc_off_config(&rt->cfg_slots[rt->active_slot]);
 
-        memset(&scrub, 0, sizeof(scrub));
-        for (int i = 0; i < nlan; i++) {
-            strncpy(scrub.locals[i].ifname, lan_names[i],
-                    sizeof(scrub.locals[i].ifname) - 1);
-        }
-        scrub.local_count = nlan;
-        for (int i = 0; i < nwan; i++) {
-            strncpy(scrub.wans[i].ifname, wan_names[i],
-                    sizeof(scrub.wans[i].ifname) - 1);
-        }
-        scrub.wan_count = nwan;
-        stop_log_step("promisc off");
-        interface_promisc_off_config(&scrub);
-    }
-
-    stop_log_step("done (dataplane stopped; daemon still running)");
+    stop_log_step("done (dataplane stopped; xdp/id cleared until -id)");
     rt->has_thread = 0;
     rt->running = 0;
     return 0;
@@ -872,7 +835,7 @@ static int handle_profile_notify(struct runtime_state *rt,
         return 0;
     }
 
-    fprintf(stderr, "[DELETE] profile %d removed — stopping dataplane (scrub XDP)\n",
+    fprintf(stderr, "[DELETE] profile %d removed — stopping dataplane\n",
             profile_id);
     fflush(stderr);
 
