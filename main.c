@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -724,6 +725,35 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     return -1;
 }
 
+static void stop_log_step(const char *step)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        fprintf(stderr, "[STOP] %s\n", step);
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[STOP] %ld.%03ld %s\n",
+            (long)ts.tv_sec, ts.tv_nsec / 1000000L, step);
+    fflush(stderr);
+}
+
+static void stop_scrub_ifaces(const char lan_names[][IF_NAMESIZE], int nlan,
+                              const char wan_names[][IF_NAMESIZE], int nwan,
+                              const char *pass_label)
+{
+    char msg[128];
+    int i;
+
+    snprintf(msg, sizeof(msg), "scrub XDP %s: %d LAN + %d WAN", pass_label, nlan, nwan);
+    stop_log_step(msg);
+    for (i = 0; i < nlan; i++)
+        profile_iface_xdp_detach_ifname(lan_names[i]);
+    for (i = 0; i < nwan; i++)
+        profile_iface_xdp_detach_ifname(wan_names[i]);
+}
+
 static int runtime_stop_forwarder(struct runtime_state *rt) {
     char lan_names[MAX_INTERFACES][IF_NAMESIZE];
     char wan_names[MAX_INTERFACES][IF_NAMESIZE];
@@ -750,17 +780,16 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
 
     fprintf(stderr, "[STOP] stopping dataplane (XSK/UMEM first, then XDP scrub)...\n");
     fflush(stderr);
+    stop_log_step("forwarder_stop");
     forwarder_stop();
     forwarder_shutdown_resources();
+    stop_log_step("pthread_join forwarder");
     pthread_join(rt->thread, NULL);
+    stop_log_step("forwarder_cleanup begin");
     forwarder_cleanup(&rt->fwd);
+    stop_log_step("forwarder_cleanup done");
 
-    fprintf(stderr, "[STOP] scrub XDP leftover on %d LAN + %d WAN...\n", nlan, nwan);
-    fflush(stderr);
-    for (int i = 0; i < nlan; i++)
-        profile_iface_xdp_detach_ifname(lan_names[i]);
-    for (int i = 0; i < nwan; i++)
-        profile_iface_xdp_detach_ifname(wan_names[i]);
+    stop_scrub_ifaces(lan_names, nlan, wan_names, nwan, "pass1");
     {
         struct app_config scrub;
 
@@ -775,17 +804,14 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
                     sizeof(scrub.wans[i].ifname) - 1);
         }
         scrub.wan_count = nwan;
+        stop_log_step("promisc off");
         interface_promisc_off_config(&scrub);
     }
 
     usleep(250000);
-    for (int i = 0; i < nlan; i++)
-        profile_iface_xdp_detach_ifname(lan_names[i]);
-    for (int i = 0; i < nwan; i++)
-        profile_iface_xdp_detach_ifname(wan_names[i]);
+    stop_scrub_ifaces(lan_names, nlan, wan_names, nwan, "pass2");
 
-    fprintf(stderr, "[STOP] done (ifaces scrubbed; daemon still running)\n");
-    fflush(stderr);
+    stop_log_step("done (ifaces scrubbed; daemon still running)");
     rt->has_thread = 0;
     rt->running = 0;
     return 0;
@@ -877,11 +903,6 @@ static int handle_profile_notify(struct runtime_state *rt,
     fflush(stderr);
     return runtime_stop_forwarder(rt);
 }
-static void handle_shutdown_signal(int sig) {
-    (void)sig;
-    sig_pqc_cleanup_ipc();
-    exit(0);
-}
 
 int main(int argc, char **argv) {
     int ipc_rc = sig_pqc_handle_ipc_cli(argc, argv);
@@ -960,6 +981,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    {
+        struct sigaction sa = { .sa_handler = on_stop_signal };
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+
     if (load_ne_env() != 0) {
         fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
         return 1;
@@ -971,19 +999,12 @@ int main(int argc, char **argv) {
                 "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
         return 1;
     }
-    signal(SIGTERM, handle_shutdown_signal);
-    signal(SIGINT, handle_shutdown_signal);
 
     sig_pqc_start_ipc_server();
     sig_pqc_init_vault();
     libbpf_set_print(libbpf_print_silent);
     fprintf(stderr, "[NE-BUILD] br-system-table-v2-loglock (journal marker — verify deploy)\n");
     fflush(stderr);
-
-    struct sigaction sa = { .sa_handler = on_stop_signal };
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 
     forwarder_pin_cpu();
     PGconn *listen_conn = PQconnectdbParams(pg.keywords, pg.values, 0);

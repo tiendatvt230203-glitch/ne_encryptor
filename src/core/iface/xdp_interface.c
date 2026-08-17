@@ -625,45 +625,35 @@ static void delete_iface_xsks(struct ne_pair *p, struct ne_iface *iface, int nq)
     }
 }
 
+void ne_pair_delete_local_xsks(struct ne_pair *p, int pair_li)
+{
+    if (!p || pair_li < 0 || pair_li >= MAX_INTERFACES)
+        return;
+    delete_iface_xsks(p, &p->locals[pair_li], p->locals[pair_li].queue_count);
+}
+
+void ne_pair_delete_wan_xsks(struct ne_pair *p, int dp_slot)
+{
+    if (!p || dp_slot < 0 || dp_slot >= MAX_INTERFACES)
+        return;
+    delete_iface_xsks(p, &p->wans[dp_slot], p->wans[dp_slot].queue_count);
+}
+
 static void delete_all_live_xsks(struct ne_pair *p)
 {
-    /* Pass 0: non-umem-fd; pass 1: umem-fd holders. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < MAX_INTERFACES; i++) {
-            if (p->local_live[i] || p->locals[i].queue_count > 0) {
-                for (int q = 0; q < p->locals[i].queue_count; q++) {
-                    struct ne_xsk_queue *slot = &p->locals[i].queues[q];
-                    int is_umem_fd;
-
-                    if (!slot->xsk)
-                        continue;
-                    is_umem_fd = queue_holds_umem_fd(p, slot);
-                    if (pass == 0 && is_umem_fd)
-                        continue;
-                    if (pass == 1 && !is_umem_fd)
-                        continue;
-                    xsk_socket__delete(slot->xsk);
-                    slot->xsk = NULL;
-                }
-            }
-            if (p->wan_live[i] || p->wans[i].queue_count > 0) {
-                for (int q = 0; q < p->wans[i].queue_count; q++) {
-                    struct ne_xsk_queue *slot = &p->wans[i].queues[q];
-                    int is_umem_fd;
-
-                    if (!slot->xsk)
-                        continue;
-                    is_umem_fd = queue_holds_umem_fd(p, slot);
-                    if (pass == 0 && is_umem_fd)
-                        continue;
-                    if (pass == 1 && !is_umem_fd)
-                        continue;
-                    xsk_socket__delete(slot->xsk);
-                    slot->xsk = NULL;
-                }
-            }
-        }
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        if (p->local_live[i] || p->locals[i].queue_count > 0)
+            delete_iface_xsks(p, &p->locals[i], p->locals[i].queue_count);
+        if (p->wan_live[i] || p->wans[i].queue_count > 0)
+            delete_iface_xsks(p, &p->wans[i], p->wans[i].queue_count);
     }
+}
+
+void ne_pair_delete_all_xsks(struct ne_pair *p)
+{
+    if (!p)
+        return;
+    delete_all_live_xsks(p);
 }
 
 static int pool_reset_full(struct ne_pool *pool, uint32_t n_frames, uint32_t frame_size)
@@ -772,7 +762,8 @@ static int xsk_create_queue(struct ne_pair *p, struct ne_iface *iface, const cha
         .tx_size = NE_RING,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = xdp_flags,
-        .bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP,
+        /* Toggle AF_XDP mode here only: XDP_COPY (ixgbe) or XDP_ZEROCOPY (ice). */
+        .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
     };
 
     zero_queue_rings(slot, preserve);
@@ -1006,23 +997,20 @@ fail:
 
 void ne_pair_close(struct ne_pair *p)
 {
-    char ifnames[MAX_INTERFACES * 2][IF_NAMESIZE];
-    int nif = 0;
-
     if (!p)
         return;
 
-    
-    for (int i = 0; i < p->local_count && nif < (int)(sizeof(ifnames) / sizeof(ifnames[0])); i++) {
-        if (p->locals[i].ifname[0])
-            snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->locals[i].ifname);
-    }
-    for (int i = 0; i < p->wan_count && nif < (int)(sizeof(ifnames) / sizeof(ifnames[0])); i++) {
-        if (p->wans[i].ifname[0])
-            snprintf(ifnames[nif++], IF_NAMESIZE, "%s", p->wans[i].ifname);
-    }
+    /*
+     * ice (and other drv-mode NICs): delete AF_XDP sockets while the XDP
+     * program is still attached. Closing bpf_object first unloads the prog
+     * and can trigger "Preparing device for XDP attach failed" / hang.
+     */
+    fprintf(stderr, "[STOP] ne_pair_close: delete XSK (prog still attached)\n");
+    fflush(stderr);
+    delete_all_live_xsks(p);
 
-
+    fprintf(stderr, "[STOP] ne_pair_close: close BPF / unload XDP prog\n");
+    fflush(stderr);
     for (int i = 0; i < p->local_count; i++) {
         if (p->bpf_locals[i]) {
             bpf_object__close(p->bpf_locals[i]);
@@ -1037,20 +1025,9 @@ void ne_pair_close(struct ne_pair *p)
         }
         p->xdp_wan_on[i] = 0;
     }
-    for (int i = 0; i < p->wan_count; i++) {
-        for (int q = 0; q < p->wans[i].queue_count; q++) {
-            if (p->wans[i].queues[q].xsk)
-                xsk_socket__delete(p->wans[i].queues[q].xsk);
-            p->wans[i].queues[q].xsk = NULL;
-        }
-    }
-    for (int i = 0; i < p->local_count; i++) {
-        for (int q = 0; q < p->locals[i].queue_count; q++) {
-            if (p->locals[i].queues[q].xsk)
-                xsk_socket__delete(p->locals[i].queues[q].xsk);
-            p->locals[i].queues[q].xsk = NULL;
-        }
-    }
+
+    fprintf(stderr, "[STOP] ne_pair_close: delete UMEM\n");
+    fflush(stderr);
     if (p->umem) {
         xsk_umem__delete(p->umem);
         p->umem = NULL;
@@ -1059,9 +1036,6 @@ void ne_pair_close(struct ne_pair *p)
     if (p->bufs && p->bufs != MAP_FAILED)
         munmap(p->bufs, p->bufsize);
     memset(p, 0, sizeof(*p));
-
-    for (int i = 0; i < nif; i++)
-        profile_iface_xdp_detach_ifname(ifnames[i]);
 }
 
 int ne_pair_local_live(const struct ne_pair *p, int pair_local_idx)

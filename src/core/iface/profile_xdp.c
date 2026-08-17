@@ -15,7 +15,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+static void profile_xdp_stop_log(const char *step, const char *ifname)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        fprintf(stderr, "[STOP] xdp %s", step);
+        if (ifname && ifname[0])
+            fprintf(stderr, " %s", ifname);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[STOP] %ld.%03ld xdp %s",
+            (long)ts.tv_sec, ts.tv_nsec / 1000000L, step);
+    if (ifname && ifname[0])
+        fprintf(stderr, " %s", ifname);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
 
 /* #region agent log */
 static void agent_dbg(const char *hid, const char *loc, const char *msg, const char *data_json)
@@ -45,6 +66,7 @@ static void profile_iface_xdp_link_off(const char *ifname)
     if (!profile_iface_ifname_safe(ifname))
         return;
 
+    profile_xdp_stop_log("detach begin", ifname);
     ifindex = if_nametoindex(ifname);
     if (ifindex != 0)
         (void)bpf_xdp_detach((int)ifindex, XDP_FLAGS_DRV_MODE, NULL);
@@ -52,6 +74,7 @@ static void profile_iface_xdp_link_off(const char *ifname)
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off >/dev/null 2>&1",
              ifname);
     (void)system(cmd);
+    profile_xdp_stop_log("detach done", ifname);
 }
 
 void profile_iface_xdp_detach_ifname(const char *ifname)
@@ -81,6 +104,7 @@ void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li)
     fprintf(stderr, "[PROFILE-XDP] DETACH LAN %s (slot %d)\n",
             p->locals[pair_li].ifname, pair_li);
     fflush(stderr);
+    ne_pair_delete_local_xsks(p, pair_li);
     profile_iface_xdp_link_off(p->locals[pair_li].ifname);
     if (p->bpf_locals[pair_li]) {
         bpf_object__close(p->bpf_locals[pair_li]);
@@ -99,6 +123,7 @@ void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
     fprintf(stderr, "[PROFILE-XDP] DETACH WAN %s (dp slot %d)\n",
             p->wans[dp_slot].ifname, dp_slot);
     fflush(stderr);
+    ne_pair_delete_wan_xsks(p, dp_slot);
     profile_iface_xdp_link_off(p->wans[dp_slot].ifname);
     if (p->bpf_wans[dp_slot]) {
         bpf_object__close(p->bpf_wans[dp_slot]);

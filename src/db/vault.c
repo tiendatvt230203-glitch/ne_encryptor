@@ -1,15 +1,23 @@
 #include "../../inc/db/vault.h"
 #include "../../inc/db/db_env.h"
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#define VAULT_CMD_BUF 2048
-#define VAULT_VAL_BUF 2048
+#define NE_VAULT_HTTP_TIMEOUT_SEC 10
+#define NE_VAULT_HTTP_BUF       65536
+#define NE_VAULT_VAL_BUF          2048
 
 struct ne_vault_cfg {
     char addr[256];
+    char host[128];
+    int port;
     char token[256];
     char k1[256];
     char k2[256];
@@ -51,6 +59,43 @@ static int ne_vault_key_allowed(const char *key)
     return 0;
 }
 
+static void ne_vault_parse_url(struct ne_vault_cfg *cfg, const char *url)
+{
+    const char *p = url;
+
+    if (!cfg || !url || !url[0])
+        return;
+
+    strncpy(cfg->addr, url, sizeof(cfg->addr) - 1);
+    if (strncmp(p, "http://", 7) == 0)
+        p += 7;
+    else if (strncmp(p, "https://", 8) == 0)
+        p += 8;
+
+    {
+        char hostport[256];
+        char *colon;
+        char *slash;
+
+        strncpy(hostport, p, sizeof(hostport) - 1);
+        hostport[sizeof(hostport) - 1] = '\0';
+        slash = strchr(hostport, '/');
+        if (slash)
+            *slash = '\0';
+        colon = strchr(hostport, ':');
+        if (colon) {
+            *colon = '\0';
+            cfg->port = atoi(colon + 1);
+        } else {
+            cfg->port = 8200;
+        }
+        strncpy(cfg->host, hostport, sizeof(cfg->host) - 1);
+    }
+
+    if (strcmp(cfg->host, "localhost") == 0)
+        strncpy(cfg->host, "127.0.0.1", sizeof(cfg->host) - 1);
+}
+
 static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
 {
     FILE *fp;
@@ -60,6 +105,8 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
         return -1;
 
     memset(cfg, 0, sizeof(*cfg));
+    cfg->port = 8200;
+    strncpy(cfg->host, "127.0.0.1", sizeof(cfg->host) - 1);
 
     fp = fopen(NE_ENV_FILE, "r");
     if (!fp) {
@@ -107,7 +154,7 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
             continue;
 
         if (strcmp(key, "VAULT_ADDR") == 0)
-            strncpy(cfg->addr, val, sizeof(cfg->addr) - 1);
+            ne_vault_parse_url(cfg, val);
         else if (strcmp(key, "VAULT_TOKEN") == 0)
             strncpy(cfg->token, val, sizeof(cfg->token) - 1);
         else if (strcmp(key, "UNSEAL_KEY_1") == 0)
@@ -141,36 +188,154 @@ static int ne_vault_cfg_present(const struct ne_vault_cfg *cfg)
            cfg->k1[0] && cfg->k2[0] && cfg->k3[0];
 }
 
-static int ne_vault_run_silent(const struct ne_vault_cfg *cfg, const char *cmd)
+static int ne_vault_http_request(const struct ne_vault_cfg *cfg, const char *method,
+                                 const char *path, const char *body,
+                                 char *resp_buf, size_t max_resp)
 {
-    char final_cmd[VAULT_CMD_BUF * 2];
-    FILE *fp;
-    int rc;
+    int sockfd;
+    struct timeval tv;
+    struct sockaddr_in serv_addr;
+    char req[16384];
+    int req_len;
+    int body_len;
+    int total_recv;
+    int n;
 
-    snprintf(final_cmd, sizeof(final_cmd),
-             "export VAULT_ADDR=\"%s\" VAULT_TOKEN=\"%s\" && %s > /dev/null 2>&1",
-             cfg->addr, cfg->token, cmd);
-    fp = popen(final_cmd, "r");
-    if (!fp)
+    if (!cfg || !method || !path || !resp_buf || max_resp < 2)
         return -1;
-    rc = pclose(fp);
-    return (rc == 0) ? 0 : -1;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0)
+        return -1;
+
+    tv.tv_sec = NE_VAULT_HTTP_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons((uint16_t)cfg->port);
+
+    if (inet_pton(AF_INET, cfg->host, &serv_addr.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(cfg->host);
+        if (!he) {
+            close(sockfd);
+            return -1;
+        }
+        memcpy(&serv_addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        fprintf(stderr, "[VAULT] HTTP connect %s:%d failed: %s\n",
+                cfg->host, cfg->port, strerror(errno));
+        close(sockfd);
+        return -1;
+    }
+
+    body_len = body ? (int)strlen(body) : 0;
+    req_len = snprintf(req, sizeof(req),
+                       "%s %s HTTP/1.1\r\n"
+                       "Host: %s:%d\r\n"
+                       "User-Agent: network-encryptor-db\r\n"
+                       "Accept: application/json\r\n"
+                       "Content-Type: application/json\r\n"
+                       "X-Vault-Token: %s\r\n"
+                       "Content-Length: %d\r\n"
+                       "Connection: close\r\n\r\n"
+                       "%s",
+                       method, path, cfg->host, cfg->port,
+                       cfg->token[0] ? cfg->token : "",
+                       body_len, body ? body : "");
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (send(sockfd, req, (size_t)req_len, 0) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    memset(resp_buf, 0, max_resp);
+    total_recv = 0;
+    while ((n = recv(sockfd, resp_buf + total_recv,
+                     (int)max_resp - 1 - total_recv, 0)) > 0) {
+        total_recv += n;
+        if (total_recv >= (int)max_resp - 1)
+            break;
+    }
+    close(sockfd);
+    resp_buf[total_recv] = '\0';
+    return total_recv > 0 ? total_recv : -1;
 }
 
-static int ne_secret_metadata_key(const char *key)
+static int ne_vault_json_bool_false(const char *json, const char *key)
 {
-    static const char *meta[] = {
-        "created_time", "custom_metadata", "deletion_time", "destroyed", "version",
-        NULL
-    };
+    char pattern[64];
+    const char *p;
 
-    if (!key)
-        return 1;
-    for (int i = 0; meta[i]; i++) {
-        if (strcmp(key, meta[i]) == 0)
-            return 1;
+    if (!json || !key)
+        return 0;
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p)
+        return 0;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t')
+        p++;
+    return strncmp(p, "false", 5) == 0;
+}
+
+static int ne_vault_json_extract_string(const char *json, const char *key,
+                                        char *out, size_t outsz)
+{
+    char pattern[128];
+    const char *p;
+    size_t i;
+
+    if (!json || !key || !out || outsz == 0)
+        return -1;
+
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p)
+        return -1;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t')
+        p++;
+    if (*p != '"')
+        return -1;
+    p++;
+
+    i = 0;
+    while (*p && *p != '"' && i + 1 < outsz) {
+        if (*p == '\\') {
+            p++;
+            if (!*p)
+                break;
+        }
+        out[i++] = *p++;
     }
-    return 0;
+    out[i] = '\0';
+    return i > 0 ? 0 : -1;
+}
+
+static int ne_vault_http_unseal_key(const struct ne_vault_cfg *cfg, const char *key)
+{
+    char payload[1024];
+    char response[8192];
+
+    if (!key || !key[0])
+        return -1;
+
+    snprintf(payload, sizeof(payload), "{\"key\":\"%s\"}", key);
+    if (ne_vault_http_request(cfg, "POST", "/v1/sys/unseal", payload,
+                              response, sizeof(response)) < 0) {
+        fprintf(stderr, "[VAULT] HTTP unseal request failed\n");
+        return -1;
+    }
+    return ne_vault_json_bool_false(response, "sealed") ? 0 : 1;
 }
 
 static int ne_secret_key_wanted(const char *key)
@@ -184,55 +349,32 @@ static int ne_secret_key_wanted(const char *key)
     return 0;
 }
 
-/* Parse "KEY    value" lines from `vault kv get` table output. */
-static int ne_vault_parse_table_line(const char *line, char *key, size_t keysz,
-                                     char *val, size_t valsz)
+static int ne_vault_kv_apply_from_json(const char *json)
 {
-    const char *p = line;
-    const char *val_start = NULL;
-    size_t klen;
+    static const char *keys[] = {
+        "LISTEN_PORT",
+        "POSTGRES_DB",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_PORT",
+        "POSTGRES_SERVER",
+        "POSTGRES_USER",
+        "POSTGRES_HOST",
+        NULL
+    };
+    char val[NE_VAULT_VAL_BUF];
+    int loaded = 0;
 
-    while (*p == ' ' || *p == '\t')
-        p++;
-    if (*p == '\0' || *p == '\n' || *p == '#')
-        return -1;
-    if (strncmp(p, "---", 3) == 0)
-        return -1;
-
-    for (const char *q = p; *q; q++) {
-        if ((*q == ' ' && q[1] == ' ') || *q == '\t') {
-            val_start = q;
-            while (*val_start == ' ' || *val_start == '\t')
-                val_start++;
-            if (!*val_start || *val_start == '\n')
-                continue;
-            break;
-        }
+    for (int i = 0; keys[i]; i++) {
+        if (ne_vault_json_extract_string(json, keys[i], val, sizeof(val)) != 0)
+            continue;
+        if (!ne_secret_key_wanted(keys[i]))
+            continue;
+        setenv(keys[i], val, 1);
+        if (strcmp(keys[i], "POSTGRES_HOST") == 0)
+            setenv("POSTGRES_SERVER", val, 1);
+        loaded++;
     }
-    if (!val_start)
-        return -1;
-
-    klen = (size_t)(val_start - p);
-    while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t'))
-        klen--;
-    if (klen == 0 || klen >= keysz)
-        return -1;
-
-    memcpy(key, p, klen);
-    key[klen] = '\0';
-
-    strncpy(val, val_start, valsz - 1);
-    val[valsz - 1] = '\0';
-
-    {
-        size_t n = strlen(val);
-        while (n > 0 && (val[n - 1] == '\n' || val[n - 1] == '\r' ||
-                         val[n - 1] == ' ' || val[n - 1] == '\t'))
-            val[--n] = '\0';
-    }
-
-    strip_env_quotes(val);
-    return val[0] ? 0 : -1;
+    return loaded;
 }
 
 static int ne_vault_value_needs_quotes(const char *key)
@@ -281,47 +423,57 @@ static void ne_vault_log_loaded_secrets(void)
 #endif
 }
 
+static void ne_vault_kv_api_path(char *out, size_t outsz)
+{
+    const char *p = NE_VAULT_SECRET_PATH;
+    const char *slash = strchr(p, '/');
+
+    if (!slash || slash == p) {
+        snprintf(out, outsz, "/v1/%s", p);
+        return;
+    }
+    snprintf(out, outsz, "/v1/%.*s/data%s",
+             (int)(slash - p), p, slash);
+}
+
 static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
 {
-    char final_cmd[VAULT_CMD_BUF * 2];
-    char line[4096];
-    char key[128];
-    char val[VAULT_VAL_BUF];
-    FILE *fp;
-    int loaded = 0;
-    int rc;
+    char *response;
+    char api_path[128];
+    int loaded;
+    const char *body;
 
-    snprintf(final_cmd, sizeof(final_cmd),
-             "export VAULT_ADDR=\"%s\" VAULT_TOKEN=\"%s\" && vault kv get %s",
-             cfg->addr, cfg->token, NE_VAULT_SECRET_PATH);
-
-    fp = popen(final_cmd, "r");
-    if (!fp) {
-        fprintf(stderr, "[VAULT] popen vault kv get failed\n");
+    response = malloc(NE_VAULT_HTTP_BUF);
+    if (!response)
         return -1;
+
+    ne_vault_kv_api_path(api_path, sizeof(api_path));
+    if (ne_vault_http_request(cfg, "GET", api_path, NULL,
+                              response, NE_VAULT_HTTP_BUF) < 0) {
+        snprintf(api_path, sizeof(api_path), "/v1/%s", NE_VAULT_SECRET_PATH);
+        if (ne_vault_http_request(cfg, "GET", api_path, NULL,
+                                  response, NE_VAULT_HTTP_BUF) < 0) {
+            fprintf(stderr, "[VAULT] HTTP kv get failed for " NE_VAULT_SECRET_PATH "\n");
+            free(response);
+            return -1;
+        }
     }
 
-    while (fgets(line, sizeof(line), fp)) {
-        if (ne_vault_parse_table_line(line, key, sizeof(key), val, sizeof(val)) != 0)
-            continue;
-        if (ne_secret_metadata_key(key))
-            continue;
-        if (!ne_secret_key_wanted(key))
-            continue;
+    body = strchr(response, '\r');
+    if (body)
+        body = strchr(body, '\n');
+    if (body)
+        body++;
+    else
+        body = response;
 
-        setenv(key, val, 1);
-        loaded++;
-    }
+    loaded = ne_vault_kv_apply_from_json(body);
+    free(response);
 
-    rc = pclose(fp);
     if (loaded == 0) {
-        fprintf(stderr, "[VAULT] vault kv get " NE_VAULT_SECRET_PATH
-                " returned no POSTGRES_* fields (exit=%d)\n", rc);
+        fprintf(stderr, "[VAULT] HTTP kv get " NE_VAULT_SECRET_PATH
+                " returned no POSTGRES_* fields\n");
         return -1;
-    }
-    if (rc != 0) {
-        fprintf(stderr, "[VAULT] warn: vault kv get exit=%d but %d field(s) parsed\n",
-                rc, loaded);
     }
     return 0;
 }
@@ -369,7 +521,7 @@ static int ne_vault_verify_postgres_env(void)
 int ne_vault_unseal_and_login(void)
 {
     struct ne_vault_cfg cfg;
-    char cmd[VAULT_CMD_BUF];
+    char response[8192];
     int fail = 0;
 
     if (ne_vault_load_cfg(&cfg) != 0)
@@ -382,28 +534,40 @@ int ne_vault_unseal_and_login(void)
         return -1;
     }
 
-    fprintf(stderr, "[VAULT] unseal + login addr=%s\n", cfg.addr);
+    fprintf(stderr, "[VAULT] unseal via HTTP addr=%s (timeout=%ds)\n",
+            cfg.addr, NE_VAULT_HTTP_TIMEOUT_SEC);
 
-    snprintf(cmd, sizeof(cmd), "vault operator unseal \"%s\"", cfg.k1);
-    if (ne_vault_run_silent(&cfg, cmd) != 0)
-        fail = 1;
-
-    snprintf(cmd, sizeof(cmd), "vault operator unseal \"%s\"", cfg.k2);
-    if (ne_vault_run_silent(&cfg, cmd) != 0)
-        fail = 1;
-
-    snprintf(cmd, sizeof(cmd), "vault operator unseal \"%s\"", cfg.k3);
-    if (ne_vault_run_silent(&cfg, cmd) != 0)
-        fail = 1;
-
-    snprintf(cmd, sizeof(cmd), "vault login \"%s\"", cfg.token);
-    if (ne_vault_run_silent(&cfg, cmd) != 0)
-        fail = 1;
-
-    if (fail) {
-        fprintf(stderr, "[VAULT] warn: unseal/login command failed\n");
+    if (ne_vault_http_request(&cfg, "GET", "/v1/sys/seal-status", NULL,
+                              response, sizeof(response)) < 0) {
+        fprintf(stderr, "[VAULT] seal-status request failed\n");
         return -1;
     }
+
+    if (ne_vault_json_bool_false(response, "sealed")) {
+        fprintf(stderr, "[VAULT] unseal ok (already unsealed)\n");
+        return 0;
+    }
+
+    if (cfg.k1[0] && ne_vault_http_unseal_key(&cfg, cfg.k1) < 0)
+        fail = 1;
+    if (cfg.k2[0] && ne_vault_http_unseal_key(&cfg, cfg.k2) < 0)
+        fail = 1;
+    if (cfg.k3[0] && ne_vault_http_unseal_key(&cfg, cfg.k3) < 0)
+        fail = 1;
+
+    if (ne_vault_http_request(&cfg, "GET", "/v1/sys/seal-status", NULL,
+                              response, sizeof(response)) < 0) {
+        fprintf(stderr, "[VAULT] seal-status verify failed\n");
+        return -1;
+    }
+
+    if (!ne_vault_json_bool_false(response, "sealed")) {
+        fprintf(stderr, "[VAULT] warn: vault still sealed after unseal keys\n");
+        fail = 1;
+    }
+
+    if (fail)
+        return -1;
 
     fprintf(stderr, "[VAULT] unseal ok\n");
     return 0;
@@ -420,8 +584,13 @@ int ne_vault_load_secrets(void)
         fprintf(stderr, "[VAULT] missing VAULT_ADDR in " NE_ENV_FILE "\n");
         return -1;
     }
+    if (!cfg.token[0]) {
+        fprintf(stderr, "[VAULT] missing VAULT_TOKEN in " NE_ENV_FILE "\n");
+        return -1;
+    }
 
-    fprintf(stderr, "[VAULT] vault kv get " NE_VAULT_SECRET_PATH "\n");
+    fprintf(stderr, "[VAULT] HTTP kv get " NE_VAULT_SECRET_PATH
+            " (timeout=%ds)\n", NE_VAULT_HTTP_TIMEOUT_SEC);
 
     if (ne_vault_kv_get_and_apply(&cfg) != 0)
         return -1;
