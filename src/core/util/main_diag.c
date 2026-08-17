@@ -1,4 +1,3 @@
-#include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -10,7 +9,6 @@
 
 #define DIAG_TBL_N     12
 #define DIAG_KEY_PREFIX_LEN 9
-#define DIAG_CIDR_LEN  24
 
 static void tbl_hline(const int *w, int n) {
     fputc('+', stderr);
@@ -48,57 +46,6 @@ static const char *policy_proto_str(uint8_t proto) {
     if (proto == 17) return "udp";
     if (proto == 89) return "ospf";
     return "?";
-}
-
-static int ipv4_netmask_to_prefix(uint32_t mask_be) {
-    uint32_t m = ntohl(mask_be);
-    int p = 0;
-    while (m & 0x80000000U) {
-        p++;
-        m <<= 1;
-    }
-    return p;
-}
-
-static void ipv4_format_cidr(char *out, size_t outsz, uint32_t net_be, uint32_t mask_be) {
-    char ip[INET_ADDRSTRLEN];
-    struct in_addr a = { .s_addr = net_be };
-    int prefix = ipv4_netmask_to_prefix(mask_be);
-
-    if (prefix < 0)
-        prefix = 0;
-    else if (prefix > 32)
-        prefix = 32;
-
-    if (!inet_ntop(AF_INET, &a, ip, sizeof(ip))) {
-        snprintf(out, outsz, "?");
-        return;
-    }
-    snprintf(out, outsz, "%.*s/%d",
-             outsz > 5 ? (int)outsz - 5 : 0, ip, prefix);
-}
-
-static void policy_port_str(char *out, size_t outsz, int from, int to) {
-    if (from < 0 || to < 0)
-        snprintf(out, outsz, "*");
-    else if (from == to)
-        snprintf(out, outsz, "%d", from);
-    else
-        snprintf(out, outsz, "%d-%d", from, to);
-}
-
-static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
-                              uint32_t net_be, uint32_t mask_be) {
-    if (any) {
-        snprintf(out, outsz, "*");
-        return;
-    }
-    char cidr[DIAG_CIDR_LEN];
-    ipv4_format_cidr(cidr, sizeof(cidr), net_be, mask_be);
-    if (negate)
-        snprintf(out, outsz, "!%.*s", (int)(outsz > 2 ? outsz - 2 : 0), cidr);
-    else
-        snprintf(out, outsz, "%.*s", (int)(outsz > 1 ? outsz - 1 : 0), cidr);
 }
 
 static int key_prefix_nonzero(const uint8_t *key, size_t len)
@@ -152,56 +99,6 @@ static void policy_crypto_label(const struct crypto_policy *cp, char *out, size_
 static void print_system_table(const struct app_config *cfg, const char *event)
 {
     mac_learn_log_runtime_table(NULL, cfg, event);
-}
-
-static void print_policy_table(const struct app_config *cfg) {
-    static const int w[DIAG_TBL_N] = {
-        6, 8, 7, 6, 10, 8, 18, 18, 7, 7, 0, 0
-    };
-    static const char *hdr[DIAG_TBL_N] = {
-        "db_id", "priority", "pkt_tag", "layer", "crypto", "proto",
-        "src", "dst", "sport", "dport", "", ""
-    };
-    const int ncol = 10;
-
-    fprintf(stderr, "\n  [policies] count=%d\n", cfg->policy_count);
-    fprintf(stderr,
-            "  priority = match order (lower first); pkt_tag = ID in encrypted packet (not DB id)\n");
-    tbl_hline(w, ncol);
-    tbl_row(w, ncol, hdr);
-    tbl_hline(w, ncol);
-
-    for (int pr = 0; pr < cfg->profile_count; pr++) {
-        const struct profile_config *p = &cfg->profiles[pr];
-        for (int j = 0; j < p->policy_count; j++) {
-            int pix = p->policy_indices[j];
-            if (pix < 0 || pix >= cfg->policy_count)
-                continue;
-            const struct crypto_policy *cp = &cfg->policies[pix];
-            char c0[8], c1[8], c2[8], c3[12], c4[8], c5[12];
-            char c8[12], c9[12];
-            char src_c[DIAG_CIDR_LEN], dst_c[DIAG_CIDR_LEN];
-
-            snprintf(c0, sizeof(c0), "%d", cp->db_id);
-            snprintf(c1, sizeof(c1), "%d", cp->priority);
-            snprintf(c2, sizeof(c2), "%d", cp->id);
-            snprintf(c3, sizeof(c3), "%s", policy_action_name(cp->action));
-            policy_crypto_label(cp, c4, sizeof(c4));
-            snprintf(c5, sizeof(c5), "%s", policy_proto_str(cp->protocol));
-            policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate,
-                              cp->src_net, cp->src_mask);
-            policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate,
-                              cp->dst_net, cp->dst_mask);
-            policy_port_str(c8, sizeof(c8), cp->src_port_from, cp->src_port_to);
-            policy_port_str(c9, sizeof(c9), cp->dst_port_from, cp->dst_port_to);
-
-            const char *row[DIAG_TBL_N] = {
-                c0, c1, c2, c3, c4, c5, src_c, dst_c, c8, c9, "", ""
-            };
-            tbl_row(w, ncol, row);
-        }
-    }
-    tbl_hline(w, ncol);
 }
 
 static void print_ne_keys_table(const struct app_config *cfg) {
@@ -306,7 +203,6 @@ void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cf
     fprintf(stderr, "  unchanged: LAN=%d WAN=%d policies=%d\n",
             cfg->local_count, cfg->wan_count, cfg->policy_count);
     print_system_table(cfg, "db-no-update");
-    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -327,7 +223,6 @@ void main_diag_log_db_apply(const struct app_config *cfg, int trigger_profile_id
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
     print_system_table(cfg, "db-load");
-    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -346,7 +241,6 @@ void main_diag_log_db_policy_apply(const struct app_config *cfg, int trigger_pro
     }
     fprintf(stderr, "| profiles: %-3d | policies: %-3d |\n",
             cfg->profile_count, cfg->policy_count);
-    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
@@ -367,7 +261,6 @@ void main_diag_log_config_summary(struct app_config *cfg, int trigger_profile_id
             cfg->profile_count, cfg->policy_count);
     if (!policy_only)
         print_system_table(cfg, is_reload ? "reload" : "config");
-    print_policy_table(cfg);
     fprintf(stderr, "\n");
     fflush(stderr);
 }
