@@ -1,6 +1,7 @@
 #include "../../../inc/core/interface.h"
 #include "../../../inc/core/profile_iface_xdp.h"
 #include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/dataplane.h"
 #include <bpf/libbpf.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
@@ -507,7 +508,7 @@ static void zero_queue_rings(struct ne_xsk_queue *slot, int preserve_fq_cq)
     }
 }
 
-static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool);
+static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool, int credit_wan_tx);
 
 static void reclaim_rx_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
 {
@@ -548,13 +549,6 @@ static void reclaim_rx_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     }
 }
 
-/*
- * Do NOT pull outstanding FQ descriptors back into the userspace pool before
- * xsk_socket__delete(). Rewinding fq.producer while the kernel still owns those
- * entries desyncs a shared UMEM. Next bind() with XDP_SHARED_UMEM then fails
- * with EINVAL (-22) on the same ifindex — while a process restart (new UMEM)
- * works. Let delete/close return fill ownership to the kernel/UMEM.
- */
 static void reclaim_iface_umem_frames(struct ne_pair *p, struct ne_iface *iface)
 {
     if (!p || !iface)
@@ -562,7 +556,7 @@ static void reclaim_iface_umem_frames(struct ne_pair *p, struct ne_iface *iface)
     for (int q = 0; q < iface->queue_count; q++) {
         struct ne_xsk_queue *slot = &iface->queues[q];
 
-        drain_cq_queue(slot, &p->pool);
+        drain_cq_queue(slot, &p->pool, 0);
         reclaim_rx_queue(slot, &p->pool);
     }
 }
@@ -1000,15 +994,7 @@ void ne_pair_close(struct ne_pair *p, const struct app_config *cfg)
     if (!p)
         return;
 
-    /*
-     * Canonical dataplane teardown (single place — stop/restart/reload all use this).
-     * Order matters on Intel ice (drv-mode XDP + AF_XDP):
-     *   1) delete XSK while prog still attached
-     *   2) bpf_object__close (unload prog from BPF)
-     *   3) ip link set xdp off (clear xdp/id on netdev — ice needs this)
-     *   4) delete UMEM / unmap
-     * Never call bpf_xdp_detach here after step 2 — ice can hang (D-state).
-     */
+
     fprintf(stderr, "[STOP] ne_pair_close: (1/4) delete XSK\n");
     fflush(stderr);
     delete_all_live_xsks(p);
@@ -1265,6 +1251,7 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
         out[i].dir = dir;
         out[i].wan_idx = wan_idx;
         out[i].local_idx = local_idx;
+        out[i].policy_slot = NE_POLICY_SLOT_NONE;
     }
     slot->rx_pending = n;
     return (int)n;
@@ -1398,7 +1385,7 @@ void ne_recv_release_wan(struct ne_pair *p)
 
 
 // CQ
-static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
+static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool, int credit_wan_tx)
 {
     uint64_t addrs[NE_BATCH_SIZE];
     uint32_t idx = 0;
@@ -1407,6 +1394,10 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
     while ((n = xsk_ring_cons__peek(&slot->cq, NE_BATCH_SIZE, &idx)) > 0) {
         for (uint32_t i = 0; i < n; i++)
             addrs[i] = *xsk_ring_cons__comp_addr(&slot->cq, idx + i);
+        if (credit_wan_tx) {
+            for (uint32_t i = 0; i < n; i++)
+                ne_local_egress_on_wan_cq(addrs[i]);
+        }
         uint32_t pushed = pool_push(pool, addrs, n);
         if (pushed > 0)
             xsk_ring_cons__release(&slot->cq, pushed);
@@ -1424,14 +1415,15 @@ static int xsk_queue_for_tx_slot(int q, int tx_slot, int nq)
     return (q % slots) == tx_slot;
 }
 
-static void drain_cq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int tx_slot)
+static void drain_cq_iface_slot(struct ne_iface *iface, struct ne_pool *pool, int tx_slot,
+                                int credit_wan_tx)
 {
     int nq = iface->queue_count;
 
     for (int q = 0; q < nq; q++) {
         if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
-        drain_cq_queue(&iface->queues[q], pool);
+        drain_cq_queue(&iface->queues[q], pool, credit_wan_tx);
     }
 }
 
@@ -1442,7 +1434,7 @@ void ne_drain_cq_local(struct ne_pair *p, int tx_slot)
     for (int i = 0; i < p->local_count; i++) {
         if (!p->local_live[i])
             continue;
-        drain_cq_iface_slot(&p->locals[i], &p->pool, tx_slot);
+        drain_cq_iface_slot(&p->locals[i], &p->pool, tx_slot, 0);
     }
 }
 
@@ -1453,7 +1445,7 @@ void ne_drain_cq_wan(struct ne_pair *p, int tx_slot)
     for (int i = 0; i < p->wan_count; i++) {
         if (!p->wan_live[i])
             continue;
-        drain_cq_iface_slot(&p->wans[i], &p->pool, tx_slot);
+        drain_cq_iface_slot(&p->wans[i], &p->pool, tx_slot, 1);
     }
 }
 
@@ -1626,7 +1618,7 @@ int ne_rx_wan_fds(struct ne_pair *p, int rx_slot, int *fds, int max)
 
 // TX
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
-                          uint64_t *tx_no_free)
+                          uint64_t *tx_no_free, int is_wan, int wan_idx)
 {   
     struct ne_packet jobs[NE_BATCH_SIZE];
     uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
@@ -1634,6 +1626,7 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     uint32_t idx = 0;
     uint32_t reserved;
     uint32_t popped = 0;
+    int kick_ok = 1;
 
     if (!free_slots) {
         if (tx_no_free)
@@ -1644,6 +1637,8 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
             else
                 ne_dp_stats_tx_full_wan(tls_dp_tx_slot, 1);
         }
+        if (is_wan)
+            ne_local_egress_on_xdp_tx_full(wan_idx);
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
@@ -1653,8 +1648,11 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 
     want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
     reserved = xsk_ring_prod__reserve(&slot->tx, want, &idx);
-    if (!reserved)
+    if (!reserved) {
+        if (is_wan)
+            ne_local_egress_on_xdp_tx_full(wan_idx);
         return 0;
+    }
 
     while (popped < reserved && ne_ring_try_pop(src, &jobs[popped]) == 0)
         popped++;
@@ -1668,13 +1666,31 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 
     for (uint32_t i = 0; i < popped; i++) {
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&slot->tx, idx + i);
+        uint32_t flen = jobs[i].len > max_frame ? max_frame : jobs[i].len;
+
         d->addr = jobs[i].addr;
-        d->len = jobs[i].len > max_frame ? max_frame : jobs[i].len;
+        d->len = flen;
+        jobs[i].len = flen;
     }
 
     xsk_ring_prod__submit(&slot->tx, popped);
     if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
-        (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+        if (sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0) < 0 &&
+            errno != EAGAIN && errno != EINTR) {
+            int err = errno;
+
+            kick_ok = 0;
+            if (is_wan)
+                ne_local_egress_on_xdp_kick_fail(wan_idx, err);
+        }
+    }
+    if (is_wan && kick_ok) {
+        for (uint32_t i = 0; i < popped; i++) {
+            if (jobs[i].dir != NE_DIR_WAN || jobs[i].policy_slot == NE_POLICY_SLOT_NONE)
+                continue;
+            ne_local_egress_note_wan_submit(jobs[i].addr, (int)jobs[i].policy_slot,
+                                            (int)jobs[i].wan_idx, jobs[i].len);
+        }
     }
     if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
         uint64_t tx_bytes = 0;
@@ -1689,16 +1705,12 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
 }
 
 static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint32_t max_frame,
-                               int tx_slot)
+                               int tx_slot, int is_wan, int wan_idx)
 {
     int nq = iface->queue_count;
     int primary = -1;
 
-    /*
-     * Sticky primary queue per TX slot. Falling through to q+slots when the
-     * first queue is full reorders a single crypto-worker flow on the wire.
-     * Prefer backpressure (return 0) over multi-queue spray.
-     */
+
     for (int q = 0; q < nq; q++) {
         if (!xsk_queue_for_tx_slot(q, tx_slot, nq))
             continue;
@@ -1707,13 +1719,15 @@ static int tx_drain_iface_ring(struct ne_iface *iface, struct ne_ring *src, uint
     }
     if (primary < 0)
         return 0;
-    return tx_drain_queue(&iface->queues[primary], src, max_frame, &iface->tx_no_free);
+    return tx_drain_queue(&iface->queues[primary], src, max_frame, &iface->tx_no_free, is_wan,
+                          wan_idx);
 }
 
 static __thread uint32_t tls_tx_drain_rr;
 
 static int tx_drain_iface_all_rings(struct ne_iface *iface, struct ne_ring *srcs[],
-                                    int src_count, uint32_t max_frame, int tx_slot)
+                                    int src_count, uint32_t max_frame, int tx_slot, int is_wan,
+                                    int wan_idx)
 {
     int sent = 0;
     int start;
@@ -1727,7 +1741,7 @@ static int tx_drain_iface_all_rings(struct ne_iface *iface, struct ne_ring *srcs
 
         if (!srcs[s])
             continue;
-        sent += tx_drain_iface_ring(iface, srcs[s], max_frame, tx_slot);
+        sent += tx_drain_iface_ring(iface, srcs[s], max_frame, tx_slot, is_wan, wan_idx);
     }
     if (sent > 0)
         tls_tx_drain_rr++;
@@ -1744,7 +1758,7 @@ int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_cou
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
     return tx_drain_iface_all_rings(&p->locals[local_idx], srcs, src_count, p->frame_size,
-                                    tx_slot);
+                                    tx_slot, 0, -1);
 }
 
 int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
@@ -1756,7 +1770,8 @@ int ne_tx_drain_wan_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count
         return 0;
     if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
         return 0;
-    return tx_drain_iface_all_rings(&p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot);
+    return tx_drain_iface_all_rings(&p->wans[wan_idx], srcs, src_count, p->frame_size, tx_slot,
+                                    1, wan_idx);
 }
 
 static int collect_iface_tx_fds(struct ne_iface *iface, int tx_slot, int *fds, int max, int n)

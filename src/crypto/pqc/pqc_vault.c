@@ -319,14 +319,14 @@ int sig_pqc_vault_read_key(const char *path_type, const char *fingerprint_filena
 
     char url_path[512];
     // Support KV v2 endpoint structure: /v1/kv/data/PQC_Key/<path_type>/<filename>
-    snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC_Key/%s/%s", path_type, clean_filename);
+    snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC-Key/%s/%s", path_type, clean_filename);
 
     char response[16384];
     int rc = http_request("GET", url_path, NULL, response, sizeof(response));
 
     // Fallback to KV v1 endpoint if KV v2 returned 404
     if (rc <= 0 || strncmp(response, "HTTP/1.1 404", 12) == 0) {
-        snprintf(url_path, sizeof(url_path), "/v1/kv/PQC_Key/%s/%s", path_type, clean_filename);
+        snprintf(url_path, sizeof(url_path), "/v1/kv/PQC-Key/%s/%s", path_type, clean_filename);
         rc = http_request("GET", url_path, NULL, response, sizeof(response));
     }
 
@@ -358,7 +358,7 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
     clean_filename[sizeof(clean_filename) - 1] = '\0';
 
     char url_path[512];
-    snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC_Key/%s/%s", path_type, clean_filename);
+    snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC-Key/%s/%s", path_type, clean_filename);
 
     char body[16384];
     snprintf(body, sizeof(body), "{\"data\":{\"key\":\"%s\",\"fingerprint\":\"%s\"}}", key_content, clean_filename);
@@ -368,7 +368,7 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
 
     if (rc <= 0 || (strncmp(response, "HTTP/1.1 200", 12) != 0 && strncmp(response, "HTTP/1.1 204", 12) != 0)) {
         // Fallback try KV v1 format
-        snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC_Key/%s/%s", path_type, clean_filename);
+        snprintf(url_path, sizeof(url_path), "/v1/kv/data/PQC-Key/%s/%s", path_type, clean_filename);
         snprintf(body, sizeof(body), "{\"key\":\"%s\",\"fingerprint\":\"%s\"}", key_content, clean_filename);
         rc = http_request("POST", url_path, body, response, sizeof(response));
     }
@@ -393,7 +393,7 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
     const char *body_start = strstr(response, "\r\n\r\n");
     if (body_start) body_start += 4;
     else body_start = response;
-    fprintf(stderr, "[PQC-VAULT] ERROR: Failed to write key to Vault: [kv/PQC_Key/%s/%s]", path_type, clean_filename);
+    fprintf(stderr, "[PQC-VAULT] ERROR: Failed to write key to Vault: [kv/PQC-Key/%s/%s]", path_type, clean_filename);
     fprintf(stderr, "[PQC-VAULT] ERROR DETAIL -> Status: %s | Response Body: %s\n", 
              status_line[0] ? status_line : "N/A", body_start[0] ? body_start : "Empty");
     

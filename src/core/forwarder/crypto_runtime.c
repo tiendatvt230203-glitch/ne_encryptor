@@ -3,6 +3,7 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
+#include "../../../inc/core/dataplane.h"
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
@@ -384,6 +385,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     }
 
     arp_bridge_reload_policies(cfg);
+    ne_local_egress_reset_diag();
     for (int i = 0; i < active_policy_count; i++) {
         const struct crypto_policy *cp = &active_policies[i];
 

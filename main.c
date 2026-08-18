@@ -893,7 +893,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
         return 1;
     }
-    sig_pqc_load_keys_from_disk();
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);

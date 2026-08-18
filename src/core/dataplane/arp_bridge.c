@@ -410,6 +410,7 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
             .len = job->len,
             .dir = NE_DIR_LOCAL,
             .local_idx = (uint8_t)li,
+            .policy_slot = NE_POLICY_SLOT_NONE,
         };
 
         if (ne_frame_alloc(&fwd->pair, &clone.addr) != 0)
@@ -843,6 +844,7 @@ int arp_bridge_from_local(struct forwarder *fwd, struct ne_packet *job,
     ring = arp_mid_to_wan_ring(fwd, wan_dp);
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
+    job->policy_slot = NE_POLICY_SLOT_NONE;
     if (dp_ring_push(fwd, ring, job) != 0) {
         static uint64_t last_ring_fail_ms;
 
