@@ -48,10 +48,8 @@ static uint64_t arp_monotonic_ms(void)
     return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
 }
 
-static void arp_crypto_ctx_init(const struct app_config *cfg)
+static void arp_crypto_ctx_init(void)
 {
-    (void)cfg;
-
     if (!g_arp_key_loaded) {
         if (parse_hex_bytes_pub(g_arp_hardcoded_master_key_hex,
                                 g_arp_default_master_key, AES_MAX_KEY_SIZE) != 0) {
@@ -190,11 +188,9 @@ static int arp_parse_tha(const uint8_t *pkt, uint32_t len, uint8_t tha_out[MAC_L
     return 0;
 }
 
-void arp_bridge_reload_policies(struct app_config *cfg)
+void arp_bridge_crypto_init(void)
 {
-    if (!cfg)
-        return;
-    arp_crypto_ctx_init(cfg);
+    arp_crypto_ctx_init();
     fprintf(stderr,
             "[ARP] mode=mac-fdb+flood-whohas-only | arp_encrypt=%d (policy-independent) | key=arp-default | opt=L2-PQC/ARP\n",
             ARP_ENCRYPT_ENABLE);
@@ -591,7 +587,7 @@ static int arp_try_encrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job,
             *skip_why = "arp-encrypt-disabled";
         return 0;
     }
-    arp_crypto_ctx_init(fwd->cfg);
+    arp_crypto_ctx_init();
     if (!g_arp_crypto_ctx_ready) {
         if (skip_why)
             *skip_why = "arp-crypto-not-ready";
@@ -637,7 +633,7 @@ static int arp_try_decrypt_l2_pqc(struct forwarder *fwd, struct ne_packet *job, 
     if (!crypto_eth_l2_has_arp_marker(pkt, job->len))
         return -1; /* not ARP wire */
 
-    arp_crypto_ctx_init(fwd->cfg);
+    arp_crypto_ctx_init();
     if (!g_arp_crypto_ctx_ready) {
         fail_why = "arp-crypto-not-ready";
         goto decrypt_fail;

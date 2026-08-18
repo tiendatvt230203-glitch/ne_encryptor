@@ -44,6 +44,38 @@ static int wan_log_rl(uint64_t *last_ms)
     return 1;
 }
 
+static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id);
+
+static uint8_t wan_first_l2_decrypt_logged[256];
+static uint8_t wan_first_l3_decrypt_logged[256];
+static uint8_t wan_first_l4_decrypt_logged[256];
+
+static void wan_log_first_decrypt_ok(struct forwarder *fwd, int layer, uint8_t wire_id)
+{
+    uint8_t *mark = NULL;
+    const struct crypto_policy *cp = NULL;
+
+    if (layer == 2)
+        mark = &wan_first_l2_decrypt_logged[wire_id];
+    else if (layer == 3)
+        mark = &wan_first_l3_decrypt_logged[wire_id];
+    else if (layer == 4)
+        mark = &wan_first_l4_decrypt_logged[wire_id];
+    if (!mark || *mark)
+        return;
+    *mark = 1;
+
+    if (layer == 2)
+        cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
+    else if (layer == 3)
+        cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L3, wire_id);
+    else if (layer == 4)
+        cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L4, wire_id);
+    fprintf(stderr,
+            "[WAN-INGRESS] first-decrypt-ok layer=L%d wire_id=%u policy_db_id=%d mode=%d\n",
+            layer, (unsigned)wire_id, cp ? cp->db_id : -1, cp ? cp->crypto_mode : -1);
+}
+
 static int wan_l2_is_udp_frag(const uint8_t *pkt, uint32_t len)
 {
     int mark_off;
@@ -139,8 +171,10 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     memcpy(scratch, pkt, orig_len);
 
     if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
-        crypto_pkt_is_ipv4(pkt, *len))
+        crypto_pkt_is_ipv4(pkt, *len)) {
+        wan_log_first_decrypt_ok(fwd, 2, wire_id);
         return 0;
+    }
 
     memcpy(pkt, scratch, orig_len);
     *len = orig_len;
@@ -393,6 +427,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail layer=L3 wire_id=%u\n", (unsigned)pol);
             return -1;
         }
+        wan_log_first_decrypt_ok(fwd, 3, pol);
     }
     if (pending)
         return 1;
@@ -422,6 +457,7 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail layer=L4 wire_id=%u\n", (unsigned)pol);
             return -1;
         }
+        wan_log_first_decrypt_ok(fwd, 4, pol);
     }
     if (pending)
         return 1;

@@ -50,6 +50,8 @@ static int local_key_nonzero(const uint8_t *key, size_t len)
     return 0;
 }
 
+static uint8_t local_first_encrypt_logged[MAX_CRYPTO_POLICIES];
+
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
     int wi = dp_crypto_current_worker_idx();
@@ -298,8 +300,21 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                         crypto_proto_classify(proto), flow_ok);
     if (enc < 0)
         goto drop;
-    if (enc > 0)
+    if (enc > 0) {
+        if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && !local_first_encrypt_logged[pi]) {
+            local_first_encrypt_logged[pi] = 1;
+            fprintf(stderr,
+                    "[LOCAL-EGRESS] first-encrypt-ok profile=%d policy_db_id=%d wire_id=%d mode=%d split=1\n",
+                    fwd->cfg->profiles[profile_idx].id, cp->db_id, cp->id, cp->crypto_mode);
+        }
         return;
+    }
+    if (pi >= 0 && pi < MAX_CRYPTO_POLICIES && !local_first_encrypt_logged[pi]) {
+        local_first_encrypt_logged[pi] = 1;
+        fprintf(stderr,
+                "[LOCAL-EGRESS] first-encrypt-ok profile=%d policy_db_id=%d wire_id=%d mode=%d split=0\n",
+                fwd->cfg->profiles[profile_idx].id, cp->db_id, cp->id, cp->crypto_mode);
+    }
     (void)push_to_wan(fwd, &job, wan_dp);
     return;
 

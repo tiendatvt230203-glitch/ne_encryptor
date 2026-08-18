@@ -40,6 +40,7 @@ static uint64_t prev_grace_until_ms;
 static struct flow_table profile_flow_tables[MAX_PROFILES];
 static int profile_flow_table_ready[MAX_PROFILES];
 static int profile_flow_profile_id[MAX_PROFILES];
+static uint8_t pqc_key_nonzero_seen[MAX_CRYPTO_POLICIES];
 
 int fwd_crypto_profile_slot_for_id(int profile_id)
 {
@@ -218,6 +219,14 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         if (policy_crypto_ctx[i].profile_id != profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+        if (!pqc_key_nonzero_seen[i] &&
+            key_nonzero(packet_crypto_get_key(&policy_crypto_ctx[i], KEY_SLOT_CURRENT), AES_KEY_LEN)) {
+            pqc_key_nonzero_seen[i] = 1;
+            fprintf(stderr,
+                    "[CRYPTO-TRANSITION] profile=%d policy_db_id=%d wire_id=%u current-key zero->ok\n",
+                    profile_id, policy_crypto_ctx[i].policy_id,
+                    (unsigned)policy_crypto_ctx[i].wire_id);
+        }
         main_diag_log_ne_policy_key(i, policy_crypto_ctx[i].policy_id);
     }
 }
@@ -276,6 +285,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     memcpy(old_active_policies, active_policies, sizeof(old_active_policies));
 
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
+    memset(pqc_key_nonzero_seen, 0, sizeof(pqc_key_nonzero_seen));
     memset(active_policies, 0, sizeof(active_policies));
     active_policy_count = 0;
     crypto_runtime_reset_indexes();
