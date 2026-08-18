@@ -6,6 +6,7 @@
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
+#include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/crypto/traffic_crypto.h"
 #include "../../../inc/crypto/pqc_handshake.h"
 
@@ -176,6 +177,31 @@ static int crypto_action_valid(int action)
            action == POLICY_ACTION_ENCRYPT_L4;
 }
 
+static void crypto_runtime_log_policy_readiness(const struct app_config *cfg, int idx)
+{
+    const struct crypto_policy *cp;
+    const uint8_t *cur;
+    int has_key;
+
+    if (!cfg || idx < 0 || idx >= active_policy_count)
+        return;
+    cp = &active_policies[idx];
+    if (!crypto_action_valid(cp->action) || cp->action == POLICY_ACTION_BYPASS)
+        return;
+    if (!policy_crypto_ready[idx]) {
+        fprintf(stderr,
+                "[CRYPTO-READY] policy_db_id=%d wire_id=%d mode=%d ready=0 reason=ctx-not-ready\n",
+                cp->db_id, cp->id, cp->crypto_mode);
+        return;
+    }
+    cur = packet_crypto_get_key(&policy_crypto_ctx[idx], KEY_SLOT_CURRENT);
+    has_key = key_nonzero(cur, AES_KEY_LEN);
+    fprintf(stderr,
+            "[CRYPTO-READY] policy_db_id=%d wire_id=%d mode=%d ready=%d current_key=%s\n",
+            cp->db_id, cp->id, cp->crypto_mode, policy_crypto_ready[idx],
+            has_key ? "ok" : "zero");
+}
+
 static void crypto_runtime_reset_indexes(void)
 {
     for (int id = 0; id < 256; id++)
@@ -256,6 +282,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
 
     if (!cfg || !cfg->crypto_enabled) {
+        if (cfg && cfg->profile_count > 0 && cfg->policy_count <= 0) {
+            fprintf(stderr,
+                    "[CRYPTO-GUARD] active profile has policies=0; data crypto path stays disabled\n");
+        }
         arp_bridge_reload_policies(cfg);
         return 0;
     }
@@ -347,6 +377,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     for (int i = 0; i < active_policy_count; i++) {
         const struct crypto_policy *cp = &active_policies[i];
 
+        crypto_runtime_log_policy_readiness(cfg, i);
         if (!policy_crypto_ready[i])
             continue;
         if (cp->action == POLICY_ACTION_BYPASS)

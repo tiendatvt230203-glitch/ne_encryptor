@@ -668,6 +668,12 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
     }
     PQclear(res);
+    if (p->enabled && p->policy_count <= 0) {
+        fprintf(stderr,
+                "[DB][CRYPTO-GUARD] profile %d (%s) active with policies=0; "
+                "IPv4 data path will fail-close until policy is added\n",
+                p->id, p->name);
+    }
     sig_pqc_finalize_reload();
     return 0;
 }
@@ -819,8 +825,17 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
     cfg->aes_bits = 128;
     memset(cfg->crypto_key, 0, sizeof(cfg->crypto_key));
 
-    if (cfg->policy_count <= 0)
+    if (cfg->policy_count <= 0) {
+        for (int i = 0; i < cfg->profile_count; i++) {
+            if (!cfg->profiles[i].enabled)
+                continue;
+            fprintf(stderr,
+                    "[CRYPTO-GUARD] profile %d (%s) has no policy; crypto_enabled=0 "
+                    "(data traffic requires policy match)\n",
+                    cfg->profiles[i].id, cfg->profiles[i].name);
+        }
         return 0;
+    }
 
     int has_l2 = 0, has_l3 = 0, has_l4 = 0;
     int first_key_pi = -1;

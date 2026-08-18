@@ -5,6 +5,7 @@
 
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
+#include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
@@ -13,8 +14,41 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
+#include <time.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
+#define LOCAL_DROP_LOG_INTERVAL_MS 3000ull
+
+static uint64_t local_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+static int local_log_rl(uint64_t *last_ms)
+{
+    uint64_t now = local_now_ms();
+
+    if (!last_ms)
+        return 0;
+    if (*last_ms != 0 && now - *last_ms < LOCAL_DROP_LOG_INTERVAL_MS)
+        return 0;
+    *last_ms = now;
+    return 1;
+}
+
+static int local_key_nonzero(const uint8_t *key, size_t len)
+{
+    if (!key)
+        return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (key[i] != 0)
+            return 1;
+    }
+    return 0;
+}
 
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
@@ -181,21 +215,49 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
 
     if (pick_profile_policy(fwd, li, flow_ok, src_ip, dst_ip, src_port, dst_port, proto,
-                            &profile_idx, &cp) != 0)
+                            &profile_idx, &cp) != 0) {
+        static uint64_t last_no_policy_ms;
+
+        if (local_log_rl(&last_no_policy_ms)) {
+            fprintf(stderr,
+                    "[LOCAL-EGRESS] drop no-policy/no-match lan=%s flow_ok=%d proto=%u sip=%u dip=%u sp=%u dp=%u\n",
+                    (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+                    flow_ok, (unsigned)proto, (unsigned)src_ip, (unsigned)dst_ip,
+                    (unsigned)src_port, (unsigned)dst_port);
+        }
         goto drop;
+    }
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
                                     src_port, dst_port, proto,
                                     dp_flow_window_bytes(pkt, job.len, job.len));
-    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
+    if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp)) {
+        static uint64_t last_wan_unavail_ms;
+
+        if (local_log_rl(&last_wan_unavail_ms)) {
+            fprintf(stderr,
+                    "[LOCAL-EGRESS] drop wan-unavailable profile=%d lan=%s wan_dp=%d\n",
+                    fwd->cfg->profiles[profile_idx].id,
+                    (li >= 0 && li < fwd->local_count) ? fwd->locals[li].ifname : "?",
+                    wan_dp);
+        }
         goto drop;
+    }
 
     if (cp->action == POLICY_ACTION_BYPASS) {
         ne_dp_stats_local_bypass(1);
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
-    if (!fwd->cfg->crypto_enabled)
+    if (!fwd->cfg->crypto_enabled) {
+        static uint64_t last_crypto_off_ms;
+
+        if (local_log_rl(&last_crypto_off_ms)) {
+            fprintf(stderr,
+                    "[LOCAL-EGRESS] drop crypto-disabled profile=%d policy_db_id=%d action=%d\n",
+                    fwd->cfg->profiles[profile_idx].id, cp->db_id, cp->action);
+        }
         goto drop;
+    }
 
     if (proto == IPPROTO_TCP) {
         crypto_option_id opt = crypto_option_from_policy(cp);
@@ -204,11 +266,31 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     }
 
     pi = (int)(cp - fwd->cfg->policies);
-    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi))
+    if (pi < 0 || pi >= MAX_CRYPTO_POLICIES || !fwd_crypto_policy_ready(pi)) {
+        static uint64_t last_ctx_not_ready_ms;
+
+        if (local_log_rl(&last_ctx_not_ready_ms)) {
+            fprintf(stderr,
+                    "[LOCAL-EGRESS] drop policy-ctx-missing profile=%d policy_db_id=%d wire_id=%d\n",
+                    fwd->cfg->profiles[profile_idx].id, cp->db_id, cp->id);
+        }
         goto drop;
+    }
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
         goto drop;
+    if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+        const uint8_t *cur = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
+        if (!local_key_nonzero(cur, AES_KEY_LEN)) {
+            static uint64_t last_key_zero_ms;
+            if (local_log_rl(&last_key_zero_ms)) {
+                fprintf(stderr,
+                        "[LOCAL-EGRESS] drop current-key-zero profile=%d policy_db_id=%d wire_id=%d\n",
+                        fwd->cfg->profiles[profile_idx].id, cp->db_id, cp->id);
+            }
+            goto drop;
+        }
+    }
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->wire_id = (uint8_t)cp->id;
     pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;

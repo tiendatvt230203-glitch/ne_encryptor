@@ -157,6 +157,11 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
 
     fwd->cfg = cfg;
     fwd_wan_weight_blend_begin(old_cfg, cfg, fwd_crypto_profile_slot_for_id);
+    if (cfg->policy_count <= 0) {
+        fprintf(stderr,
+                "[RELOAD][CRYPTO-GUARD] profile reload with policies=0; "
+                "IPv4 data path remains fail-close until policy exists\n");
+    }
     if (cfg->crypto_enabled) {
         pqc_handshake_start_all_profiles(cfg);
     }

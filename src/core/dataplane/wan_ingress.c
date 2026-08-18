@@ -15,12 +15,34 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
+#include <time.h>
 
 /* L2 UDP fragment ONLY (need_split: pkt+35 > MTU 1500). Wire after nonce:
  *   [0x5B][pkt_id:2][frag_index:0|1][reserved:0][ciphertext...]
  * TCP / UDP that fits MTU never write this — that offset is ciphertext. */
 #define WAN_L2_FRAG_MAGIC    0x5Bu
 #define WAN_L2_FRAG_TAG_LEN  4u
+#define WAN_DROP_LOG_INTERVAL_MS 3000ull
+
+static uint64_t wan_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+}
+
+static int wan_log_rl(uint64_t *last_ms)
+{
+    uint64_t now = wan_now_ms();
+
+    if (!last_ms)
+        return 0;
+    if (*last_ms != 0 && now - *last_ms < WAN_DROP_LOG_INTERVAL_MS)
+        return 0;
+    *last_ms = now;
+    return 1;
+}
 
 static int wan_l2_is_udp_frag(const uint8_t *pkt, uint32_t len)
 {
@@ -102,8 +124,12 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_id) != 0)
         return 0;
     ctx = fwd_crypto_ctx_for_wire_id(wire_id);
-    if (!ctx)
+    if (!ctx) {
+        static uint64_t last_missing_ctx_ms;
+        if (wan_log_rl(&last_missing_ctx_ms))
+            fprintf(stderr, "[WAN-INGRESS] drop missing-ctx layer=L2 wire_id=%u\n", (unsigned)wire_id);
         return -1;
+    }
     cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
     opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_GCM128;
 
@@ -118,6 +144,11 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
 
     memcpy(pkt, scratch, orig_len);
     *len = orig_len;
+    {
+        static uint64_t last_l2_dec_fail_ms;
+        if (wan_log_rl(&last_l2_dec_fail_ms))
+            fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail layer=L2 wire_id=%u\n", (unsigned)wire_id);
+    }
     return -1;
 }
 
@@ -350,8 +381,18 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         const struct crypto_policy *cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L3, pol);
         struct packet_crypto_ctx *ctx = fwd_crypto_ctx_for_wire_id(pol);
         crypto_option_id opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L3_GCM128;
-        if (!ctx || crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
+        if (!ctx) {
+            static uint64_t last_l3_missing_ctx_ms;
+            if (wan_log_rl(&last_l3_missing_ctx_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop missing-ctx layer=L3 wire_id=%u\n", (unsigned)pol);
             return -1;
+        }
+        if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0) {
+            static uint64_t last_l3_dec_fail_ms;
+            if (wan_log_rl(&last_l3_dec_fail_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail layer=L3 wire_id=%u\n", (unsigned)pol);
+            return -1;
+        }
     }
     if (pending)
         return 1;
@@ -369,8 +410,18 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         const struct crypto_policy *cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L4, pol);
         struct packet_crypto_ctx *ctx = fwd_crypto_ctx_for_wire_id(pol);
         crypto_option_id opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L4_GCM128;
-        if (!ctx || crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0)
+        if (!ctx) {
+            static uint64_t last_l4_missing_ctx_ms;
+            if (wan_log_rl(&last_l4_missing_ctx_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop missing-ctx layer=L4 wire_id=%u\n", (unsigned)pol);
             return -1;
+        }
+        if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, &len) != 0) {
+            static uint64_t last_l4_dec_fail_ms;
+            if (wan_log_rl(&last_l4_dec_fail_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail layer=L4 wire_id=%u\n", (unsigned)pol);
+            return -1;
+        }
     }
     if (pending)
         return 1;
@@ -607,8 +658,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
     encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
     if (encrypted) {
-        if (!fwd->cfg->crypto_enabled)
+        if (!fwd->cfg->crypto_enabled) {
+            static uint64_t last_crypto_off_ms;
+            if (wan_log_rl(&last_crypto_off_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop encrypted-wire while crypto-disabled\n");
             goto drop;
+        }
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
@@ -616,19 +671,31 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec == 2)
             return;
-        if (dec != 0)
+        if (dec != 0) {
+            static uint64_t last_decrypt_fail_ms;
+            if (wan_log_rl(&last_decrypt_fail_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail on encrypted wire\n");
             goto drop;
+        }
         pkt = ne_packet_data(&fwd->pair, job.addr);
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
 
-        if (!wan_l2_plain_ipv4(pkt, job.len))
+        if (!wan_l2_plain_ipv4(pkt, job.len)) {
+            static uint64_t last_plain_reject_ms;
+            if (wan_log_rl(&last_plain_reject_ms))
+                fprintf(stderr, "[WAN-INGRESS] drop plain-non-ipv4 frame\n");
             goto drop;
+        }
     }
 
     if (forward_wan_to_local(fwd, &job, wire_buf, wire_len,
-                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)
+                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0) {
+        static uint64_t last_no_route_ms;
+        if (wan_log_rl(&last_no_route_ms))
+            fprintf(stderr, "[WAN-INGRESS] drop no-local-route/fdb-miss/profile-miss\n");
         goto drop;
+    }
     ne_dp_stats_wan_fwd(1);
     return;
 
