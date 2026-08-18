@@ -386,6 +386,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
 
     arp_bridge_reload_policies(cfg);
     ne_local_egress_reset_diag();
+    ne_wan_ingress_reset_diag();
     for (int i = 0; i < active_policy_count; i++) {
         const struct crypto_policy *cp = &active_policies[i];
 

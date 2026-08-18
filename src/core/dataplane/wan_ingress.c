@@ -11,8 +11,11 @@
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/forwarder_wan.h"
+#include "../../../inc/core/wan_failover.h"
 
 #include <netinet/in.h>
+#include <stdio.h>
 #include <string.h>
 #include <net/if.h>
 #include <time.h>
@@ -44,11 +47,102 @@ static int wan_log_rl(uint64_t *last_ms)
     return 1;
 }
 
-static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id);
-
+static uint8_t wan_stage_rx;
+static uint8_t wan_stage_decrypt;
+static uint8_t wan_stage_fwd;
+static uint8_t wan_stage_lan_xdp;
+static uint8_t wan_ok;
+static uint8_t wan_stuck_crypto_off;
+static uint8_t wan_stuck_decrypt;
+static uint8_t wan_stuck_plain;
+static uint8_t wan_stuck_route;
+static uint64_t wan_pending_addr;
+static uint8_t wan_pending_valid;
+static int wan_pending_pi;
+static char wan_pending_lan[IFNAMSIZ];
+static int wan_pending_db_id;
+static int wan_pending_wire;
+static uint32_t wan_pending_len;
 static uint8_t wan_first_l2_decrypt_logged[256];
 static uint8_t wan_first_l3_decrypt_logged[256];
 static uint8_t wan_first_l4_decrypt_logged[256];
+
+void ne_wan_ingress_reset_diag(void)
+{
+    wan_stage_rx = 0;
+    wan_stage_decrypt = 0;
+    wan_stage_fwd = 0;
+    wan_stage_lan_xdp = 0;
+    wan_ok = 0;
+    wan_stuck_crypto_off = 0;
+    wan_stuck_decrypt = 0;
+    wan_stuck_plain = 0;
+    wan_stuck_route = 0;
+    wan_pending_valid = 0;
+    wan_pending_addr = 0;
+    wan_pending_pi = -1;
+    wan_pending_lan[0] = '\0';
+    wan_pending_db_id = -1;
+    wan_pending_wire = -1;
+    wan_pending_len = 0;
+    memset(wan_first_l2_decrypt_logged, 0, sizeof(wan_first_l2_decrypt_logged));
+    memset(wan_first_l3_decrypt_logged, 0, sizeof(wan_first_l3_decrypt_logged));
+    memset(wan_first_l4_decrypt_logged, 0, sizeof(wan_first_l4_decrypt_logged));
+}
+
+void ne_wan_ingress_note_lan_submit(uint64_t addr, int policy_slot, int lan_idx, uint32_t len)
+{
+    if (wan_ok || wan_pending_valid)
+        return;
+    (void)lan_idx;
+    wan_pending_valid = 1;
+    wan_pending_addr = addr;
+    wan_pending_pi = policy_slot;
+    wan_pending_len = len;
+    if (!wan_stage_lan_xdp) {
+        wan_stage_lan_xdp = 1;
+        fprintf(stderr,
+                "[WAN-INGRESS][STAGE] 4/lan-xdp-submit waiting=nic-cq policy_db_id=%d "
+                "wire_id=%d len=%u\n",
+                wan_pending_db_id, wan_pending_wire, (unsigned)len);
+        fflush(stderr);
+    }
+}
+
+void ne_wan_ingress_on_lan_cq(uint64_t addr)
+{
+    if (!wan_pending_valid || wan_ok)
+        return;
+    if (wan_pending_addr != addr)
+        return;
+    wan_pending_valid = 0;
+    wan_ok = 1;
+    fprintf(stderr,
+            "[WAN-INGRESS] TRAFFIC-IN-OK policy_db_id=%d wire_id=%d lan=%s len=%u "
+            "— decrypted and NIC TX-complete on LAN\n",
+            wan_pending_db_id, wan_pending_wire,
+            wan_pending_lan[0] ? wan_pending_lan : "?",
+            (unsigned)wan_pending_len);
+    fflush(stderr);
+}
+
+static void wan_stage_rx_log(struct forwarder *fwd, int wan_dp, const uint8_t *pkt, uint32_t len)
+{
+    uint16_t et;
+
+    if (wan_stage_rx)
+        return;
+    wan_stage_rx = 1;
+    et = (len >= 14u) ? (uint16_t)((pkt[12] << 8) | pkt[13]) : 0;
+    fprintf(stderr,
+            "[WAN-INGRESS][STAGE] 1/wan-rx wan=%s et=0x%04x len=%u "
+            "(encrypted NE wire must show et=0x104a/L2 or IPv4 proto=99/L3)\n",
+            (wan_dp >= 0 && wan_dp < fwd->wan_count) ? fwd->wans[wan_dp].ifname : "?",
+            (unsigned)et, (unsigned)len);
+    fflush(stderr);
+}
+
+static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id);
 
 static void wan_log_first_decrypt_ok(struct forwarder *fwd, int layer, uint8_t wire_id)
 {
@@ -622,6 +716,19 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
     return wan_profile_pi_bypass(fwd, pkt, len);
 }
 
+static int wan_dp_usable_for_fwd(struct forwarder *fwd, int wan_dp)
+{
+    if (!fwd || wan_dp < 0 || wan_dp >= fwd->wan_count)
+        return 0;
+    if (!ne_pair_wan_live(&fwd->pair, wan_dp))
+        return 0;
+    if (fwd_wan_is_stopped(wan_dp))
+        return 0;
+    if (wan_failover_dp_excluded(wan_dp))
+        return 0;
+    return 1;
+}
+
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
                                 const uint8_t *wire_pkt, uint32_t wire_len,
                                 int ingress_wan_dp)
@@ -629,6 +736,7 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     uint8_t *pkt;
     int profile_pi;
     int li;
+    int paired_li = -1;
 
     if (!fwd || !job || !wire_pkt || wire_len < 14u)
         return -1;
@@ -642,11 +750,32 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (profile_pi < 0)
         return -1;
 
+    if (ingress_wan_dp >= 0)
+        paired_li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
+
     li = mac_lookup(fwd, pkt);
-    if (li < 0 || !profile_owns_local(fwd, profile_pi, li)) {
-        if (ingress_wan_dp >= 0)
-            li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
+    if (li >= 0 && profile_owns_local(fwd, profile_pi, li) &&
+        paired_li >= 0 && li != paired_li) {
+        int lan_wan = mac_fwd_wan_dp_for_local(fwd, profile_pi, li);
+
+        /* FDB trỏ LAN kia trong khi WAN của LAN đó UP → nhảy cầu, bỏ FDB. */
+        if (lan_wan >= 0 && wan_dp_usable_for_fwd(fwd, lan_wan)) {
+            static uint8_t logged_cross;
+
+            if (!logged_cross) {
+                logged_cross = 1;
+                fprintf(stderr,
+                        "[WAN-INGRESS] ignore cross-bridge FDB fdb_lan=%s pair_lan=%s "
+                        "(other WAN up; stay on ingress pair)\n",
+                        fwd->locals[li].ifname,
+                        fwd->locals[paired_li].ifname);
+                fflush(stderr);
+            }
+            li = -1;
+        }
     }
+    if (li < 0 || !profile_owns_local(fwd, profile_pi, li))
+        li = paired_li;
     if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
@@ -692,13 +821,34 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     }
 
+    wan_stage_rx_log(fwd, job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1, pkt, job.len);
+    job.policy_slot = NE_POLICY_SLOT_NONE;
+
     encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
     if (encrypted) {
+        uint8_t wire_id = 0;
+
         if (!fwd->cfg->crypto_enabled) {
-            static uint64_t last_crypto_off_ms;
-            if (wan_log_rl(&last_crypto_off_ms))
-                fprintf(stderr, "[WAN-INGRESS] drop encrypted-wire while crypto-disabled\n");
+            if (!wan_stuck_crypto_off) {
+                wan_stuck_crypto_off = 1;
+                fprintf(stderr,
+                        "[WAN-INGRESS][STUCK] at=crypto-gate reason=crypto-disabled "
+                        "(encrypted frame arrived, cannot decrypt)\n");
+                fflush(stderr);
+            }
             goto drop;
+        }
+        if (crypto_eth_l2_read_policy_id(pkt, job.len, &wire_id) != 0)
+            (void)crypto_l3_extract_policy_id(fwd->cfg, pkt, job.len, &wire_id);
+        if (wire_id) {
+            for (int i = 0; i < fwd->cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
+                if ((uint8_t)fwd->cfg->policies[i].id == wire_id) {
+                    job.policy_slot = (uint8_t)i;
+                    wan_pending_db_id = fwd->cfg->policies[i].db_id;
+                    wan_pending_wire = fwd->cfg->policies[i].id;
+                    break;
+                }
+            }
         }
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
@@ -708,29 +858,67 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dec == 2)
             return;
         if (dec != 0) {
-            static uint64_t last_decrypt_fail_ms;
-            if (wan_log_rl(&last_decrypt_fail_ms))
-                fprintf(stderr, "[WAN-INGRESS] drop decrypt-fail on encrypted wire\n");
+            if (!wan_stuck_decrypt) {
+                wan_stuck_decrypt = 1;
+                fprintf(stderr,
+                        "[WAN-INGRESS][STUCK] at=decrypt reason=decrypt-fail "
+                        "policy_db_id=%d wire_id=%d (frame reached NE but crypto failed)\n",
+                        wan_pending_db_id, wan_pending_wire);
+                fflush(stderr);
+            }
             goto drop;
+        }
+        if (!wan_stage_decrypt) {
+            wan_stage_decrypt = 1;
+            fprintf(stderr,
+                    "[WAN-INGRESS][STAGE] 2/decrypt-ok policy_db_id=%d wire_id=%d\n",
+                    wan_pending_db_id, wan_pending_wire);
+            fflush(stderr);
         }
         pkt = ne_packet_data(&fwd->pair, job.addr);
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
 
         if (!wan_l2_plain_ipv4(pkt, job.len)) {
-            static uint64_t last_plain_reject_ms;
-            if (wan_log_rl(&last_plain_reject_ms))
-                fprintf(stderr, "[WAN-INGRESS] drop plain-non-ipv4 frame\n");
+            if (!wan_stuck_plain) {
+                wan_stuck_plain = 1;
+                fprintf(stderr,
+                        "[WAN-INGRESS][STUCK] at=classify reason=plain-non-ipv4 "
+                        "(WAN frame not NE-encrypted and not IPv4)\n");
+                fflush(stderr);
+            }
             goto drop;
         }
     }
 
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len,
-                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0) {
-        static uint64_t last_no_route_ms;
-        if (wan_log_rl(&last_no_route_ms))
-            fprintf(stderr, "[WAN-INGRESS] drop no-local-route/fdb-miss/profile-miss\n");
-        goto drop;
+    {
+        int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
+        int li;
+
+        if (forward_wan_to_local(fwd, &job, wire_buf, wire_len, wan_dp) != 0) {
+            if (!wan_stuck_route) {
+                wan_stuck_route = 1;
+                fprintf(stderr,
+                        "[WAN-INGRESS][STUCK] at=lan-fwd reason=no-local-route "
+                        "policy_db_id=%d (decrypt ok or bypass, FDB/profile miss)\n",
+                        wan_pending_db_id);
+                fflush(stderr);
+            }
+            goto drop;
+        }
+        li = job.local_idx;
+        if (li >= 0 && li < fwd->local_count) {
+            strncpy(wan_pending_lan, fwd->locals[li].ifname, sizeof(wan_pending_lan) - 1);
+            wan_pending_lan[sizeof(wan_pending_lan) - 1] = '\0';
+        }
+        if (!wan_stage_fwd) {
+            wan_stage_fwd = 1;
+            fprintf(stderr,
+                    "[WAN-INGRESS][STAGE] 3/queued-mid-to-local lan=%s policy_db_id=%d "
+                    "(waiting LAN XDP TX)\n",
+                    wan_pending_lan[0] ? wan_pending_lan : "?", wan_pending_db_id);
+            fflush(stderr);
+        }
     }
     ne_dp_stats_wan_fwd(1);
     return;

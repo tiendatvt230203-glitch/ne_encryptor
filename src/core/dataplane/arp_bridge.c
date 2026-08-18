@@ -427,11 +427,14 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
 }
 
 /*
- * Broadcast ARP WAN→LAN: flood mọi LAN trong profile.
- * Cần cho failover — who-has về backup WAN vẫn tới LAN gốc (Br0/Br1).
+ * Broadcast ARP WAN→LAN:
+ *  - luôn tới LAN ghép với WAN ingress (Br0 WAN → Br0 LAN).
+ *  - thêm LAN khác chỉ khi WAN primary của LAN đó đang DOWN (failover).
+ * Flood cả profile khi cả 2 WAN UP làm ARP/MAC nhảy cầu → ping lúc được lúc không.
  */
 static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *job,
                                        const uint8_t *pkt, int profile_pi,
+                                       int ingress_wan_dp,
                                        char *lans_out, size_t lans_out_sz)
 {
     const struct profile_config *prof;
@@ -439,6 +442,7 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
     int sent = 0;
     uint16_t sent_mask = 0;
     size_t lans_len = 0;
+    int paired_li;
 
     if (lans_out && lans_out_sz > 0)
         lans_out[0] = '\0';
@@ -451,10 +455,13 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
     if (!prof->enabled || prof->local_count <= 0)
         return -1;
 
+    paired_li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
     wi = dp_crypto_current_worker_idx();
 
     for (int i = 0; i < prof->local_count; i++) {
         int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);
+        int lan_wan;
+        int take;
         const char *lif;
 
         if (li < 0 || li >= fwd->local_count)
@@ -462,6 +469,13 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
         if (!arp_profile_owns_local(fwd, profile_pi, li))
             continue;
         if (li < (int)(sizeof(sent_mask) * 8) && (sent_mask & (1u << li)) != 0)
+            continue;
+
+        take = (paired_li >= 0 && li == paired_li);
+        if (!take && resolve_wan_dp_for_fwd_local(fwd, prof, li, &lan_wan) == 0 &&
+            !arp_wan_dp_usable(fwd, lan_wan))
+            take = 1;
+        if (!take)
             continue;
 
         if (arp_flood_push_local(fwd, job, pkt, li, wi, &sent) != 0)
@@ -957,7 +971,7 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
     if (is_bcast) {
         const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
 
-        if (arp_flood_to_profile_locals(fwd, job, mut, profile_pi,
+        if (arp_flood_to_profile_locals(fwd, job, mut, profile_pi, ingress_wan_dp,
                                         flood_lans, sizeof(flood_lans)) != 0) {
             static uint64_t last_flood_fail_ms;
 
@@ -978,10 +992,37 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
             op_name, (unsigned)arp_op, l2_dst, spa_s, tpa_s, tha_s, smac_s, dmac_s,
             crypto_state);
     } else {
-        /* Unicast: chỉ forward khi DMAC có trong bảng MAC → LAN. Không fallback. */
+        /* Unicast: FDB DMAC → LAN, nhưng không nhảy cầu khi WAN của LAN kia đang UP. */
         const struct profile_config *prof = &fwd->cfg->profiles[profile_pi];
+        int paired_li = mac_fwd_local_for_wan_dp(fwd, profile_pi, ingress_wan_dp);
 
         deliver_li = mac_lookup(fwd, mut);
+        if (deliver_li >= 0 && arp_profile_owns_local(fwd, profile_pi, deliver_li) &&
+            paired_li >= 0 && deliver_li != paired_li) {
+            int lan_wan;
+            int failover = 0;
+
+            if (resolve_wan_dp_for_fwd_local(fwd, prof, deliver_li, &lan_wan) == 0 &&
+                !arp_wan_dp_usable(fwd, lan_wan))
+                failover = 1;
+            if (!failover) {
+                static uint8_t logged_cross;
+
+                if (!logged_cross) {
+                    logged_cross = 1;
+                    fprintf(stderr,
+                            "[ARP-RX] drop cross-bridge wan=%s/%s fdb_lan=%s/%s "
+                            "pair_lan=%s (other WAN up)\n",
+                            wan_ifname(fwd, ingress_wan_dp),
+                            arp_br_name_for_wan(prof, ingress_wan_dp),
+                            local_ifname(fwd, deliver_li),
+                            arp_br_name_for_lan(fwd, prof, deliver_li),
+                            local_ifname(fwd, paired_li));
+                    fflush(stderr);
+                }
+                deliver_li = -1;
+            }
+        }
         if (deliver_li < 0 || !arp_profile_owns_local(fwd, profile_pi, deliver_li)) {
             static uint64_t last_no_mac_ms;
 
@@ -1018,7 +1059,7 @@ int arp_bridge_from_wan(struct forwarder *fwd, struct ne_packet *job,
                 if (arp_log_fail_ratelimit(&last_rx_reply_ms))
                     arp_log_backup_line(
                         "[ARP-RX][%s] %s/%s -> %s/%s has-mac "
-                        "| op=%s(%u) l2_dst=unicast spa=%s tpa=%s tha=%s smac=%s dmac=%s %s\n",
+                        "| op=%s(%u) l2_dst=%s spa=%s tpa=%s tha=%s smac=%s dmac=%s %s\n",
                         op_tag,
                         wan_ifname(fwd, ingress_wan_dp),
                         arp_br_name_for_wan(prof, ingress_wan_dp),

@@ -1076,6 +1076,34 @@ int mac_fwd_local_for_wan_dp(struct forwarder *fwd, int profile_pi, int wan_dp)
     return ingress_idx_by_ifname(fwd, ifname);
 }
 
+int mac_fwd_wan_dp_for_local(struct forwarder *fwd, int profile_pi, int fwd_local_idx)
+{
+    const struct profile_config *prof;
+    const char *ifname;
+
+    if (!fwd || !fwd->cfg || profile_pi < 0 || profile_pi >= fwd->cfg->profile_count)
+        return -1;
+    if (fwd_local_idx < 0 || fwd_local_idx >= fwd->local_count)
+        return -1;
+    prof = &fwd->cfg->profiles[profile_pi];
+    if (!prof->enabled)
+        return -1;
+    ifname = fwd->locals[fwd_local_idx].ifname;
+    if (!ifname[0])
+        return -1;
+
+    for (int i = 0; i < prof->bridge_count; i++) {
+        int ci = prof->bridges[i].local_idx;
+
+        if (ci < 0 || ci >= fwd->cfg->local_count)
+            continue;
+        if (strcmp(fwd->cfg->locals[ci].ifname, ifname) != 0)
+            continue;
+        return prof->bridges[i].wan_dp;
+    }
+    return -1;
+}
+
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname)
 {
     for (int i = 0; i < fwd->local_count; i++) {

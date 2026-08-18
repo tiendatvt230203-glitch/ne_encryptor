@@ -61,4 +61,7 @@ int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li);
 /* Map ingress WAN dp → live fwd local slot via bridge pair (for WAN ARP/data). */
 int mac_fwd_local_for_wan_dp(struct forwarder *fwd, int profile_pi, int wan_dp);
 
+/* Reverse: live LAN slot → paired WAN dp from bridges[]. -1 if none. */
+int mac_fwd_wan_dp_for_local(struct forwarder *fwd, int profile_pi, int fwd_local_idx);
+
 #endif

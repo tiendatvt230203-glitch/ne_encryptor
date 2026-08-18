@@ -1397,6 +1397,9 @@ static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool, int 
         if (credit_wan_tx) {
             for (uint32_t i = 0; i < n; i++)
                 ne_local_egress_on_wan_cq(addrs[i]);
+        } else {
+            for (uint32_t i = 0; i < n; i++)
+                ne_wan_ingress_on_lan_cq(addrs[i]);
         }
         uint32_t pushed = pool_push(pool, addrs, n);
         if (pushed > 0)
@@ -1690,6 +1693,13 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
                 continue;
             ne_local_egress_note_wan_submit(jobs[i].addr, (int)jobs[i].policy_slot,
                                             (int)jobs[i].wan_idx, jobs[i].len);
+        }
+    } else if (!is_wan && kick_ok) {
+        for (uint32_t i = 0; i < popped; i++) {
+            if (jobs[i].dir != NE_DIR_LOCAL || jobs[i].policy_slot == NE_POLICY_SLOT_NONE)
+                continue;
+            ne_wan_ingress_note_lan_submit(jobs[i].addr, (int)jobs[i].policy_slot,
+                                           (int)jobs[i].local_idx, jobs[i].len);
         }
     }
     if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
