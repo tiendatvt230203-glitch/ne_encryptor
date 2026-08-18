@@ -188,8 +188,9 @@ static int arp_parse_tha(const uint8_t *pkt, uint32_t len, uint8_t tha_out[MAC_L
     return 0;
 }
 
-void arp_bridge_crypto_init(void)
+void arp_bridge_reload_policies(struct app_config *cfg)
 {
+    (void)cfg;
     arp_crypto_ctx_init();
     fprintf(stderr,
             "[ARP] mode=mac-fdb+flood-whohas-only | arp_encrypt=%d (policy-independent) | key=arp-default | opt=L2-PQC/ARP\n",
