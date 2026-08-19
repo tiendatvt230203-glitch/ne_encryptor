@@ -5,6 +5,7 @@
 #include "../../../inc/core/forwarder_reload.h"
 #include "../../../inc/core/forwarder_wan.h"
 #include "../../../inc/core/interface.h"
+#include "../../../inc/crypto/eth_parse.h"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -37,15 +38,6 @@ static void profile_xdp_stop_log(const char *step, const char *ifname)
     fprintf(stderr, "\n");
     fflush(stderr);
 }
-
-/* #region agent log */
-static void agent_dbg(const char *hid, const char *loc, const char *msg, const char *data_json)
-{
-    (void)loc;
-    fprintf(stderr, "[PROFILE-XDP-DBG] %s %s %s\n", hid, msg, data_json ? data_json : "{}");
-    fflush(stderr);
-}
-/* #endregion */
 
 static int profile_iface_ifname_safe(const char *ifname)
 {
@@ -383,13 +375,17 @@ static int update_xsk_map_iface(struct ne_iface *iface, int map_fd)
 
 static void update_wan_fake_ethertype(struct bpf_object *obj, uint16_t fake_ethertype_ipv4)
 {
-    if (!obj || fake_ethertype_ipv4 == 0)
+    struct bpf_map *map;
+    int key = 0;
+    uint16_t et = (uint16_t)NE_L2_FAKE_ETHERTYPE;
+
+    (void)fake_ethertype_ipv4;
+    if (!obj)
         return;
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, "wan_config_map");
+    map = bpf_object__find_map_by_name(obj, "wan_config_map");
     if (!map)
         return;
-    int key = 0;
-    (void)bpf_map_update_elem(bpf_map__fd(map), &key, &fake_ethertype_ipv4, BPF_ANY);
+    (void)bpf_map_update_elem(bpf_map__fd(map), &key, &et, BPF_ANY);
 }
 
 int profile_iface_xdp_bind_local(struct ne_pair *p, const struct app_config *cfg, int pair_li)
@@ -551,18 +547,6 @@ int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
         fprintf(stderr, "[PROFILE-XDP] reload missing trigger profile id\n");
         return -1;
     }
-
-    /* #region agent log */
-    {
-        char js[256];
-        snprintf(js, sizeof(js),
-                 "{\"mode\":%d,\"trigger\":%d,\"old_lan\":%d,\"old_wan\":%d,"
-                 "\"new_lan\":%d,\"new_wan\":%d,\"old_prof\":%d,\"new_prof\":%d}",
-                 (int)mode, trigger_profile_id, old->local_count, old->wan_count,
-                 cfg->local_count, cfg->wan_count, old->profile_count, cfg->profile_count);
-        agent_dbg("C", "profile_iface_xdp.c:reload_impl", "reload_enter", js);
-    }
-    /* #endregion */
 
     switch (mode) {
     case PROFILE_IFACE_XDP_REMOVE:
