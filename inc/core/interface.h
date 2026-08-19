@@ -42,10 +42,7 @@ struct ne_packet {
     uint8_t dir;
     uint8_t wan_idx;
     uint8_t local_idx;
-    uint8_t policy_slot; /* cfg->policies[] index; NE_POLICY_SLOT_NONE if N/A */
 };
-
-#define NE_POLICY_SLOT_NONE 0xFF
 
 struct ne_ring {
     struct ne_packet *buf;

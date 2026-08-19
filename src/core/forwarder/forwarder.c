@@ -127,11 +127,8 @@ static int dp_burst_tx_wan(struct forwarder *fwd, int wan_idx, int tx_slot)
     int nring;
     int total = 0;
 
-    if (!ne_pair_wan_live(&fwd->pair, wan_idx)) {
-        if (fwd_mid_to_wan_depth(fwd, wan_idx) > 0)
-            ne_local_egress_on_wan_not_live(wan_idx);
+    if (!ne_pair_wan_live(&fwd->pair, wan_idx))
         return 0;
-    }
 
     nring = tx_collect_worker_rings(rings, fwd->mid_to_wan[wan_idx], tx_slot,
                                     (int)NE_TX_SLOTS);

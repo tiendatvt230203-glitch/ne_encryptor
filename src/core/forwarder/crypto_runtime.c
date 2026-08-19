@@ -3,11 +3,9 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
-#include "../../../inc/core/dataplane.h"
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
-#include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/crypto/traffic_crypto.h"
 #include "../../../inc/crypto/pqc_handshake.h"
 
@@ -41,7 +39,6 @@ static uint64_t prev_grace_until_ms;
 static struct flow_table profile_flow_tables[MAX_PROFILES];
 static int profile_flow_table_ready[MAX_PROFILES];
 static int profile_flow_profile_id[MAX_PROFILES];
-static uint8_t pqc_key_nonzero_seen[MAX_CRYPTO_POLICIES];
 
 int fwd_crypto_profile_slot_for_id(int profile_id)
 {
@@ -179,31 +176,6 @@ static int crypto_action_valid(int action)
            action == POLICY_ACTION_ENCRYPT_L4;
 }
 
-static void crypto_runtime_log_policy_readiness(const struct app_config *cfg, int idx)
-{
-    const struct crypto_policy *cp;
-    const uint8_t *cur;
-    int has_key;
-
-    if (!cfg || idx < 0 || idx >= active_policy_count)
-        return;
-    cp = &active_policies[idx];
-    if (!crypto_action_valid(cp->action) || cp->action == POLICY_ACTION_BYPASS)
-        return;
-    if (!policy_crypto_ready[idx]) {
-        fprintf(stderr,
-                "[CRYPTO-READY] policy_db_id=%d wire_id=%d mode=%d ready=0 reason=ctx-not-ready\n",
-                cp->db_id, cp->id, cp->crypto_mode);
-        return;
-    }
-    cur = packet_crypto_get_key(&policy_crypto_ctx[idx], KEY_SLOT_CURRENT);
-    has_key = key_nonzero(cur, AES_KEY_LEN);
-    fprintf(stderr,
-            "[CRYPTO-READY] policy_db_id=%d wire_id=%d mode=%d ready=%d current_key=%s\n",
-            cp->db_id, cp->id, cp->crypto_mode, policy_crypto_ready[idx],
-            has_key ? "ok" : "zero");
-}
-
 static void crypto_runtime_reset_indexes(void)
 {
     for (int id = 0; id < 256; id++)
@@ -220,14 +192,6 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         if (policy_crypto_ctx[i].profile_id != profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
-        if (!pqc_key_nonzero_seen[i] &&
-            key_nonzero(packet_crypto_get_key(&policy_crypto_ctx[i], KEY_SLOT_CURRENT), AES_KEY_LEN)) {
-            pqc_key_nonzero_seen[i] = 1;
-            fprintf(stderr,
-                    "[CRYPTO-TRANSITION] profile=%d policy_db_id=%d wire_id=%u current-key zero->ok\n",
-                    profile_id, policy_crypto_ctx[i].policy_id,
-                    (unsigned)policy_crypto_ctx[i].wire_id);
-        }
         main_diag_log_ne_policy_key(i, policy_crypto_ctx[i].policy_id);
     }
 }
@@ -286,17 +250,12 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     memcpy(old_active_policies, active_policies, sizeof(old_active_policies));
 
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
-    memset(pqc_key_nonzero_seen, 0, sizeof(pqc_key_nonzero_seen));
     memset(active_policies, 0, sizeof(active_policies));
     active_policy_count = 0;
     crypto_runtime_reset_indexes();
     memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
 
     if (!cfg || !cfg->crypto_enabled) {
-        if (cfg && cfg->profile_count > 0 && cfg->policy_count <= 0) {
-            fprintf(stderr,
-                    "[CRYPTO-GUARD] active profile has policies=0; data crypto path stays disabled\n");
-        }
         arp_bridge_reload_policies(cfg);
         return 0;
     }
@@ -385,12 +344,9 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     }
 
     arp_bridge_reload_policies(cfg);
-    ne_local_egress_reset_diag();
-    ne_wan_ingress_reset_diag();
     for (int i = 0; i < active_policy_count; i++) {
         const struct crypto_policy *cp = &active_policies[i];
 
-        crypto_runtime_log_policy_readiness(cfg, i);
         if (!policy_crypto_ready[i])
             continue;
         if (cp->action == POLICY_ACTION_BYPASS)
