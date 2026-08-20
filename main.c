@@ -810,10 +810,26 @@ static int handle_profile_notify(struct runtime_state *rt,
                                  int *active_ids,
                                  int *active_id_count,
                                  int profile_id) {
+    int exists = 0;
+    int was_active;
+
     if (g_stop_requested)
         return 0;
 
-    if (ne_profile_id_exists(profile_id) == 0) {
+    /* BE may NOTIFY before Postgres commit is visible — retry briefly. */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (ne_profile_id_exists(profile_id) == 0) {
+            exists = 1;
+            break;
+        }
+        if (attempt == 0)
+            fprintf(stderr,
+                    "[NOTIFY] profile %d not visible in DB yet — retry (commit race)\n",
+                    profile_id);
+        usleep(200000);
+    }
+
+    if (exists) {
         if (*active_id_count >= 1 && active_ids[0] != profile_id) {
             fprintf(stderr,
                     "[VALIDATE] REJECT load profile %d: profile %d is active "
@@ -824,19 +840,26 @@ static int handle_profile_notify(struct runtime_state *rt,
         }
         int lr = load_profile_and_run(rt, active_ids, active_id_count, profile_id);
         if (lr != 0) {
-            fprintf(stderr, "[ERR] profile %d: load failed\n", profile_id);
+            fprintf(stderr,
+                    "[ERR] profile %d: load failed — requesting service restart "
+                    "(systemd Restart=always; clean PQC/dataplane)\n",
+                    profile_id);
+            fflush(stderr);
+            g_service_restart_requested = 1;
+            g_stop_requested = 1;
             return -1;
         }
         return 0;
     }
 
-    if (!active_ids_remove(active_ids, active_id_count, profile_id)) {
+    /* Not in DB after retries → delete notify (or stale). */
+    was_active = active_ids_remove(active_ids, active_id_count, profile_id);
+    if (!was_active) {
+        /* Nothing running for this id — no restart (avoids first-load race reboot). */
         fprintf(stderr,
-                "[DELETE] profile %d (not in DB, not active — requesting service restart)\n",
+                "[DELETE] profile %d not in DB and not active — ignore (no restart)\n",
                 profile_id);
         fflush(stderr);
-        g_service_restart_requested = 1;
-        g_stop_requested = 1;
         return 0;
     }
 
