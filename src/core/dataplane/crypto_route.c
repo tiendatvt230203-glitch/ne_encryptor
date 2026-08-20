@@ -93,8 +93,14 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
         return 0;
 
     if (!fwd_crypto_has_l2_marker(pkt, len)) {
+        /*
+         * L3/L4 fragment does not carry L2 worker byte.
+         * Keep fragment stream sticky by packet-id instead of
+         * trying to parse a non-existent L2 worker field.
+         */
         if (!crypto_option_is_any_fragment(fwd->cfg, pkt, len, &pid, &fidx))
             return 0;
+        return dp_flow_hash_to_worker((uint32_t)pid);
     }
 
     if (crypto_eth_l2_read_worker_idx(pkt, len, &wire_id) != 0)

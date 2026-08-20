@@ -119,6 +119,9 @@ void main_diag_log_ne_pqc_traffic_key(int profile_id, int policy_id,
 
     if (!traffic_key || !key_prefix_nonzero(traffic_key, 4))
         return;
+    /* ARP bridge uses profile_id=0 policy_id=0 — not PQC policy traffic. */
+    if (profile_id <= 0 || policy_id <= 0)
+        return;
     if (ne_pqc_log_already_seen(profile_id, policy_id, traffic_key))
         return;
 
