@@ -5,6 +5,7 @@
 
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
+#include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
@@ -13,6 +14,7 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
+#include <stdio.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
@@ -211,6 +213,17 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->wire_id = (uint8_t)cp->id;
     pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
+    if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+        packet_crypto_update_keys(pctx);
+        const uint8_t *k = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
+        int knz = 0;
+        if (k) {
+            for (int i = 0; i < 32; i++)
+                if (k[i]) { knz = 1; break; }
+        }
+        if (!knz)
+            goto drop;
+    }
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                         crypto_proto_classify(proto), flow_ok);
     if (enc < 0)

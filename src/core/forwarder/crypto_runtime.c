@@ -207,7 +207,6 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
             int pi = prof->policy_indices[j];
             const struct crypto_policy *cp;
             int ctx_i = -1;
-            uint8_t probe[PQC_TRAFFIC_KEY_SZ];
 
             if (pi < 0 || pi >= cfg->policy_count)
                 continue;
@@ -228,13 +227,12 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
             policy_crypto_ctx[ctx_i].policy_id = cp->db_id;
             policy_crypto_ctx[ctx_i].wire_id = (uint8_t)cp->id;
 
-            if (sig_pqc_diversify_key(prof->id, cp->db_id, probe) != 0)
-                continue;
-
+            /* HS not ready (UI đổi key / re-handshake fail) → wipe stale session key now. */
             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[ctx_i]);
         }
     }
 }
+
 int fwd_crypto_rebuild(struct app_config *cfg)
 {
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
@@ -290,6 +288,9 @@ int fwd_crypto_rebuild(struct app_config *cfg)
                         policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
                         policy_crypto_ready[i] = 1;
                         reused = 1;
+                        /* PQC: drop reused keys if handshake is no longer ready. */
+                        if (cp->crypto_mode == CRYPTO_MODE_PQC)
+                            packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
                     }
                 }
             }
@@ -304,6 +305,8 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_crypto_ctx[i].policy_id = cp->db_id;
             policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
             policy_crypto_ready[i] = 1;
+            /* Only populate keys when handshake key_ready; else keep all-zero (block TX/RX). */
+            packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
             continue;
         }
         if (!key_nonzero(cp->key, AES_KEY_LEN))

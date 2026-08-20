@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
+#include <stdio.h>
 
 /* L2 UDP fragment ONLY (need_split: pkt+35 > MTU 1500). Wire after nonce:
  *   [0x5B][pkt_id:2][frag_index:0|1][reserved:0][ciphertext...]
