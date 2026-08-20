@@ -217,14 +217,27 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (cp->crypto_mode == CRYPTO_MODE_PQC) {
         uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
         const uint8_t *k;
+        const char *why = NULL;
 
-        /* Hard gate: HS ready + NE traffic key MATCH PQC handshake key. */
+        /* Per-policy hard gate: HS ready + NE traffic key MATCH that policy's HS key. */
         packet_crypto_update_keys(pctx);
         k = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
         if (!k || sig_pqc_diversify_key(pctx->profile_id, pctx->policy_id, hs_key) != 0)
+            why = "PQC_HS_NOT_READY";
+        else if (memcmp(k, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
+            why = "NE_KEY_MISMATCH_HS";
+        if (why) {
+            static int fail_logged[256];
+            int slot = pctx->policy_id & 0xFF;
+            if (!fail_logged[slot]) {
+                fail_logged[slot] = 1;
+                fprintf(stderr,
+                        "[PQC-TX-GATE] FAIL once policy_id=%d profile=%d wire_id=%u: %s (drop)\n",
+                        pctx->policy_id, pctx->profile_id, (unsigned)pctx->wire_id, why);
+                fflush(stderr);
+            }
             goto drop;
-        if (memcmp(k, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
-            goto drop;
+        }
     }
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                         crypto_proto_classify(proto), flow_ok);
