@@ -288,9 +288,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
                         policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
                         policy_crypto_ready[i] = 1;
                         reused = 1;
-                        /* PQC: drop reused keys if handshake is no longer ready. */
-                        if (cp->crypto_mode == CRYPTO_MODE_PQC)
+                        if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+                            policy_crypto_ctx[i].pqc_from_handshake = true;
                             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+                        }
                     }
                 }
             }
@@ -304,6 +305,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
             policy_crypto_ctx[i].policy_id = cp->db_id;
             policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
+            policy_crypto_ctx[i].pqc_from_handshake = true;
             policy_crypto_ready[i] = 1;
             /* Only populate keys when handshake key_ready; else keep all-zero (block TX/RX). */
             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);

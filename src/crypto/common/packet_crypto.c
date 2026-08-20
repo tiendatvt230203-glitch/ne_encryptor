@@ -50,7 +50,7 @@ static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
 {
     uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
 
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
+    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
 
     /* No successful matching handshake → wipe stale keys so encrypt/decrypt stop. */
@@ -94,7 +94,7 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 {
     uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
 
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC)
+    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
     if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
         pqc_clear_ctx_keys(ctx);

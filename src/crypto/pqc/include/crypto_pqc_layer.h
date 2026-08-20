@@ -41,9 +41,10 @@ static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc
     if (!key)
         return -1;
     if (crypto_pqc_key_is_all_zero(key, PQC_TRAFFIC_KEY_SZ)) {
-        fprintf(stderr,
-                "[PQC-KEY] invalid CURRENT key (all-zero) for profile=%d policy=%d; blocking PQC crypto path\n",
-                ctx->profile_id, ctx->policy_id);
+        if (ctx->pqc_from_handshake)
+            fprintf(stderr,
+                    "[PQC-KEY] invalid CURRENT key (all-zero) for profile=%d policy=%d; blocking PQC crypto path\n",
+                    ctx->profile_id, ctx->policy_id);
         return -1;
     }
     sess->key = key;
