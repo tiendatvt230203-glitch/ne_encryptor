@@ -17,6 +17,7 @@
 #include <net/if.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 /* L2 UDP fragment ONLY (need_split: pkt+35 > MTU 1500). Wire after nonce:
  *   [0x5B][pkt_id:2][frag_index:0|1][reserved:0][ciphertext...]
@@ -54,13 +55,38 @@ static int l2pqc_log_enabled(void)
 static void l2pqc_log(const char *stage, int reason, uint32_t len, int worker,
                       uint8_t pol, uint16_t pkt_id, uint8_t fidx)
 {
+    uint32_t pool_free = 0;
+
     if (!l2pqc_log_enabled())
         return;
-    if ((++tls_l2pqc_log_budget & 0x7Fu) != 1u)
+    if ((++tls_l2pqc_log_budget & 0x3Fu) != 1u)
         return;
+    /* best-effort: pool free helps prove hold→exhaust */
+    (void)pool_free;
     fprintf(stderr,
             "[L2-PQC] stage=%s reason=%d worker=%d pol=%u pkt_id=%u fidx=%u len=%u\n",
             stage ? stage : "?", reason, worker, pol, pkt_id, fidx, len);
+    /* #region agent log */
+    {
+        FILE *f = fopen("/tmp/debug-37ed71.log", "a");
+        if (!f)
+            f = fopen("/home/tiendat/Downloads/ne_mac_learn/.cursor/debug-37ed71.log", "a");
+        if (f) {
+            struct timespec ts;
+            uint64_t ms;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+            fprintf(f,
+                    "{\"sessionId\":\"37ed71\",\"runId\":\"pre\",\"hypothesisId\":\"H1\","
+                    "\"location\":\"wan_ingress.c:l2pqc_log\",\"message\":\"%s\","
+                    "\"timestamp\":%llu,\"data\":{\"reason\":%d,\"worker\":%d,"
+                    "\"pol\":%u,\"pkt_id\":%u,\"fidx\":%u,\"len\":%u}}\n",
+                    stage ? stage : "?", (unsigned long long)ms, reason, worker,
+                    pol, pkt_id, fidx, len);
+            fclose(f);
+        }
+    }
+    /* #endregion */
 }
 
 static int wan_dec_fail(int reason)
@@ -340,14 +366,23 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
         }
         if (l2_fast == 1) {
             uint64_t out_addr;
+            uint8_t wire_pol = 0;
+            uint16_t wire_pid = 0;
+            uint8_t wire_fidx = 0;
+
+            (void)crypto_eth_l2_read_policy_id(pkt, len, &wire_pol);
+            (void)crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP,
+                                            fwd->cfg, pkt, len, &wire_pid, &wire_fidx);
 
             if (pending == 2) {
-                /* frag0 held in reasm table — frame stays allocated */
-                l2pqc_log("rx_frag_hold", 0, len, dp_crypto_current_worker_idx(), 0, 0, 0);
+                /* should not happen with copy-based frag0 */
+                l2pqc_log("rx_frag_hold", 0, len, dp_crypto_current_worker_idx(),
+                          wire_pol, wire_pid, wire_fidx);
                 return 2;
             }
             if (pending) {
-                l2pqc_log("rx_frag_pending_free", 0, len, dp_crypto_current_worker_idx(), 0, 0, 0);
+                l2pqc_log("rx_frag_pending_free", 0, len, dp_crypto_current_worker_idx(),
+                          wire_pol, wire_pid, wire_fidx);
                 return 1;
             }
             out_addr = crypto_l2_pqc_reasm_out_addr();
@@ -355,7 +390,8 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                 ne_frame_free(&fwd->pair, job->addr);
                 job->addr = out_addr;
             }
-            l2pqc_log("rx_frag_join_ok", 0, len, dp_crypto_current_worker_idx(), 0, 0, 0);
+            l2pqc_log("rx_frag_join_ok", 0, len, dp_crypto_current_worker_idx(),
+                      wire_pol, wire_pid, wire_fidx);
             job->len = len;
             return 0;
         }
