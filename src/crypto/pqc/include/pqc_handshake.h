@@ -7,7 +7,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#define PQC_USE_DYNAMIC_ROLE  1 // 1 = Dynamic (compare IP/MAC), 0 = Static (DB configured)
 #define PQC_HS_PORT        7090
 #define PQC_HS_MAGIC       0x50514348 // "PQCH"
 #define PQC_HS_MSG_HELLO   1
@@ -32,9 +31,11 @@
 #endif
 
 #define PQC_RX_QUEUE_SIZE  16
-#define MAX_IDENTITY_REGISTRY 1000
+#define PQC_HS_CACHE_SLOTS 4
+#define MAX_IDENTITY_REGISTRY 100
 #define MAX_POLICY_BINDINGS 128
 #define MAX_L2_DISPATCHERS 16
+#define PQC_USE_DYNAMIC_ROLE  1 // 1 = Dynamic (compare IP/MAC), 0 = Static (DB configured)
 
 typedef enum {
     PQC_ROLE_RESPONDER = 0,
@@ -59,6 +60,18 @@ typedef struct {
     uint8_t src_mac[6];
 } pqc_rx_pkt_info_t;
 
+/* L3 responder state for idempotent HELLO handling.  L2 keeps its existing
+ * handshake flow and does not use this cache. */
+typedef struct {
+    uint8_t *response;
+    uint32_t session_id;
+    int response_len;
+    uint8_t hello_hash[32];
+    uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
+    bool valid;
+    bool key_promoted;
+} pqc_hs_cache_entry_t;
+
 typedef struct {
     // 8-Byte Aligned Members
     uint64_t last_rotation_time;
@@ -71,6 +84,8 @@ typedef struct {
     char *local_pub;
     char *peer_pub;
 
+    pqc_hs_cache_entry_t hs_cache[PQC_HS_CACHE_SLOTS];
+
     pthread_t thread_id;
     uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
     pthread_mutex_t rx_mutex;
@@ -82,6 +97,7 @@ typedef struct {
     int role_mode;
     int rx_head;
     int rx_tail;
+    int hs_cache_next;
     int rx_len[PQC_RX_QUEUE_SIZE];
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
 
@@ -103,6 +119,7 @@ typedef struct {
     bool thread_started;
     bool handshake_give_up;
     bool rotation_give_up;
+    bool giveup_logged;
     bool send_poke;
     bool is_tunnel;
     volatile bool thread_exit_sig;
@@ -175,9 +192,9 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *local_priv, const char *local_pub,
                          const char *peer_pub, bool is_tunnel);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
-int sig_pqc_load_keys_from_vault(const char *target_fg, char *out_priv, size_t priv_sz,
-                                    char *out_pub, size_t pub_sz);
-char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
+int  sig_pqc_load_keys_from_vault(const char *target_fg,
+                                   char *out_priv, size_t priv_sz,
+                                   char *out_pub,  size_t pub_sz);
 
 /**
  * Feed a received PQC handshake packet (UDP payload only) into the handshake module.

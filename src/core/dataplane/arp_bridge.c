@@ -90,7 +90,12 @@ static int arp_log_fail_ratelimit(uint64_t *last_ms)
 /* Backup path: always log — không rate-limit (debug failover ARP). */
 static void arp_log_backup_line(const char *fmt, ...)
 {
-    /* (void) tắt tạm log ARP TX/RX/FO — bật lại khi cần debug */
+    // va_list ap;
+
+    // va_start(ap, fmt);
+    // vfprintf(stderr, fmt, ap);
+    // va_end(ap);
+    // fflush(stderr);
     (void)fmt;
 }
 
