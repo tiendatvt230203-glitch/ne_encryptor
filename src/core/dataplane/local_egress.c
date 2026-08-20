@@ -6,6 +6,7 @@
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/packet_crypto.h"
+#include "../../../inc/crypto/pqc_handshake.h"
 #include "../../../inc/core/crypto_route.h"
 #include "../../../inc/core/arp_bridge.h"
 #include "../../../inc/core/dataplane_stats.h"
@@ -214,14 +215,15 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     pctx->wire_id = (uint8_t)cp->id;
     pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
     if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+        uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
+        const uint8_t *k;
+
+        /* Hard gate: HS ready + NE traffic key MATCH PQC handshake key. */
         packet_crypto_update_keys(pctx);
-        const uint8_t *k = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
-        int knz = 0;
-        if (k) {
-            for (int i = 0; i < 32; i++)
-                if (k[i]) { knz = 1; break; }
-        }
-        if (!knz)
+        k = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
+        if (!k || sig_pqc_diversify_key(pctx->profile_id, pctx->policy_id, hs_key) != 0)
+            goto drop;
+        if (memcmp(k, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
             goto drop;
     }
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
