@@ -6,8 +6,19 @@
 #include "../../../inc/core/forwarder_crypto_runtime.h"
 #include "../../../inc/core/mac_learn.h"
 #include "../../../inc/crypto/packet_crypto.h"
+#include "../../../inc/crypto/pqc_handshake.h"
 
 #define DIAG_KEY_PREFIX_LEN 9
+#define NE_PQC_LOG_SLOTS    64
+
+typedef struct {
+    int profile_id;
+    int policy_id;
+    uint8_t traffic_prefix[4];
+    int valid;
+} ne_pqc_log_slot_t;
+
+static ne_pqc_log_slot_t ne_pqc_log_cache[NE_PQC_LOG_SLOTS];
 
 static int key_prefix_nonzero(const uint8_t *key, size_t len)
 {
@@ -58,6 +69,81 @@ void main_diag_log_ne_policy_key(int policy_index, int db_id)
 
     fprintf(stderr, "[NE-KEY] policy db_id=%d Key prefix: %s\n", db_id, prefix);
     fflush(stderr);
+}
+
+static void key_prefix_hex(char *out, size_t outsz, const uint8_t *key)
+{
+    snprintf(out, outsz, "%02X%02X%02X%02X", key[0], key[1], key[2], key[3]);
+}
+
+static int ne_pqc_log_already_seen(int profile_id, int policy_id, const uint8_t *traffic_key)
+{
+    for (int i = 0; i < NE_PQC_LOG_SLOTS; i++) {
+        if (!ne_pqc_log_cache[i].valid)
+            continue;
+        if (ne_pqc_log_cache[i].profile_id != profile_id ||
+            ne_pqc_log_cache[i].policy_id != policy_id)
+            continue;
+        if (memcmp(ne_pqc_log_cache[i].traffic_prefix, traffic_key, 4) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void ne_pqc_log_remember(int profile_id, int policy_id, const uint8_t *traffic_key)
+{
+    int slot = -1;
+
+    for (int i = 0; i < NE_PQC_LOG_SLOTS; i++) {
+        if (!ne_pqc_log_cache[i].valid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        slot = (profile_id ^ policy_id ^ traffic_key[0]) % NE_PQC_LOG_SLOTS;
+
+    ne_pqc_log_cache[slot].profile_id = profile_id;
+    ne_pqc_log_cache[slot].policy_id = policy_id;
+    memcpy(ne_pqc_log_cache[slot].traffic_prefix, traffic_key, 4);
+    ne_pqc_log_cache[slot].valid = 1;
+}
+
+void main_diag_log_ne_pqc_traffic_key(int profile_id, int policy_id,
+                                      const uint8_t traffic_key[32])
+{
+    uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
+    char traffic_px[DIAG_KEY_PREFIX_LEN];
+    char hs_px[DIAG_KEY_PREFIX_LEN];
+    int hs_ok;
+
+    if (!traffic_key || !key_prefix_nonzero(traffic_key, 4))
+        return;
+    if (ne_pqc_log_already_seen(profile_id, policy_id, traffic_key))
+        return;
+
+    key_prefix_hex(traffic_px, sizeof(traffic_px), traffic_key);
+    hs_ok = (sig_pqc_diversify_key(profile_id, policy_id, hs_key) == 0);
+    if (hs_ok)
+        key_prefix_hex(hs_px, sizeof(hs_px), hs_key);
+    else
+        snprintf(hs_px, sizeof(hs_px), "--------");
+
+    if (hs_ok && memcmp(traffic_key, hs_key, PQC_TRAFFIC_KEY_SZ) == 0) {
+        fprintf(stderr,
+                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s MATCH\n",
+                profile_id, policy_id, traffic_px, hs_px);
+    } else if (hs_ok) {
+        fprintf(stderr,
+                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s MISMATCH\n",
+                profile_id, policy_id, traffic_px, hs_px);
+    } else {
+        fprintf(stderr,
+                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s PQC_NOT_READY\n",
+                profile_id, policy_id, traffic_px, hs_px);
+    }
+    fflush(stderr);
+    ne_pqc_log_remember(profile_id, policy_id, traffic_key);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {

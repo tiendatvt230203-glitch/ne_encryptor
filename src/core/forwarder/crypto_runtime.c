@@ -192,7 +192,6 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         if (policy_crypto_ctx[i].profile_id != profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
-        main_diag_log_ne_policy_key(i, policy_crypto_ctx[i].policy_id);
     }
 }
 
@@ -233,7 +232,6 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
                 continue;
 
             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[ctx_i]);
-            main_diag_log_ne_policy_key(ctx_i, cp->db_id);
         }
     }
 }

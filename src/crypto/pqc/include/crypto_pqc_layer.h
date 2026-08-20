@@ -6,6 +6,7 @@
 #include "traffic_crypto.h"
 #include "pqc_handshake.h"
 #include "scrypt.h"
+#include "../../../../inc/core/main_diag.h"
 #include <stdio.h>
 
 typedef struct crypto_pqc_sess {
@@ -48,6 +49,7 @@ static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc
     sess->key = key;
     sess->aad = HARDCODED_AAD;
     sess->aad_len = 12;
+    main_diag_log_ne_pqc_traffic_key(ctx->profile_id, ctx->policy_id, key);
     return 0;
 }
 
