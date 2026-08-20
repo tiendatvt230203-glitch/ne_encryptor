@@ -324,13 +324,6 @@ static void *wan_rx_thread(void *arg)
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
             wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
             if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                static __thread uint32_t tls_wi_drop_log;
-                /* L2-PQC focus: only log when packet has L2 crypto marker. */
-                if (fwd_crypto_has_l2_marker(pkt, batch[i].len) &&
-                    (++tls_wi_drop_log & 0x7Fu) == 1u)
-                    fprintf(stderr,
-                            "[L2-PQC] stage=pick_worker wi=%d len=%u\n",
-                            wi, batch[i].len);
                 ne_dp_stats_wan_drop(1);
                 ne_frame_free(&fwd->pair, batch[i].addr);
                 continue;

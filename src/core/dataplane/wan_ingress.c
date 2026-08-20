@@ -15,85 +15,12 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <time.h>
 
 /* L2 UDP fragment ONLY (need_split: pkt+35 > MTU 1500). Wire after nonce:
  *   [0x5B][pkt_id:2][frag_index:0|1][reserved:0][ciphertext...]
  * TCP / UDP that fits MTU never write this — that offset is ciphertext. */
 #define WAN_L2_FRAG_MAGIC    0x5Bu
 #define WAN_L2_FRAG_TAG_LEN  4u
-
-enum wan_dec_reason {
-    WAN_DEC_OK = 0,
-    WAN_DEC_BAD_ARGS = 1,
-    WAN_DEC_L2_FAST_FAIL = 2,
-    WAN_DEC_L2_REASM_FAIL = 3,
-    WAN_DEC_L2_POLICY_FAIL = 4,
-    WAN_DEC_L2_DECRYPT_FAIL = 5, /* decrypt fail + not a valid L2 frag */
-};
-
-static __thread int tls_wan_dec_reason;
-static __thread uint32_t tls_l2pqc_log_budget;
-
-/* Always-on for L2-PQC path. Set NE_WAN_DEBUG=0 to silence. */
-static int l2pqc_log_enabled(void)
-{
-    static int inited = 0;
-    static int enabled = 1;
-
-    if (!inited) {
-        const char *v = getenv("NE_WAN_DEBUG");
-        if (v && strcmp(v, "0") == 0)
-            enabled = 0;
-        inited = 1;
-    }
-    return enabled;
-}
-
-static void l2pqc_log(const char *stage, int reason, uint32_t len, int worker,
-                      uint8_t pol, uint16_t pkt_id, uint8_t fidx)
-{
-    uint32_t pool_free = 0;
-
-    if (!l2pqc_log_enabled())
-        return;
-    if ((++tls_l2pqc_log_budget & 0x3Fu) != 1u)
-        return;
-    /* best-effort: pool free helps prove hold→exhaust */
-    (void)pool_free;
-    fprintf(stderr,
-            "[L2-PQC] stage=%s reason=%d worker=%d pol=%u pkt_id=%u fidx=%u len=%u\n",
-            stage ? stage : "?", reason, worker, pol, pkt_id, fidx, len);
-    /* #region agent log */
-    {
-        FILE *f = fopen("/tmp/debug-37ed71.log", "a");
-        if (!f)
-            f = fopen("/home/tiendat/Downloads/ne_mac_learn/.cursor/debug-37ed71.log", "a");
-        if (f) {
-            struct timespec ts;
-            uint64_t ms;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
-            fprintf(f,
-                    "{\"sessionId\":\"37ed71\",\"runId\":\"pre\",\"hypothesisId\":\"H1\","
-                    "\"location\":\"wan_ingress.c:l2pqc_log\",\"message\":\"%s\","
-                    "\"timestamp\":%llu,\"data\":{\"reason\":%d,\"worker\":%d,"
-                    "\"pol\":%u,\"pkt_id\":%u,\"fidx\":%u,\"len\":%u}}\n",
-                    stage ? stage : "?", (unsigned long long)ms, reason, worker,
-                    pol, pkt_id, fidx, len);
-            fclose(f);
-        }
-    }
-    /* #endregion */
-}
-
-static int wan_dec_fail(int reason)
-{
-    tls_wan_dec_reason = reason;
-    return -1;
-}
 
 static int wan_l2_is_udp_frag(const uint8_t *pkt, uint32_t len)
 {
@@ -347,9 +274,8 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     int pending = 0;
     int is_l2 = 0;
 
-    tls_wan_dec_reason = WAN_DEC_OK;
     if (!fwd || !pkt || !job)
-        return wan_dec_fail(WAN_DEC_BAD_ARGS);
+        return -1;
     /* Caller must only invoke this for encrypted wire; plain bypass never enters. */
     if (!wan_wire_is_encrypted(fwd, pkt, len))
         return 0;
@@ -359,39 +285,20 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
     {
         int l2_fast = wan_try_l2_pqc_frag(fwd, pkt, &len, job->addr, &pending);
 
-        if (l2_fast < 0) {
-            l2pqc_log("rx_frag_fast_fail", WAN_DEC_L2_FAST_FAIL, len,
-                      dp_crypto_current_worker_idx(), 0, 0, 0);
-            return wan_dec_fail(WAN_DEC_L2_FAST_FAIL);
-        }
+        if (l2_fast < 0)
+            return -1;
         if (l2_fast == 1) {
             uint64_t out_addr;
-            uint8_t wire_pol = 0;
-            uint16_t wire_pid = 0;
-            uint8_t wire_fidx = 0;
 
-            (void)crypto_eth_l2_read_policy_id(pkt, len, &wire_pol);
-            (void)crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP,
-                                            fwd->cfg, pkt, len, &wire_pid, &wire_fidx);
-
-            if (pending == 2) {
-                /* should not happen with copy-based frag0 */
-                l2pqc_log("rx_frag_hold", 0, len, dp_crypto_current_worker_idx(),
-                          wire_pol, wire_pid, wire_fidx);
+            if (pending == 2)
                 return 2;
-            }
-            if (pending) {
-                l2pqc_log("rx_frag_pending_free", 0, len, dp_crypto_current_worker_idx(),
-                          wire_pol, wire_pid, wire_fidx);
+            if (pending)
                 return 1;
-            }
             out_addr = crypto_l2_pqc_reasm_out_addr();
             if (out_addr && out_addr != job->addr) {
                 ne_frame_free(&fwd->pair, job->addr);
                 job->addr = out_addr;
             }
-            l2pqc_log("rx_frag_join_ok", 0, len, dp_crypto_current_worker_idx(),
-                      wire_pol, wire_pid, wire_fidx);
             job->len = len;
             return 0;
         }
@@ -415,23 +322,12 @@ static int decrypt_wan(struct forwarder *fwd, struct ne_packet *job)
                     crypto_option_is_fragment(CRYPTO_OPT_L2_GCM128, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                     crypto_option_is_fragment(CRYPTO_OPT_L2_GCM256, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx) ||
                     crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, fwd->cfg, pkt, len, &pid, &fidx)) {
-                    if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0) {
-                        l2pqc_log("rx_policy_fail", WAN_DEC_L2_POLICY_FAIL, len,
-                                  dp_crypto_current_worker_idx(), 0, pid, fidx);
-                        return wan_dec_fail(WAN_DEC_L2_POLICY_FAIL);
-                    }
-                    if (reassemble_l2(fwd, pkt, &len, wire_pol, job->addr, &pending) != 0) {
-                        l2pqc_log("rx_reasm_fail", WAN_DEC_L2_REASM_FAIL, len,
-                                  dp_crypto_current_worker_idx(), wire_pol, pid, fidx);
-                        return wan_dec_fail(WAN_DEC_L2_REASM_FAIL);
-                    }
+                    if (crypto_eth_l2_read_policy_id(pkt, len, &wire_pol) != 0)
+                        return -1;
+                    if (reassemble_l2(fwd, pkt, &len, wire_pol, job->addr, &pending) != 0)
+                        return -1;
                 } else if (is_l2) {
-                    (void)crypto_eth_l2_read_policy_id(pkt, len, &wire_pol);
-                    l2pqc_log("rx_decrypt_fail", WAN_DEC_L2_DECRYPT_FAIL, len,
-                              dp_crypto_current_worker_idx(), wire_pol, 0, 0);
-                    return wan_dec_fail(WAN_DEC_L2_DECRYPT_FAIL);
-                } else {
-                    /* Not L2 wire — leave for L3/L4 path below. */
+                    return -1;
                 }
             }
         }
@@ -685,19 +581,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint32_t wire_len;
     int dec;
     int encrypted;
-    const char *drop_stage = "unknown";
-    int drop_reason = 0;
 
-    if (!fwd || !pkt) {
-        drop_stage = "bad_args";
+    if (!fwd || !pkt)
         goto drop;
-    }
 
     wire_len = job.len;
-    if (wire_len < 14u || wire_len > NE_FRAME) {
-        drop_stage = "bad_len";
+    if (wire_len < 14u || wire_len > NE_FRAME)
         goto drop;
-    }
     /* L2 frag pending is freed after decrypt; snapshot header only (policy_id). */
     if (wan_l2_is_frag(pkt, wire_len)) {
         uint32_t snap = wire_len < 64u ? wire_len : 64u;
@@ -717,16 +607,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
 
         if (bridged == 0)
             return;
-        drop_stage = "arp_bridge";
         goto drop;
     }
 
     encrypted = wan_wire_is_encrypted(fwd, pkt, job.len);
     if (encrypted) {
-        if (!fwd->cfg->crypto_enabled) {
-            drop_stage = "crypto_off";
+        if (!fwd->cfg->crypto_enabled)
             goto drop;
-        }
         dec = decrypt_wan(fwd, &job);
         if (dec == 1) {
             ne_frame_free(&fwd->pair, job.addr);
@@ -734,35 +621,22 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         }
         if (dec == 2)
             return;
-        if (dec != 0) {
-            drop_stage = "decrypt";
-            drop_reason = tls_wan_dec_reason;
+        if (dec != 0)
             goto drop;
-        }
         pkt = ne_packet_data(&fwd->pair, job.addr);
         wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
-        if (!wan_l2_plain_ipv4(pkt, job.len)) {
-            drop_stage = "plain_not_ipv4";
+        if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
-        }
     }
 
     if (forward_wan_to_local(fwd, &job, wire_buf, wire_len,
-                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0) {
-        drop_stage = "fwd_local";
+                             job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)
         goto drop;
-    }
     ne_dp_stats_wan_fwd(1);
     return;
 
 drop:
-    /* Only shout for L2-PQC related drops (encrypted L2 wire / decrypt fail). */
-    if (drop_stage && (strcmp(drop_stage, "decrypt") == 0 ||
-                       strcmp(drop_stage, "fwd_local") == 0 ||
-                       strcmp(drop_stage, "crypto_off") == 0)) {
-        l2pqc_log(drop_stage, drop_reason, job.len, dp_crypto_current_worker_idx(), 0, 0, 0);
-    }
     ne_dp_stats_wan_drop(1);
     ne_frame_free(&fwd->pair, job.addr);
 }

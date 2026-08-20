@@ -13,49 +13,8 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <net/if.h>
-#include <stdio.h>
-#include <time.h>
 
 #define SPLIT_TAIL_REFILL_BATCH 32u
-
-static __thread uint32_t tls_l2pqc_tx_log;
-
-static void l2pqc_tx_log(const char *stage, int reason, uint32_t len)
-{
-    if ((++tls_l2pqc_tx_log & 0x7Fu) != 1u)
-        return;
-    fprintf(stderr, "[L2-PQC] stage=%s reason=%d worker=%d len=%u\n",
-            stage ? stage : "?", reason, dp_crypto_current_worker_idx(), len);
-}
-
-/* #region agent log */
-static void agent_dbg_tx(const char *hypothesisId, const char *message,
-                         uint64_t a, uint64_t b, uint64_t pool_free)
-{
-    FILE *f;
-    struct timespec ts;
-    uint64_t ms;
-    static __thread uint32_t budget;
-
-    if ((++budget & 0x1Fu) != 1u)
-        return;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
-    f = fopen("/tmp/debug-37ed71.log", "a");
-    if (!f)
-        f = fopen("/home/tiendat/Downloads/ne_mac_learn/.cursor/debug-37ed71.log", "a");
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"37ed71\",\"runId\":\"pre\",\"hypothesisId\":\"%s\","
-            "\"location\":\"local_egress.c\",\"message\":\"%s\",\"timestamp\":%llu,"
-            "\"data\":{\"a\":%llu,\"b\":%llu,\"pool_free\":%llu}}\n",
-            hypothesisId, message, (unsigned long long)ms,
-            (unsigned long long)a, (unsigned long long)b,
-            (unsigned long long)pool_free);
-    fclose(f);
-}
-/* #endregion */
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
     int wi = dp_crypto_current_worker_idx();
@@ -136,37 +95,21 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     (void)flow_ok;
 
     if (crypto_option_need_split(opt_id, pclass, len)) {
-        if (split_tail_take(fwd, worker_idx, &tail.addr) != 0) {
-            if (opt_id == CRYPTO_OPT_L2_PQC) {
-                l2pqc_tx_log("tx_split_no_frame", -1, len);
-                /* #region agent log */
-                agent_dbg_tx("H1", "tx_split_no_frame", len, worker_idx,
-                             ne_pool_free_count(&fwd->pair));
-                /* #endregion */
-            }
+        if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
             return -1;
-        }
         tail_buf = ne_packet_data(&fwd->pair, tail.addr);
         if (crypto_option_split(opt_id, pclass, pctx, pkt, len, fwd->pair.frame_size, &l1,
                                 tail_buf, fwd->pair.frame_size, &l2) != 0) {
             ne_frame_free(&fwd->pair, tail.addr);
-            if (opt_id == CRYPTO_OPT_L2_PQC)
-                l2pqc_tx_log("tx_split_fail", -2, len);
             return -1;
         }
-        if (push_split_to_wan(fwd, job, l1, &tail, l2, wan_dp) != 0) {
-            if (opt_id == CRYPTO_OPT_L2_PQC)
-                l2pqc_tx_log("tx_split_push_fail", -3, len);
+        if (push_split_to_wan(fwd, job, l1, &tail, l2, wan_dp) != 0)
             return -1;
-        }
         return 1;
     }
 
-    if (crypto_option_encrypt(opt_id, pclass, pctx, pkt, &len) != 0) {
-        if (opt_id == CRYPTO_OPT_L2_PQC)
-            l2pqc_tx_log("tx_encrypt_fail", -4, len);
+    if (crypto_option_encrypt(opt_id, pclass, pctx, pkt, &len) != 0)
         return -1;
-    }
     job->len = len;
     return 0;
 }

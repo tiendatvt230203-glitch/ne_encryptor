@@ -10,60 +10,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
-#include <stdio.h>
-#include <stdatomic.h>
 
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
 #define likely(x)               __builtin_expect(!!(x), 1)
 #define unlikely(x)             __builtin_expect(!!(x), 0)
 
 /* ===================== L2 PQC ===================== */
-
-/* #region agent log */
-static atomic_uint_fast64_t g_l2pqc_held_live;
-static atomic_uint_fast64_t g_l2pqc_hold_n;
-static atomic_uint_fast64_t g_l2pqc_join_ok;
-static atomic_uint_fast64_t g_l2pqc_join_fail;
-static atomic_uint_fast64_t g_l2pqc_release_n;
-static atomic_uint_fast64_t g_l2pqc_evict_n;
-static __thread uint32_t tls_agent_log_budget;
-
-static void agent_dbg_l2pqc(const char *hypothesisId, const char *location,
-                            const char *message, uint64_t a, uint64_t b,
-                            uint64_t c, uint64_t d)
-{
-    FILE *f;
-    struct timespec ts;
-    uint64_t ms;
-
-    if ((++tls_agent_log_budget & 0x3Fu) != 1u)
-        return;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
-    f = fopen("/tmp/debug-37ed71.log", "a");
-    if (!f)
-        f = fopen("/home/tiendat/Downloads/ne_mac_learn/.cursor/debug-37ed71.log", "a");
-    if (!f)
-        return;
-    fprintf(f,
-            "{\"sessionId\":\"37ed71\",\"runId\":\"pre\",\"hypothesisId\":\"%s\","
-            "\"location\":\"%s\",\"message\":\"%s\",\"timestamp\":%llu,"
-            "\"data\":{\"a\":%llu,\"b\":%llu,\"c\":%llu,\"d\":%llu,"
-            "\"held_live\":%llu,\"hold_n\":%llu,\"join_ok\":%llu,"
-            "\"join_fail\":%llu,\"release_n\":%llu,\"evict_n\":%llu}}\n",
-            hypothesisId, location, message,
-            (unsigned long long)ms,
-            (unsigned long long)a, (unsigned long long)b,
-            (unsigned long long)c, (unsigned long long)d,
-            (unsigned long long)atomic_load(&g_l2pqc_held_live),
-            (unsigned long long)atomic_load(&g_l2pqc_hold_n),
-            (unsigned long long)atomic_load(&g_l2pqc_join_ok),
-            (unsigned long long)atomic_load(&g_l2pqc_join_fail),
-            (unsigned long long)atomic_load(&g_l2pqc_release_n),
-            (unsigned long long)atomic_load(&g_l2pqc_evict_n));
-    fclose(f);
-}
-/* #endregion */
 
 /* wire — local to this option */
 #define OPT_FAKE_ETHERTYPE  0x104Au
@@ -89,11 +41,9 @@ struct opt_table {
 
 static struct opt_table *g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS];
 
-static __thread struct ne_pair *tls_pair;
-
 void crypto_l2_pqc_bind_pair(struct ne_pair *p)
 {
-    tls_pair = p;
+    (void)p;
 }
 
 void crypto_l2_pqc_reasm_set_addr(uint64_t addr)
@@ -183,15 +133,8 @@ static int opt_pick_slot(struct opt_table *ft, uint16_t pkt_id, uint64_t now)
     }
     if (empty_idx >= 0)
         return empty_idx;
-    if (oldest_idx >= 0) {
-        /* #region agent log */
-        atomic_fetch_add(&g_l2pqc_evict_n, 1);
-        agent_dbg_l2pqc("H2", "pqc_l2_option.c:opt_pick_slot",
-                        "evict_oldest_slot", (uint64_t)oldest_idx, (uint64_t)pkt_id,
-                        oldest_age, (uint64_t)ft->entries[oldest_idx].pkt_id);
-        /* #endregion */
+    if (oldest_idx >= 0)
         return oldest_idx;
-    }
     return base;
 }
 
@@ -209,17 +152,6 @@ static int opt_store_first(struct opt_entry *entry, uint16_t pkt_id,
     memcpy(entry->eth_hdr, eth, eth_len);
     entry->eth_len = eth_len;
     entry->got_first = 1;
-    atomic_fetch_add(&g_l2pqc_hold_n, 1);
-    /* #region agent log */
-    agent_dbg_l2pqc("H1", "pqc_l2_option.c:opt_store_first",
-                    "store_frag0_copy", 0, pkt_id, data_len,
-                    tls_pair ? ne_pool_free_count(tls_pair) : 0);
-    if ((tls_agent_log_budget & 0x3Fu) == 1u)
-        fprintf(stderr,
-                "[L2-PQC] store_copy pkt_id=%u first_len=%u pool_free=%u\n",
-                pkt_id, data_len,
-                tls_pair ? ne_pool_free_count(tls_pair) : 0u);
-    /* #endregion */
     return 0;
 }
 
@@ -244,12 +176,6 @@ static int opt_emit_join(struct opt_entry *entry, uint8_t *out_buf, uint32_t *ou
         return 0;
     eth_len = entry->eth_len ? (int)entry->eth_len : (int)ETH_HEADER_SIZE;
     if (entry->first_len + entry->second_len + (uint32_t)eth_len > NE_FRAME) {
-        atomic_fetch_add(&g_l2pqc_join_fail, 1);
-        /* #region agent log */
-        agent_dbg_l2pqc("H3", "pqc_l2_option.c:opt_emit_join",
-                        "join_fail_too_big", entry->pkt_id, entry->first_len,
-                        entry->second_len, (uint64_t)eth_len);
-        /* #endregion */
         opt_clear_entry(entry);
         return -1;
     }
@@ -264,17 +190,6 @@ static int opt_emit_join(struct opt_entry *entry, uint8_t *out_buf, uint32_t *ou
     *out_len = (uint32_t)off;
     if (eth_len >= 2)
         crypto_eth_set_ipv4_et(out_buf, eth_len - 2);
-    atomic_fetch_add(&g_l2pqc_join_ok, 1);
-    /* #region agent log */
-    agent_dbg_l2pqc("H1", "pqc_l2_option.c:opt_emit_join",
-                    "join_ok_copy", 0, entry->pkt_id, *out_len,
-                    tls_pair ? ne_pool_free_count(tls_pair) : 0);
-    if ((tls_agent_log_budget & 0x3Fu) == 1u)
-        fprintf(stderr,
-                "[L2-PQC] join_ok_copy pkt_id=%u out_len=%u pool_free=%u\n",
-                entry->pkt_id, *out_len,
-                tls_pair ? ne_pool_free_count(tls_pair) : 0u);
-    /* #endregion */
     opt_clear_entry(entry);
     return 1;
 }
