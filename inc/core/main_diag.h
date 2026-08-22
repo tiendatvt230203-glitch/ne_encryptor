@@ -19,9 +19,10 @@ void main_diag_log_dataplane_ready(struct forwarder *fwd);
 /* [NE-KEY] when KEY_SLOT_CURRENT is loaded for a policy (CTR/GCM). */
 void main_diag_log_ne_policy_key(int policy_index, int db_id);
 
-/* [NE-KEY] PQC: only when HS ready (peers share PQC key) and local NE==PQC.
- * Call after keys are copied into the NE ctx — not on dataplane traffic. */
+/* [NE-KEY] table: only HS-ok + local NE==PQC rows. Upsert then reprint table. */
 void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
                                 const uint8_t ne_key[32]);
+/* Drop row when HS fails / NE key wiped (optional table refresh). */
+void main_diag_ne_pqc_clear(int profile_id, int policy_id);
 
 #endif

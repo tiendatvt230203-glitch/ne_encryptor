@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,16 +10,17 @@
 #include "../../../inc/crypto/pqc_handshake.h"
 
 #define DIAG_KEY_PREFIX_LEN 9
-#define NE_PQC_LOG_SLOTS    64
+#define NE_PQC_TBL_SLOTS    64
 
 typedef struct {
     int profile_id;
     int policy_id;
-    uint8_t traffic_prefix[4];
+    uint8_t key_prefix[4];
     int valid;
-} ne_pqc_log_slot_t;
+} ne_pqc_tbl_row_t;
 
-static ne_pqc_log_slot_t ne_pqc_log_cache[NE_PQC_LOG_SLOTS];
+static ne_pqc_tbl_row_t ne_pqc_tbl[NE_PQC_TBL_SLOTS];
+static pthread_mutex_t ne_pqc_tbl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int key_prefix_nonzero(const uint8_t *key, size_t len)
 {
@@ -76,52 +78,57 @@ static void key_prefix_hex(char *out, size_t outsz, const uint8_t *key)
     snprintf(out, outsz, "%02X%02X%02X%02X", key[0], key[1], key[2], key[3]);
 }
 
-static int ne_pqc_log_already_seen(int profile_id, int policy_id, const uint8_t *traffic_key)
+static void ne_pqc_tbl_hline(void)
 {
-    for (int i = 0; i < NE_PQC_LOG_SLOTS; i++) {
-        if (!ne_pqc_log_cache[i].valid)
-            continue;
-        if (ne_pqc_log_cache[i].profile_id != profile_id ||
-            ne_pqc_log_cache[i].policy_id != policy_id)
-            continue;
-        if (memcmp(ne_pqc_log_cache[i].traffic_prefix, traffic_key, 4) == 0)
-            return 1;
-    }
-    return 0;
+    fprintf(stderr,
+            "+----------+----------+----------+----------+\n");
 }
 
-static void ne_pqc_log_remember(int profile_id, int policy_id, const uint8_t *traffic_key)
+/* Caller holds ne_pqc_tbl_lock. Only MATCH rows (HS ok + NE==PQC). */
+static void ne_pqc_tbl_print_locked(const char *event)
 {
-    int slot = -1;
+    int printed = 0;
 
-    for (int i = 0; i < NE_PQC_LOG_SLOTS; i++) {
-        if (!ne_pqc_log_cache[i].valid) {
-            slot = i;
-            break;
-        }
+    fprintf(stderr, "\n  [ne-key] processing: %s\n", event ? event : "update");
+    ne_pqc_tbl_hline();
+    fprintf(stderr,
+            "| %-8s | %-8s | %-8s | %-8s |\n",
+            "profile", "policy", "ne", "pqc_hs");
+    ne_pqc_tbl_hline();
+
+    for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
+        char px[DIAG_KEY_PREFIX_LEN];
+
+        if (!ne_pqc_tbl[i].valid)
+            continue;
+        key_prefix_hex(px, sizeof(px), ne_pqc_tbl[i].key_prefix);
+        /* ne == pqc_hs by construction — same prefix both columns for peer compare */
+        fprintf(stderr,
+                "| %-8d | %-8d | %-8s | %-8s |\n",
+                ne_pqc_tbl[i].profile_id,
+                ne_pqc_tbl[i].policy_id,
+                px, px);
+        printed++;
     }
-    if (slot < 0)
-        slot = (profile_id ^ policy_id ^ traffic_key[0]) % NE_PQC_LOG_SLOTS;
 
-    ne_pqc_log_cache[slot].profile_id = profile_id;
-    ne_pqc_log_cache[slot].policy_id = policy_id;
-    memcpy(ne_pqc_log_cache[slot].traffic_prefix, traffic_key, 4);
-    ne_pqc_log_cache[slot].valid = 1;
+    if (!printed)
+        fprintf(stderr,
+                "| %-8s | %-8s | %-8s | %-8s |\n",
+                "-", "-", "-", "-");
+    ne_pqc_tbl_hline();
+    fflush(stderr);
 }
 
 /*
- * Log only when:
- *   - PQC HS key is ready (diversify ok ⇒ both peers finished HS with same secret)
- *   - local NE CURRENT key == that PQC HS key
- * Then NE keys on both devices for this policy will match (each side copies PQC→NE).
- * One-shot per (profile, policy, key prefix). Do not call from traffic path.
+ * Upsert MATCH row and reprint table (like MAC table updates).
+ * Only when diversify ok (peers share PQC) and local NE == PQC.
  */
 void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
                                 const uint8_t ne_key[32])
 {
     uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
-    char ne_px[DIAG_KEY_PREFIX_LEN];
-    char hs_px[DIAG_KEY_PREFIX_LEN];
+    int slot = -1;
+    int changed = 0;
 
     if (!ne_key || !key_prefix_nonzero(ne_key, 4))
         return;
@@ -131,17 +138,66 @@ void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
         return;
     if (memcmp(ne_key, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
         return;
-    if (ne_pqc_log_already_seen(profile_id, policy_id, ne_key))
+
+    pthread_mutex_lock(&ne_pqc_tbl_lock);
+
+    for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
+        if (!ne_pqc_tbl[i].valid)
+            continue;
+        if (ne_pqc_tbl[i].profile_id == profile_id &&
+            ne_pqc_tbl[i].policy_id == policy_id) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
+            if (!ne_pqc_tbl[i].valid) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0)
+        slot = (profile_id ^ policy_id) % NE_PQC_TBL_SLOTS;
+
+    if (!ne_pqc_tbl[slot].valid ||
+        ne_pqc_tbl[slot].profile_id != profile_id ||
+        ne_pqc_tbl[slot].policy_id != policy_id ||
+        memcmp(ne_pqc_tbl[slot].key_prefix, ne_key, 4) != 0)
+        changed = 1;
+
+    ne_pqc_tbl[slot].profile_id = profile_id;
+    ne_pqc_tbl[slot].policy_id = policy_id;
+    memcpy(ne_pqc_tbl[slot].key_prefix, ne_key, 4);
+    ne_pqc_tbl[slot].valid = 1;
+
+    if (changed)
+        ne_pqc_tbl_print_locked("match");
+
+    pthread_mutex_unlock(&ne_pqc_tbl_lock);
+}
+
+void main_diag_ne_pqc_clear(int profile_id, int policy_id)
+{
+    int removed = 0;
+
+    if (profile_id <= 0 || policy_id <= 0)
         return;
 
-    key_prefix_hex(ne_px, sizeof(ne_px), ne_key);
-    key_prefix_hex(hs_px, sizeof(hs_px), hs_key);
-    fprintf(stderr,
-            "[NE-KEY] profile=%d policy_id=%d ne=%s pqc_hs=%s MATCH "
-            "(pqc peers aligned, local ne==pqc)\n",
-            profile_id, policy_id, ne_px, hs_px);
-    fflush(stderr);
-    ne_pqc_log_remember(profile_id, policy_id, ne_key);
+    pthread_mutex_lock(&ne_pqc_tbl_lock);
+    for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
+        if (!ne_pqc_tbl[i].valid)
+            continue;
+        if (ne_pqc_tbl[i].profile_id == profile_id &&
+            ne_pqc_tbl[i].policy_id == policy_id) {
+            ne_pqc_tbl[i].valid = 0;
+            removed = 1;
+        }
+    }
+    if (removed)
+        ne_pqc_tbl_print_locked("clear");
+    pthread_mutex_unlock(&ne_pqc_tbl_lock);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {

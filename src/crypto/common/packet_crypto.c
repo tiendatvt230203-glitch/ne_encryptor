@@ -44,6 +44,8 @@ static void pqc_clear_ctx_keys(struct packet_crypto_ctx *ctx)
 {
     if (!ctx)
         return;
+    if (ctx->pqc_from_handshake && ctx->profile_id > 0 && ctx->policy_id > 0)
+        main_diag_ne_pqc_clear(ctx->profile_id, ctx->policy_id);
     memset(ctx->keys, 0, sizeof(ctx->keys));
 }
 
