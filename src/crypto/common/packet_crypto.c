@@ -1,6 +1,7 @@
 #include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/crypto/traffic_crypto.h"
 #include "../../../inc/core/config.h"
+#include "../../../inc/core/main_diag.h"
 
 #include <openssl/hmac.h>
 #include <stdatomic.h>
@@ -66,6 +67,8 @@ static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
     memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
+    main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
+                               ctx->keys[KEY_SLOT_CURRENT]);
 }
 
 uint32_t packet_crypto_next_counter(void)
@@ -103,6 +106,8 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
     memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
+    main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
+                               ctx->keys[KEY_SLOT_CURRENT]);
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx, const uint8_t master_key[AES_MAX_KEY_SIZE],

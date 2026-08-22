@@ -31,7 +31,6 @@
 #define MAX_ACTIVE_PROFILE_IDS 32
 
 static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_service_restart_requested = 0;
 static volatile sig_atomic_t g_stop_logged = 0;
 static volatile sig_atomic_t g_stop_signal_count = 0;
 
@@ -59,23 +58,20 @@ static int parse_notify_profile_id(const char *payload) {
     return (int)v;
 }
 
-/* Payload: "123" | "load:123" | "del:123". Bare id = load intent (never delete). */
-static int parse_notify_profile_cmd(const char *payload, int *out_id, int *out_is_delete)
+/* Payload: "123" | "load:123" | "del:123" — only the id matters; action from DB+active. */
+static int parse_notify_profile_cmd(const char *payload, int *out_id)
 {
     const char *p = payload;
 
-    if (!out_id || !out_is_delete)
+    if (!out_id)
         return -1;
     *out_id = -1;
-    *out_is_delete = 0;
     if (!p || !*p)
         return -1;
-    if (!strncmp(p, "del:", 4)) {
-        *out_is_delete = 1;
+    if (!strncmp(p, "del:", 4))
         p += 4;
-    } else if (!strncmp(p, "load:", 5)) {
+    else if (!strncmp(p, "load:", 5))
         p += 5;
-    }
     *out_id = parse_notify_profile_id(p);
     return (*out_id > 0) ? 0 : -1;
 }
@@ -95,13 +91,12 @@ static void usage(const char *prog) {
             "  %s               # daemon (passive LISTEN %s; no auto DB load)\n"
             "  %s -gi            # generate new identity key and load into RAM\n"
             "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
-            "  %s -id <ID>       # load/apply profile (create or edit) — notify load:<ID>\n"
-            "  %s -del <ID>      # delete profile — notify del:<ID>, daemon back to blank\n"
+            "  %s -id <ID>       # load/apply profile (create or edit)\n"
             "  %s -di <wan_if>   # notify daemon: hard-detach WAN from bonding/profile\n"
             "  %s -ai <wan_if>   # notify daemon: hot-add WAN back into bonding/profile\n"
             "  %s -check [ID]    # check database config consistency\n"
             "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -115,50 +110,43 @@ static int parse_profile_id_token(const char *token, int *out_id) {
     return 0;
 }
 
-/* Parse -id / -del. out_is_delete: 0=load, 1=delete. out_id=-1 if neither. */
-static int parse_profile_cli(int argc, char **argv, int *out_id, int *out_is_delete) {
+static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
     *out_id = -1;
-    *out_is_delete = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        int is_del = 0;
-        const char *val = NULL;
 
         if (strcmp(arg, "-id") == 0) {
-            is_del = 0;
+            if (*out_id >= 0) {
+                fprintf(stderr, "[FATAL] -id specified more than once\n");
+                return -1;
+            }
             if (i + 1 >= argc) {
                 fprintf(stderr, "[FATAL] -id requires ne_profiles.id\n");
                 return -1;
             }
-            val = argv[++i];
-        } else if (strncmp(arg, "-id=", 4) == 0) {
-            is_del = 0;
-            val = arg + 4;
-        } else if (strcmp(arg, "-del") == 0) {
-            is_del = 1;
-            if (i + 1 >= argc) {
-                fprintf(stderr, "[FATAL] -del requires ne_profiles.id\n");
+            if (parse_profile_id_token(argv[++i], out_id) != 0) {
+                fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", argv[i]);
                 return -1;
             }
-            val = argv[++i];
-        } else if (strncmp(arg, "-del=", 5) == 0) {
-            is_del = 1;
-            val = arg + 5;
-        } else {
-            fprintf(stderr, "[FATAL] unknown option: %s\n", arg);
-            return -1;
+            continue;
         }
 
-        if (*out_id >= 0) {
-            fprintf(stderr, "[FATAL] -id/-del specified more than once\n");
-            return -1;
+        if (strncmp(arg, "-id=", 4) == 0) {
+            if (*out_id >= 0) {
+                fprintf(stderr, "[FATAL] -id specified more than once\n");
+                return -1;
+            }
+            const char *id_str = arg + 4;
+            if (parse_profile_id_token(id_str, out_id) != 0) {
+                fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", id_str);
+                return -1;
+            }
+            continue;
         }
-        if (parse_profile_id_token(val, out_id) != 0) {
-            fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", val);
-            return -1;
-        }
-        *out_is_delete = is_del;
+
+        fprintf(stderr, "[FATAL] unknown option: %s\n", arg);
+        return -1;
     }
     return 0;
 }
@@ -201,7 +189,7 @@ static int libbpf_print_silent(enum libbpf_print_level level,
     return 0;
 }
 
-static int notify_profile_cmd(int profile_id, int is_delete)
+static int notify_profile_load(int profile_id)
 {
     struct ne_postgres_conn pg;
     if (ne_postgres_conn_fill(&pg) != 0)
@@ -215,10 +203,7 @@ static int notify_profile_cmd(int profile_id, int is_delete)
     }
 
     char sql[128];
-    if (is_delete)
-        snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', 'del:%d')", NOTIFY_CHANNEL, profile_id);
-    else
-        snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', 'load:%d')", NOTIFY_CHANNEL, profile_id);
+    snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', 'load:%d')", NOTIFY_CHANNEL, profile_id);
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "[ERR] pg_notify failed: %s", PQerrorMessage(conn));
@@ -844,12 +829,14 @@ static const char *g_prog_name = "network-encryptor";
 static void daemon_idle_log(void)
 {
     fprintf(stderr,
-            "[DAEMON] listening %s + %s — use %s -id <id> | -del <id> | -di <wan> | -ai <wan>\n",
+            "[DAEMON] listening %s + %s — use %s -id <id> | -di <wan> | -ai <wan>\n",
             NOTIFY_CHANNEL, WAN_ADMIN_CHANNEL, g_prog_name);
     fflush(stderr);
 }
 
-/* Stop dataplane + wipe runtime + exit → systemd Restart=always = idle trắng. */
+/*
+ * Stop dataplane, wipe runtime, stay idle (same process — keep LISTEN).
+ */
 static void return_to_blank_daemon(struct runtime_state *rt, int *active_id_count)
 {
     if (active_id_count)
@@ -858,43 +845,42 @@ static void return_to_blank_daemon(struct runtime_state *rt, int *active_id_coun
         (void)runtime_stop_forwarder(rt);
     if (rt)
         memset(rt, 0, sizeof(*rt));
-    g_service_restart_requested = 1;
-    g_stop_requested = 1;
+    daemon_idle_log();
 }
 
+/*
+ * Hard rules:
+ *   1) có trong DB     → LOAD (BE tạo/sửa xong mới notify)
+ *   2) không có trong DB → DELETE → idle daemon (BE xóa rồi notify id đó)
+ */
 static int handle_profile_notify(struct runtime_state *rt,
                                  int *active_ids,
                                  int *active_id_count,
-                                 int profile_id,
-                                 int is_delete) {
+                                 int profile_id) {
     if (g_stop_requested)
         return 0;
 
-    /* -del only: stop + blank. Never treat load miss as delete. */
-    if (is_delete) {
-        return_to_blank_daemon(rt, active_id_count);
+    if (ne_profile_id_exists(profile_id) == 0) {
+        if (*active_id_count >= 1 && active_ids[0] != profile_id) {
+            fprintf(stderr,
+                    "[ERR] reject load %d — profile %d already active\n",
+                    profile_id, active_ids[0]);
+            fflush(stderr);
+            return -1;
+        }
+        if (load_profile_and_run(rt, active_ids, active_id_count, profile_id) != 0) {
+            fprintf(stderr, "[ERR] load profile %d failed\n", profile_id);
+            fflush(stderr);
+            return -1;
+        }
         return 0;
     }
 
-    if (*active_id_count >= 1 && active_ids[0] != profile_id) {
-        fprintf(stderr,
-                "[ERR] reject load %d — profile %d already active\n",
-                profile_id, active_ids[0]);
-        fflush(stderr);
-        return -1;
-    }
-
-    if (load_profile_and_run(rt, active_ids, active_id_count, profile_id) != 0) {
-        fprintf(stderr,
-                "[ERR] load profile %d failed (DB not ready or config error) — "
-                "daemon stays up; retry -id after commit\n",
-                profile_id);
-        fflush(stderr);
-        *active_id_count = 0;
-        if (rt->has_thread)
-            (void)runtime_stop_forwarder(rt);
-        return -1;
-    }
+    fprintf(stderr,
+            "[DELETE] profile %d not in DB — idle\n",
+            profile_id);
+    fflush(stderr);
+    return_to_blank_daemon(rt, active_id_count);
     return 0;
 }
 
@@ -942,8 +928,7 @@ int main(int argc, char **argv) {
     }
 
     int profile_id = -1;
-    int is_delete = 0;
-    if (parse_profile_cli(argc, argv, &profile_id, &is_delete) != 0) {
+    if (parse_startup_profile_id(argc, argv, &profile_id) != 0) {
         usage(argv[0]);
         return 1;
     }
@@ -953,11 +938,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
             return 1;
         }
-        /* -id → always load; -del → always del. No DB guessing. */
-        if (notify_profile_cmd(profile_id, is_delete) != 0)
+        /* -id = load/edit only. Never guess delete from DB miss. */
+        if (notify_profile_load(profile_id) != 0)
             return 1;
-        fprintf(stderr, "[NOTIFY] sent %s:%d\n",
-                is_delete ? "del" : "load", profile_id);
+        fprintf(stderr, "[NOTIFY] sent load:%d\n", profile_id);
         return 0;
     }
 
@@ -1054,18 +1038,14 @@ int main(int argc, char **argv) {
                 (void)handle_wan_admin_notify(rt, notify->extra);
             } else {
                 int id = -1;
-                int is_delete = 0;
-                if (parse_notify_profile_cmd(notify->extra, &id, &is_delete) != 0) {
+                if (parse_notify_profile_cmd(notify->extra, &id) != 0) {
                     fprintf(stderr,
-                            "[WARN] ignoring NOTIFY with invalid payload: \"%s\" "
-                            "(want <id>|load:<id>|del:<id>)\n",
+                            "[WARN] ignoring NOTIFY with invalid payload: \"%s\"\n",
                             notify->extra ? notify->extra : "");
                 } else {
-                    fprintf(stderr, "\n[NOTIFY] %s profile %d\n",
-                            is_delete ? "del" : "load", id);
+                    fprintf(stderr, "\n[NOTIFY] profile %d\n", id);
                     fflush(stderr);
-                    (void)handle_profile_notify(rt, active_ids, &active_id_count,
-                                                id, is_delete);
+                    (void)handle_profile_notify(rt, active_ids, &active_id_count, id);
                 }
             }
             PQfreemem(notify);
@@ -1084,7 +1064,5 @@ int main(int argc, char **argv) {
     free(rt);
     PQfinish(listen_conn);
     trf_pqc_cleanup();
-    /* Restart=always → process mới in [DAEMON] listening (idle trắng). */
-    (void)g_service_restart_requested;
     return 0;
 }

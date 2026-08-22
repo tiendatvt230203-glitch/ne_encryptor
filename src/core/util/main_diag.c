@@ -109,44 +109,39 @@ static void ne_pqc_log_remember(int profile_id, int policy_id, const uint8_t *tr
     ne_pqc_log_cache[slot].valid = 1;
 }
 
-void main_diag_log_ne_pqc_traffic_key(int profile_id, int policy_id,
-                                      const uint8_t traffic_key[32])
+/*
+ * Log only when:
+ *   - PQC HS key is ready (diversify ok ⇒ both peers finished HS with same secret)
+ *   - local NE CURRENT key == that PQC HS key
+ * Then NE keys on both devices for this policy will match (each side copies PQC→NE).
+ * One-shot per (profile, policy, key prefix). Do not call from traffic path.
+ */
+void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
+                                const uint8_t ne_key[32])
 {
     uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
-    char traffic_px[DIAG_KEY_PREFIX_LEN];
+    char ne_px[DIAG_KEY_PREFIX_LEN];
     char hs_px[DIAG_KEY_PREFIX_LEN];
-    int hs_ok;
 
-    if (!traffic_key || !key_prefix_nonzero(traffic_key, 4))
+    if (!ne_key || !key_prefix_nonzero(ne_key, 4))
         return;
-    /* ARP bridge uses profile_id=0 policy_id=0 — not PQC policy traffic. */
     if (profile_id <= 0 || policy_id <= 0)
         return;
-    if (ne_pqc_log_already_seen(profile_id, policy_id, traffic_key))
+    if (sig_pqc_diversify_key(profile_id, policy_id, hs_key) != 0)
+        return;
+    if (memcmp(ne_key, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
+        return;
+    if (ne_pqc_log_already_seen(profile_id, policy_id, ne_key))
         return;
 
-    key_prefix_hex(traffic_px, sizeof(traffic_px), traffic_key);
-    hs_ok = (sig_pqc_diversify_key(profile_id, policy_id, hs_key) == 0);
-    if (hs_ok)
-        key_prefix_hex(hs_px, sizeof(hs_px), hs_key);
-    else
-        snprintf(hs_px, sizeof(hs_px), "--------");
-
-    if (hs_ok && memcmp(traffic_key, hs_key, PQC_TRAFFIC_KEY_SZ) == 0) {
-        fprintf(stderr,
-                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s MATCH\n",
-                profile_id, policy_id, traffic_px, hs_px);
-    } else if (hs_ok) {
-        fprintf(stderr,
-                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s MISMATCH\n",
-                profile_id, policy_id, traffic_px, hs_px);
-    } else {
-        fprintf(stderr,
-                "[NE-KEY] profile=%d policy_id=%d traffic=%s pqc_hs=%s PQC_NOT_READY\n",
-                profile_id, policy_id, traffic_px, hs_px);
-    }
+    key_prefix_hex(ne_px, sizeof(ne_px), ne_key);
+    key_prefix_hex(hs_px, sizeof(hs_px), hs_key);
+    fprintf(stderr,
+            "[NE-KEY] profile=%d policy_id=%d ne=%s pqc_hs=%s MATCH "
+            "(pqc peers aligned, local ne==pqc)\n",
+            profile_id, policy_id, ne_px, hs_px);
     fflush(stderr);
-    ne_pqc_log_remember(profile_id, policy_id, traffic_key);
+    ne_pqc_log_remember(profile_id, policy_id, ne_key);
 }
 
 void main_diag_log_no_update(int trigger_profile_id, const struct app_config *cfg) {
