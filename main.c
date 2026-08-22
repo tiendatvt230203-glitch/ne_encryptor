@@ -58,7 +58,6 @@ static int parse_notify_profile_id(const char *payload) {
     return (int)v;
 }
 
-/* Payload: "123" | "load:123" | "del:123" — only the id matters; action from DB+active. */
 static int parse_notify_profile_cmd(const char *payload, int *out_id)
 {
     const char *p = payload;
@@ -151,34 +150,6 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
     return 0;
 }
 
-
-static int active_ids_add(int *active_ids, int *active_id_count, int id) {
-    for (int i = 0; i < *active_id_count; i++) {
-        if (active_ids[i] == id)
-            return 0;
-    }
-    if (*active_id_count >= MAX_ACTIVE_PROFILE_IDS) {
-        fprintf(stderr, "[WARN] active profile set is full, ignoring id=%d\n", id);
-        return -1;
-    }
-    active_ids[(*active_id_count)++] = id;
-    return 1;
-}
-
-static int active_ids_remove(int *active_ids, int *active_id_count, int id) {
-    int w = 0;
-    int removed = 0;
-
-    for (int i = 0; i < *active_id_count; i++) {
-        if (active_ids[i] == id) {
-            removed = 1;
-            continue;
-        }
-        active_ids[w++] = active_ids[i];
-    }
-    *active_id_count = w;
-    return removed;
-}
 
 static int libbpf_print_silent(enum libbpf_print_level level,
                                const char *format,
@@ -787,40 +758,14 @@ static int load_profile_and_run(struct runtime_state *rt,
                                 int *active_ids,
                                 int *active_id_count,
                                 int profile_id) {
-    if (!rt->has_thread)
-        *active_id_count = 0;
+    int load_ids[1];
 
-
-    if (*active_id_count > 1) {
-        fprintf(stderr,
-                "[VALIDATE] REJECT: %d profiles in active set — single-profile mode "
-                "allows exactly 1 (ids:",
-                *active_id_count);
-        for (int i = 0; i < *active_id_count; i++)
-            fprintf(stderr, " %d", active_ids[i]);
-        fprintf(stderr, "). Stop dataplane / delete extras first.\n");
-        fflush(stderr);
-        return -1;
-    }
-    if (*active_id_count == 1 && active_ids[0] != profile_id) {
-        fprintf(stderr,
-                "[VALIDATE] REJECT: cannot load profile %d — profile %d already running "
-                "(single-profile mode). Delete/stop profile %d first, then create/load "
-                "the new one (daemon stays up; dataplane will restart).\n",
-                profile_id, active_ids[0], active_ids[0]);
-        fflush(stderr);
-        return -1;
-    }
-
-    int added = active_ids_add(active_ids, active_id_count, profile_id);
-    if (added < 0)
+    load_ids[0] = profile_id;
+    if (apply_active_configs(rt, load_ids, 1, profile_id) != 0)
         return -1;
 
-    if (apply_active_configs(rt, active_ids, *active_id_count, profile_id) != 0) {
-        if (added == 1)
-            active_ids_remove(active_ids, active_id_count, profile_id);
-        return -1;
-    }
+    active_ids[0] = profile_id;
+    *active_id_count = 1;
     return 0;
 }
 
@@ -834,25 +779,26 @@ static void daemon_idle_log(void)
     fflush(stderr);
 }
 
-/*
- * Stop dataplane, wipe runtime, stay idle (same process — keep LISTEN).
- */
-static void return_to_blank_daemon(struct runtime_state *rt, int *active_id_count)
+static void return_to_blank_daemon(struct runtime_state *rt,
+                                   int *active_ids,
+                                   int *active_id_count)
 {
     if (active_id_count)
         *active_id_count = 0;
+    if (active_ids)
+        memset(active_ids, 0, sizeof(int) * MAX_ACTIVE_PROFILE_IDS);
+
     if (rt && rt->has_thread)
         (void)runtime_stop_forwarder(rt);
+
+    forwarder_clear_stop();
+
     if (rt)
         memset(rt, 0, sizeof(*rt));
+
     daemon_idle_log();
 }
 
-/*
- * Hard rules:
- *   1) có trong DB     → LOAD (BE tạo/sửa xong mới notify)
- *   2) không có trong DB → DELETE → idle daemon (BE xóa rồi notify id đó)
- */
 static int handle_profile_notify(struct runtime_state *rt,
                                  int *active_ids,
                                  int *active_id_count,
@@ -860,27 +806,33 @@ static int handle_profile_notify(struct runtime_state *rt,
     if (g_stop_requested)
         return 0;
 
-    if (ne_profile_id_exists(profile_id) == 0) {
-        if (*active_id_count >= 1 && active_ids[0] != profile_id) {
-            fprintf(stderr,
-                    "[ERR] reject load %d — profile %d already active\n",
-                    profile_id, active_ids[0]);
-            fflush(stderr);
-            return -1;
-        }
-        if (load_profile_and_run(rt, active_ids, active_id_count, profile_id) != 0) {
-            fprintf(stderr, "[ERR] load profile %d failed\n", profile_id);
-            fflush(stderr);
-            return -1;
-        }
+    if (ne_profile_id_exists(profile_id) != 0) {
+        fprintf(stderr,
+                "[FAIL] profile id=%d not found in DB — load aborted\n",
+                profile_id);
+        fflush(stderr);
+        return_to_blank_daemon(rt, active_ids, active_id_count);
         return 0;
     }
 
-    fprintf(stderr,
-            "[DELETE] profile %d not in DB — idle\n",
-            profile_id);
-    fflush(stderr);
-    return_to_blank_daemon(rt, active_id_count);
+    if ((*active_id_count >= 1 && active_ids[0] != profile_id) ||
+        (rt->has_thread && *active_id_count == 0)) {
+        int old_id = (*active_id_count >= 1) ? active_ids[0] : -1;
+        fprintf(stderr,
+                "[LOAD] replace profile %d → %d (clear old, then load)\n",
+                old_id, profile_id);
+        fflush(stderr);
+        return_to_blank_daemon(rt, active_ids, active_id_count);
+    }
+
+    if (load_profile_and_run(rt, active_ids, active_id_count, profile_id) != 0) {
+        fprintf(stderr,
+                "[FAIL] load profile id=%d failed — load aborted\n",
+                profile_id);
+        fflush(stderr);
+        return_to_blank_daemon(rt, active_ids, active_id_count);
+        return -1;
+    }
     return 0;
 }
 
@@ -938,7 +890,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
             return 1;
         }
-        /* -id = load/edit only. Never guess delete from DB miss. */
         if (notify_profile_load(profile_id) != 0)
             return 1;
         fprintf(stderr, "[NOTIFY] sent load:%d\n", profile_id);
@@ -996,7 +947,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int active_ids[MAX_ACTIVE_PROFILE_IDS];
+    int active_ids[MAX_ACTIVE_PROFILE_IDS] = {0};
     int active_id_count = 0;
 
     while (!g_stop_requested) {
