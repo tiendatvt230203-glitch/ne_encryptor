@@ -791,7 +791,11 @@ static void return_to_blank_daemon(struct runtime_state *rt,
     if (rt && rt->has_thread)
         (void)runtime_stop_forwarder(rt);
 
+    /* Tear down PQC bindings left from the deleted/previous profile. */
+    sig_pqc_prepare_reload();
+    sig_pqc_finalize_reload();
     forwarder_clear_stop();
+    main_diag_ne_pqc_clear_all();
 
     if (rt)
         memset(rt, 0, sizeof(*rt));
@@ -815,12 +819,20 @@ static int handle_profile_notify(struct runtime_state *rt,
         return 0;
     }
 
-    if ((*active_id_count >= 1 && active_ids[0] != profile_id) ||
-        (rt->has_thread && *active_id_count == 0)) {
-        int old_id = (*active_id_count >= 1) ? active_ids[0] : -1;
+    if (rt->has_thread && *active_id_count == 0) {
+        fprintf(stderr,
+                "[LOAD] stale dataplane (thread without active profile) — reset to idle\n");
+        fflush(stderr);
+        return_to_blank_daemon(rt, active_ids, active_id_count);
+    } else if (rt->has_thread && !rt->running) {
+        fprintf(stderr,
+                "[LOAD] dataplane thread not running — reset to idle before load\n");
+        fflush(stderr);
+        return_to_blank_daemon(rt, active_ids, active_id_count);
+    } else if (*active_id_count >= 1 && active_ids[0] != profile_id) {
         fprintf(stderr,
                 "[LOAD] replace profile %d → %d (clear old, then load)\n",
-                old_id, profile_id);
+                active_ids[0], profile_id);
         fflush(stderr);
         return_to_blank_daemon(rt, active_ids, active_id_count);
     }

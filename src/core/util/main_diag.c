@@ -122,6 +122,7 @@ static void ne_pqc_tbl_print_locked(const char *event)
 /*
  * Upsert MATCH row and reprint table (like MAC table updates).
  * Only when diversify ok (peers share PQC) and local NE == PQC.
+ * Only the running profile stays in the table — drop other profiles.
  */
 void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
                                 const uint8_t ne_key[32])
@@ -144,11 +145,13 @@ void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
     for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
         if (!ne_pqc_tbl[i].valid)
             continue;
-        if (ne_pqc_tbl[i].profile_id == profile_id &&
-            ne_pqc_tbl[i].policy_id == policy_id) {
-            slot = i;
-            break;
+        if (ne_pqc_tbl[i].profile_id != profile_id) {
+            ne_pqc_tbl[i].valid = 0;
+            changed = 1;
+            continue;
         }
+        if (ne_pqc_tbl[i].policy_id == policy_id)
+            slot = i;
     }
     if (slot < 0) {
         for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
@@ -194,6 +197,22 @@ void main_diag_ne_pqc_clear(int profile_id, int policy_id)
             ne_pqc_tbl[i].valid = 0;
             removed = 1;
         }
+    }
+    if (removed)
+        ne_pqc_tbl_print_locked("clear");
+    pthread_mutex_unlock(&ne_pqc_tbl_lock);
+}
+
+void main_diag_ne_pqc_clear_all(void)
+{
+    int removed = 0;
+
+    pthread_mutex_lock(&ne_pqc_tbl_lock);
+    for (int i = 0; i < NE_PQC_TBL_SLOTS; i++) {
+        if (!ne_pqc_tbl[i].valid)
+            continue;
+        ne_pqc_tbl[i].valid = 0;
+        removed = 1;
     }
     if (removed)
         ne_pqc_tbl_print_locked("clear");

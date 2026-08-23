@@ -34,7 +34,10 @@ int load_ne_env(void) {
     }
 
     ne_sync_pgpassword();
-    fprintf(stderr, "[ENV] POSTGRES_* ready (from Vault " NE_VAULT_SECRET_PATH ")\n");
+    fprintf(stderr,
+            "[ENV] POSTGRES_* ready (from Vault " NE_VAULT_SECRET_PATH
+            "; NE_VAULT_DEBUG=%s)\n",
+            getenv("NE_VAULT_DEBUG") ? getenv("NE_VAULT_DEBUG") : "0");
     return 0;
 }
 

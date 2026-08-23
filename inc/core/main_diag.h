@@ -19,10 +19,12 @@ void main_diag_log_dataplane_ready(struct forwarder *fwd);
 /* [NE-KEY] when KEY_SLOT_CURRENT is loaded for a policy (CTR/GCM). */
 void main_diag_log_ne_policy_key(int policy_index, int db_id);
 
-/* [NE-KEY] table: only HS-ok + local NE==PQC rows. Upsert then reprint table. */
+/* [NE-KEY] table: only HS-ok + local NE==PQC rows for the running profile. */
 void main_diag_log_ne_pqc_match(int profile_id, int policy_id,
                                 const uint8_t ne_key[32]);
 /* Drop row when HS fails / NE key wiped (optional table refresh). */
 void main_diag_ne_pqc_clear(int profile_id, int policy_id);
+/* Wipe whole table (blank daemon / profile gone). */
+void main_diag_ne_pqc_clear_all(void);
 
 #endif

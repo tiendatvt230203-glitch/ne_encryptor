@@ -22,7 +22,11 @@ struct ne_vault_cfg {
     char k1[256];
     char k2[256];
     char k3[256];
+    int debug; /* 0/1: dump POSTGRES_* from Vault to stderr */
 };
+
+/* Effective debug flag after reading .env (compile default + NE_VAULT_DEBUG). */
+static int g_ne_vault_debug = NE_VAULT_DEBUG_LOG;
 
 static void strip_env_quotes(char *val)
 {
@@ -47,6 +51,7 @@ static int ne_vault_key_allowed(const char *key)
         "UNSEAL_KEY_1",
         "UNSEAL_KEY_2",
         "UNSEAL_KEY_3",
+        "NE_VAULT_DEBUG", /* 0|1 dump DB secrets from Vault */
         NULL
     };
 
@@ -106,6 +111,7 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->port = 8200;
+    cfg->debug = NE_VAULT_DEBUG_LOG;
     strncpy(cfg->host, "127.0.0.1", sizeof(cfg->host) - 1);
 
     fp = fopen(NE_ENV_FILE, "r");
@@ -163,9 +169,14 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
             strncpy(cfg->k2, val, sizeof(cfg->k2) - 1);
         else if (strcmp(key, "UNSEAL_KEY_3") == 0)
             strncpy(cfg->k3, val, sizeof(cfg->k3) - 1);
+        else if (strcmp(key, "NE_VAULT_DEBUG") == 0)
+            cfg->debug = (val[0] == '1') ? 1 : 0;
     }
 
     fclose(fp);
+
+    g_ne_vault_debug = cfg->debug ? 1 : 0;
+    setenv("NE_VAULT_DEBUG", g_ne_vault_debug ? "1" : "0", 1);
 
     if (cfg->addr[0])
         setenv("VAULT_ADDR", cfg->addr, 1);
@@ -174,10 +185,11 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
 
     fprintf(stderr,
             "[VAULT] config from " NE_ENV_FILE
-            " (addr=%s unseal_keys=%d token=%s)\n",
+            " (addr=%s unseal_keys=%d token=%s debug=%d)\n",
             cfg->addr[0] ? cfg->addr : "-",
             (cfg->k1[0] ? 1 : 0) + (cfg->k2[0] ? 1 : 0) + (cfg->k3[0] ? 1 : 0),
-            cfg->token[0] ? "set" : "missing");
+            cfg->token[0] ? "set" : "missing",
+            g_ne_vault_debug);
 
     return 0;
 }
@@ -377,50 +389,27 @@ static int ne_vault_kv_apply_from_json(const char *json)
     return loaded;
 }
 
-static int ne_vault_value_needs_quotes(const char *key)
-{
-    if (!key)
-        return 1;
-    if (strcmp(key, "LISTEN_PORT") == 0 || strcmp(key, "POSTGRES_PORT") == 0)
-        return 0;
-    return 1;
-}
-
-static void ne_vault_log_kv(const char *key, const char *val)
-{
-#if NE_VAULT_DEBUG_LOG
-    if (!key || !val)
-        return;
-    if (ne_vault_value_needs_quotes(key))
-        fprintf(stderr, "%s=\"%s\"\n", key, val);
-    else
-        fprintf(stderr, "%s=%s\n", key, val);
-#else
-    (void)key;
-    (void)val;
-#endif
-}
-
 static void ne_vault_log_loaded_secrets(void)
 {
-#if NE_VAULT_DEBUG_LOG
-    static const char *order[] = {
-        "LISTEN_PORT",
-        "POSTGRES_DB",
-        "POSTGRES_PASSWORD",
-        "POSTGRES_PORT",
-        "POSTGRES_SERVER",
-        "POSTGRES_USER",
-        NULL
-    };
+    const char *db = getenv("POSTGRES_DB");
+    const char *pass = getenv("POSTGRES_PASSWORD");
+    const char *port = getenv("POSTGRES_PORT");
+    const char *user = getenv("POSTGRES_USER");
 
-    fprintf(stderr, "[VAULT] secrets from " NE_VAULT_SECRET_PATH ":\n");
-    for (int i = 0; order[i]; i++) {
-        const char *v = getenv(order[i]);
-        if (v && v[0])
-            ne_vault_log_kv(order[i], v);
-    }
-#endif
+    if (!g_ne_vault_debug)
+        return;
+
+    fprintf(stderr,
+            "[VAULT-DEBUG] DB from Vault " NE_VAULT_SECRET_PATH ":\n"
+            "  \"POSTGRES_DB\": \"%s\",\n"
+            "  \"POSTGRES_PASSWORD\": \"%s\",\n"
+            "  \"POSTGRES_PORT\": \"%s\",\n"
+            "  \"POSTGRES_USER\": \"%s\",\n",
+            (db && db[0]) ? db : "",
+            (pass && pass[0]) ? pass : "",
+            (port && port[0]) ? port : "",
+            (user && user[0]) ? user : "");
+    fflush(stderr);
 }
 
 static void ne_vault_kv_api_path(char *out, size_t outsz)

@@ -250,6 +250,8 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     active_policy_count = 0;
     crypto_runtime_reset_indexes();
     memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
+    /* Drop key rows from deleted/previous profiles before rebuilding. */
+    main_diag_ne_pqc_clear_all();
 
     if (!cfg || !cfg->crypto_enabled) {
         arp_bridge_reload_policies(cfg);

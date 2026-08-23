@@ -615,7 +615,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             policy_key_binding_t *b = &g_policy_bindings[i];
             if (msg->msg_type == PQC_HS_MSG_POKE) {
                 b->handshake_give_up = false;
-                b->handshake_start_time = 0;
+                b->handshake_start_time = get_time_ms_hs();
                 b->rotation_give_up = false;
                 b->rotation_start_time = 0;
                 b->giveup_logged = false;
@@ -629,7 +629,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
                 if (b->handshake_give_up) {
                     b->handshake_give_up = false;
-                    b->handshake_start_time = 0;
+                    b->handshake_start_time = get_time_ms_hs();
                     b->rotation_give_up = false;
                     b->rotation_start_time = 0;
                     b->giveup_logged = false;
@@ -1911,7 +1911,7 @@ void sig_pqc_trigger_retry(int policy_id) {
         if (g_policy_bindings[i].policy_id == policy_id) {
             policy_key_binding_t *b = &g_policy_bindings[i];
             b->handshake_give_up = false;
-            b->handshake_start_time = 0;
+            b->handshake_start_time = get_time_ms_hs();
             b->rotation_give_up = false;
             b->rotation_start_time = 0;
             b->key_ready = false;
@@ -1933,7 +1933,7 @@ int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_ma
         if (g_policy_bindings[i].policy_id == policy_id) {
             policy_key_binding_t *b = &g_policy_bindings[i];
             b->handshake_give_up = false;
-            b->handshake_start_time = 0;
+            b->handshake_start_time = get_time_ms_hs();
             b->rotation_give_up = false;
             b->rotation_start_time = 0;
             b->key_ready = false;
