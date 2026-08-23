@@ -333,10 +333,27 @@ static int ne_vault_json_extract_string(const char *json, const char *key,
     return i > 0 ? 0 : -1;
 }
 
+static int ne_vault_http_status(const char *response)
+{
+    const char *p;
+
+    if (!response)
+        return -1;
+    /* "HTTP/1.x NNN ..." */
+    p = strstr(response, "HTTP/");
+    if (!p)
+        return -1;
+    p = strchr(p, ' ');
+    if (!p)
+        return -1;
+    return atoi(p + 1);
+}
+
 static int ne_vault_http_unseal_key(const struct ne_vault_cfg *cfg, const char *key)
 {
     char payload[1024];
     char response[8192];
+    int status;
 
     if (!key || !key[0])
         return -1;
@@ -345,6 +362,13 @@ static int ne_vault_http_unseal_key(const struct ne_vault_cfg *cfg, const char *
     if (ne_vault_http_request(cfg, "POST", "/v1/sys/unseal", payload,
                               response, sizeof(response)) < 0) {
         fprintf(stderr, "[VAULT] HTTP unseal request failed\n");
+        return -1;
+    }
+    status = ne_vault_http_status(response);
+    if (status == 400 || status == 500) {
+        fprintf(stderr,
+                "[VAULT] unseal rejected (HTTP %d) — UNSEAL_KEY likely wrong\n",
+                status);
         return -1;
     }
     return ne_vault_json_bool_false(response, "sealed") ? 0 : 1;
@@ -430,6 +454,7 @@ static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
     char *response;
     char api_path[128];
     int loaded;
+    int status;
     const char *body;
 
     response = malloc(NE_VAULT_HTTP_BUF);
@@ -448,20 +473,48 @@ static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
         }
     }
 
-    body = strchr(response, '\r');
+    status = ne_vault_http_status(response);
+    if (status == 401 || status == 403) {
+        fprintf(stderr,
+                "[VAULT] cannot read " NE_VAULT_SECRET_PATH
+                " (HTTP %d) — VAULT_TOKEN wrong or permission denied\n",
+                status);
+        free(response);
+        return -1;
+    }
+    if (status == 404) {
+        fprintf(stderr,
+                "[VAULT] secret path " NE_VAULT_SECRET_PATH
+                " not found (HTTP 404) — empty/missing in Vault\n");
+        free(response);
+        return -1;
+    }
+    if (status > 0 && (status < 200 || status >= 300)) {
+        fprintf(stderr,
+                "[VAULT] kv get " NE_VAULT_SECRET_PATH " failed (HTTP %d)\n",
+                status);
+        free(response);
+        return -1;
+    }
+
+    body = strstr(response, "\r\n\r\n");
     if (body)
-        body = strchr(body, '\n');
-    if (body)
-        body++;
-    else
-        body = response;
+        body += 4;
+    else {
+        body = strstr(response, "\n\n");
+        if (body)
+            body += 2;
+        else
+            body = response;
+    }
 
     loaded = ne_vault_kv_apply_from_json(body);
     free(response);
 
     if (loaded == 0) {
-        fprintf(stderr, "[VAULT] HTTP kv get " NE_VAULT_SECRET_PATH
-                " returned no POSTGRES_* fields\n");
+        fprintf(stderr,
+                "[VAULT] " NE_VAULT_SECRET_PATH
+                " empty — no POSTGRES_DB/PASSWORD/PORT/USER fields\n");
         return -1;
     }
     return 0;
@@ -551,12 +604,16 @@ int ne_vault_unseal_and_login(void)
     }
 
     if (!ne_vault_json_bool_false(response, "sealed")) {
-        fprintf(stderr, "[VAULT] warn: vault still sealed after unseal keys\n");
+        fprintf(stderr,
+                "[VAULT] still sealed after UNSEAL_KEY_1/2/3 — keys wrong or incomplete\n");
         fail = 1;
     }
 
-    if (fail)
+    if (fail) {
+        fprintf(stderr,
+                "[VAULT] unseal/login failed with keys+token from " NE_ENV_FILE "\n");
         return -1;
+    }
 
     fprintf(stderr, "[VAULT] unseal ok\n");
     return 0;

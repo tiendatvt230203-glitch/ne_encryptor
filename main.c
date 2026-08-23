@@ -863,14 +863,20 @@ int main(int argc, char **argv) {
 
     if (argc == 3 && strcmp(argv[1], "-di") == 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+            fprintf(stderr,
+                    "[FATAL] Vault/DB bootstrap failed "
+                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
+                    NE_VAULT_SECRET_PATH ")\n");
             return 1;
         }
         return notify_wan_admin("di", argv[2]) != 0 ? 1 : 0;
     }
     if (argc == 3 && strcmp(argv[1], "-ai") == 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+            fprintf(stderr,
+                    "[FATAL] Vault/DB bootstrap failed "
+                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
+                    NE_VAULT_SECRET_PATH ")\n");
             return 1;
         }
         return notify_wan_admin("ai", argv[2]) != 0 ? 1 : 0;
@@ -899,7 +905,10 @@ int main(int argc, char **argv) {
 
     if (profile_id >= 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+            fprintf(stderr,
+                    "[FATAL] Vault/DB bootstrap failed "
+                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
+                    NE_VAULT_SECRET_PATH ")\n");
             return 1;
         }
         if (notify_profile_load(profile_id) != 0)
@@ -922,14 +931,18 @@ int main(int argc, char **argv) {
     }
 
     if (load_ne_env() != 0) {
-        fprintf(stderr, "[FATAL] DB env not loaded from " NE_ENV_FILE "\n");
+        fprintf(stderr,
+                "[FATAL] Vault/DB bootstrap failed "
+                "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
+                NE_VAULT_SECRET_PATH ")\n");
         return 1;
     }
 
     struct ne_postgres_conn pg;
     if (ne_postgres_conn_fill(&pg) != 0) {
         fprintf(stderr,
-                "[FATAL] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD in " NE_ENV_FILE "\n");
+                "[FATAL] Vault " NE_VAULT_SECRET_PATH
+                " empty or incomplete — need POSTGRES_SERVER/PORT/USER/DB/PASSWORD\n");
         return 1;
     }
 
@@ -942,7 +955,8 @@ int main(int argc, char **argv) {
     if (PQstatus(listen_conn) != CONNECTION_OK) {
         fprintf(stderr, "[FATAL] DB connection failed: %s", PQerrorMessage(listen_conn));
         fprintf(stderr,
-                "[DB] tried host=%s port=%s dbname=%s user=%s (from " NE_ENV_FILE ")\n",
+                "[DB] tried host=%s port=%s dbname=%s user=%s (from Vault "
+                NE_VAULT_SECRET_PATH ")\n",
                 pg.values[0], pg.values[1], pg.values[2], pg.values[3]);
         PQfinish(listen_conn);
         return 1;

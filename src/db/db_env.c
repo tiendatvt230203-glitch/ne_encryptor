@@ -24,12 +24,17 @@ int load_ne_env(void) {
             "POSTGRES_* come from Vault " NE_VAULT_SECRET_PATH "\n");
 
     if (ne_vault_unseal_and_login() != 0) {
-        fprintf(stderr, "[ENV] Vault unseal/login failed\n");
+        fprintf(stderr,
+                "[ENV] cannot login/unseal Vault — check VAULT_ADDR, VAULT_TOKEN, "
+                "UNSEAL_KEY_1/2/3 in " NE_ENV_FILE " (wrong key/token?)\n");
         return -1;
     }
 
     if (ne_vault_load_secrets() != 0) {
-        fprintf(stderr, "[ENV] Failed to load secrets from Vault\n");
+        fprintf(stderr,
+                "[ENV] Vault " NE_VAULT_SECRET_PATH
+                " empty or inaccessible — no usable POSTGRES_* "
+                "(wrong token / empty secret?)\n");
         return -1;
     }
 
@@ -58,8 +63,8 @@ int ne_postgres_conn_fill(struct ne_postgres_conn *out) {
     if (!host || !host[0] || !port || !port[0] || !user || !user[0] ||
         !dbname || !dbname[0] || !pass || !pass[0]) {
         fprintf(stderr,
-                "[DB] Missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD "
-                "(expected in Vault " NE_VAULT_SECRET_PATH ")\n");
+                "[DB] Vault " NE_VAULT_SECRET_PATH
+                " empty or incomplete — missing POSTGRES_SERVER/PORT/USER/DB/PASSWORD\n");
         return -1;
     }
 
