@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
-
+#include "vault.h"
 #include "config.h"
 #include "db_env.h"
 #include "db_runtime.h"
