@@ -456,6 +456,56 @@ int config_local_policies_cover_ip(const struct app_config *cfg, int local_idx, 
     return 0;
 }
 
+static int policy_port_is_any(int from, int to)
+{
+    if (from < 0 || to < 0)
+        return 1;
+    return from <= 0 && to >= 65535;
+}
+
+/* Policy khớp mọi 5-tuple (kể cả sau khi đảo src/dst chiều IN). */
+static int crypto_policy_is_catchall(const struct crypto_policy *cp)
+{
+    if (!cp)
+        return 0;
+    if (!cp->src_any || !cp->dst_any)
+        return 0;
+    if (cp->protocol != POLICY_PROTO_ANY)
+        return 0;
+#if !CRYPTO_POLICY_MATCH_IP_ONLY
+    if (!policy_port_is_any(cp->src_port_from, cp->src_port_to))
+        return 0;
+    if (!policy_port_is_any(cp->dst_port_from, cp->dst_port_to))
+        return 0;
+#endif
+    return 1;
+}
+
+void config_refresh_policy_in_any(struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        struct profile_config *p = &cfg->profiles[pi];
+        int skip = 0;
+
+        for (int i = 0; i < p->policy_count; i++) {
+            int poli = p->policy_indices[i];
+
+            if (poli < 0 || poli >= cfg->policy_count)
+                continue;
+            if (crypto_policy_is_catchall(&cfg->policies[poli])) {
+                skip = 1;
+                break;
+            }
+        }
+        p->policy_in_any = skip;
+        fprintf(stderr,
+                "[CRYPTO-GUARD] profile %d (%s) WAN IN 5-tuple gate %s\n",
+                p->id, p->name, skip ? "OFF (catch-all any/any)" : "ON");
+    }
+}
+
 static int crypto_policy_match_packet(const struct crypto_policy *cp,
                                       uint32_t src_ip, uint32_t dst_ip,
                                       uint16_t src_port, uint16_t dst_port,

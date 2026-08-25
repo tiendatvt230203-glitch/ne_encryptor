@@ -21,6 +21,7 @@ static atomic_uint_fast64_t s_local_bypass;
 static atomic_uint_fast64_t s_local_drop;
 static atomic_uint_fast64_t s_wan_fwd;
 static atomic_uint_fast64_t s_wan_drop;
+static atomic_uint_fast64_t s_wan_policy_drop;
 static atomic_uint_fast64_t s_mid_ring_drop;
 
 static atomic_uint_fast64_t s_tx_lan_pkts[NE_TX_SLOTS];
@@ -103,6 +104,7 @@ void ne_dp_stats_local_bypass(uint32_t n)  { STAT_INC(s_local_bypass, n); }
 void ne_dp_stats_local_drop(uint32_t n)    { STAT_INC(s_local_drop, n); }
 void ne_dp_stats_wan_fwd(uint32_t n)       { STAT_INC(s_wan_fwd, n); }
 void ne_dp_stats_wan_drop(uint32_t n)      { STAT_INC(s_wan_drop, n); }
+void ne_dp_stats_wan_policy_drop(uint32_t n) { STAT_INC(s_wan_policy_drop, n); }
 void ne_dp_stats_mid_ring_drop(uint32_t n) { STAT_INC(s_mid_ring_drop, n); }
 
 void ne_dp_stats_tx_lan(int slot, uint32_t pkts, uint64_t bytes)
@@ -250,12 +252,14 @@ void ne_dp_stats_tick(struct forwarder *fwd)
     fprintf(stderr,
             "[DP-STATS] %.1fs LAN_RX=%s WAN_RX=%s TX_WAN=%s TX_LAN=%s "
             "bypass=%llu local_drop=%llu wan_fwd=%llu wan_drop=%llu "
+            "wan_policy_drop=%llu "
             "rx_ring_drop(lan=%llu wan=%llu) mid_ring_drop=%llu\n",
             sec, lan_g, wan_g, tx_wan_g, tx_lan_g,
             (unsigned long long)load64(&s_local_bypass),
             (unsigned long long)load64(&s_local_drop),
             (unsigned long long)load64(&s_wan_fwd),
             (unsigned long long)load64(&s_wan_drop),
+            (unsigned long long)load64(&s_wan_policy_drop),
             (unsigned long long)load64(&s_rx_ring_drop_lan[0]),
             (unsigned long long)load64(&s_rx_ring_drop_wan[0]),
             (unsigned long long)load64(&s_mid_ring_drop));

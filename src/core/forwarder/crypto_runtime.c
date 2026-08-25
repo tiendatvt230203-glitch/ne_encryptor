@@ -253,6 +253,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     /* Drop key rows from deleted/previous profiles before rebuilding. */
     main_diag_ne_pqc_clear_all();
 
+    /* Tính lại mỗi lần apply config (load / reload / xóa any-any). */
+    if (cfg)
+        config_refresh_policy_in_any(cfg);
+
     if (!cfg || !cfg->crypto_enabled) {
         arp_bridge_reload_policies(cfg);
         return 0;

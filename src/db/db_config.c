@@ -834,6 +834,7 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
                     "(data traffic requires policy match)\n",
                     cfg->profiles[i].id, cfg->profiles[i].name);
         }
+        config_refresh_policy_in_any(cfg);
         return 0;
     }
 
@@ -878,6 +879,7 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
         cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
     }
 
+    config_refresh_policy_in_any(cfg);
     return 0;
 }
 

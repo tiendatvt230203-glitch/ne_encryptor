@@ -468,8 +468,9 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
 
         if (!prof->enabled)
             continue;
-        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
+        /* Gói WAN->LAN: đảo src/dst để khớp bảng policy viết theo LAN->WAN. */
+        cp = config_select_crypto_policy(fwd->cfg, pi, dst_ip, src_ip,
+                                         dst_port, src_port, proto);
         if (!cp || cp->action != POLICY_ACTION_BYPASS)
             continue;
         if (best_pi < 0 || cp->priority < best_pri ||
@@ -480,6 +481,28 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
         }
     }
     return best_pi;
+}
+
+/*
+ * Bảng policy khớp theo chiều LAN->WAN; gói WAN->LAN là chiều ngược nên phải
+ * đảo src/dst IP + port trước khi khớp. Không policy nào của profile khớp
+ * => chặn, không TX xuống LAN.
+ */
+static int wan_policy_in_ok(struct forwarder *fwd, int profile_pi,
+                            const uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+
+    if (!fwd || !fwd->cfg || !pkt || profile_pi < 0)
+        return 0;
+    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                      &src_port, &dst_port, &proto) != 0)
+        return 0;
+    return config_select_crypto_policy(fwd->cfg, profile_pi,
+                                       dst_ip, src_ip, dst_port, src_port,
+                                       proto) != NULL;
 }
 
 static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
@@ -542,23 +565,17 @@ static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t le
 }
 
 static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
-                                const uint8_t *wire_pkt, uint32_t wire_len,
-                                int ingress_wan_dp)
+                                int profile_pi, int ingress_wan_dp)
 {
     uint8_t *pkt;
-    int profile_pi;
     int li;
 
-    if (!fwd || !job || !wire_pkt || wire_len < 14u)
+    if (!fwd || !job || profile_pi < 0)
         return -1;
     pkt = ne_packet_data(&fwd->pair, job->addr);
     if (!pkt || job->len < 14u)
         return -1;
     if (!eth_dmac_is_unicast(pkt))
-        return -1;
-
-    profile_pi = wan_profile_pi(fwd, wire_pkt, wire_len);
-    if (profile_pi < 0)
         return -1;
 
     li = mac_lookup(fwd, pkt);
@@ -582,6 +599,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
     uint32_t wire_len;
     int dec;
     int encrypted;
+    int profile_pi;
 
     if (!fwd || !pkt)
         goto drop;
@@ -626,15 +644,28 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             goto drop;
         pkt = ne_packet_data(&fwd->pair, job.addr);
         wan_clamp_tcp_mss(fwd, pkt, job.len);
+        profile_pi = wan_profile_pi(fwd, wire_buf, wire_len);
     } else {
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
+        profile_pi = wan_profile_pi(fwd, wire_buf, wire_len);
     }
+    if (profile_pi < 0)
+        goto drop;
+    if (!fwd->cfg->profiles[profile_pi].policy_in_any &&
+        !wan_policy_in_ok(fwd, profile_pi, pkt, job.len))
+        goto policy_drop;
 
-    if (forward_wan_to_local(fwd, &job, wire_buf, wire_len,
+    if (forward_wan_to_local(fwd, &job, profile_pi,
                              job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)
         goto drop;
     ne_dp_stats_wan_fwd(1);
+    return;
+
+policy_drop:
+    ne_dp_stats_wan_policy_drop(1);
+    ne_dp_stats_wan_drop(1);
+    ne_frame_free(&fwd->pair, job.addr);
     return;
 
 drop:
