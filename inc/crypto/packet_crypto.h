@@ -26,7 +26,7 @@ struct packet_crypto_ctx {
     uint8_t wire_id; /* policy wire id written into packet headers */
     int profile_id;
     int aes_bits;
-    /* 1 = keys come from PQC handshake (diversify/clear on !key_ready).
+    /* 1 = keys come from PQC handshake (refresh when HS has key; keep last in RAM).
      * 0 = static/master-derived keys (e.g. ARP default) — never HS-refresh. */
     bool pqc_from_handshake;
 };

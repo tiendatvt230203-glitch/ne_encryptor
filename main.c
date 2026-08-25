@@ -21,6 +21,7 @@
 #include "main_diag.h"
 #include "profile_iface_xdp.h"
 #include "wan_admin.h"
+#include "cfm_diag.h"
 #include "pqc_handshake.h"
 #include "pqc_ipc.h"
 #include "traffic_crypto.h"
@@ -93,9 +94,10 @@ static void usage(const char *prog) {
             "  %s -id <ID>       # load/apply profile (create or edit)\n"
             "  %s -di <wan_if>   # notify daemon: hard-detach WAN from bonding/profile\n"
             "  %s -ai <wan_if>   # notify daemon: hot-add WAN back into bonding/profile\n"
+            "  %s -gs <name>     # print UP or DOWN for wan_if / bridge\n"
             "  %s -check [ID]    # check database config consistency\n"
             "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {
@@ -774,7 +776,7 @@ static const char *g_prog_name = "network-encryptor";
 static void daemon_idle_log(void)
 {
     fprintf(stderr,
-            "[DAEMON] listening %s + %s — use %s -id <id> | -di <wan> | -ai <wan>\n",
+            "[DAEMON] listening %s + %s — use %s -id <id> | -di <wan> | -ai <wan> | -gs <name>\n",
             NOTIFY_CHANNEL, WAN_ADMIN_CHANNEL, g_prog_name);
     fflush(stderr);
 }
@@ -859,6 +861,13 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
         sig_pqc_handle_gen_identity();
         return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "-gs") == 0)
+        return cfm_status_ipc_query(argv[2]);
+    if (argc == 2 && strcmp(argv[1], "-gs") == 0) {
+        fprintf(stderr, "[ERR] -gs requires <wan_if|bridge>\n");
+        return 1;
     }
 
     if (argc == 3 && strcmp(argv[1], "-di") == 0) {
@@ -947,6 +956,7 @@ int main(int argc, char **argv) {
     }
 
     sig_pqc_start_ipc_server();
+    cfm_status_ipc_start();
     sig_pqc_init_vault();
     libbpf_set_print(libbpf_print_silent);
 

@@ -145,4 +145,9 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
 void config_refresh_policy_in_any(struct app_config *cfg);
+/* Gate WAN->LAN: bảng nén đã đảo chiều IN lúc load. 5-tuple gói as-is. */
+int config_policy_in_ok(const struct app_config *cfg, int profile_idx,
+                        uint32_t src_ip, uint32_t dst_ip,
+                        uint16_t src_port, uint16_t dst_port,
+                        uint8_t protocol);
 #endif

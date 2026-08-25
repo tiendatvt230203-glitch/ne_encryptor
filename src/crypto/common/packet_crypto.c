@@ -40,15 +40,6 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE], int aes_bits, uin
     memcpy(out, hmac_out, (size_t)ks);
 }
 
-static void pqc_clear_ctx_keys(struct packet_crypto_ctx *ctx)
-{
-    if (!ctx)
-        return;
-    if (ctx->pqc_from_handshake && ctx->profile_id > 0 && ctx->policy_id > 0)
-        main_diag_ne_pqc_clear(ctx->profile_id, ctx->policy_id);
-    memset(ctx->keys, 0, sizeof(ctx->keys));
-}
-
 static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
 {
     uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
@@ -56,11 +47,9 @@ static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
 
-    /* No successful matching handshake → wipe stale keys so encrypt/decrypt stop. */
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
-        pqc_clear_ctx_keys(ctx);
+    /* HS temporarily not ready: keep last key in RAM (do not wipe). */
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
         return;
-    }
 
     if (key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ) &&
         memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) == 0)
@@ -101,10 +90,9 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
-        pqc_clear_ctx_keys(ctx);
+    /* HS temporarily not ready: keep last key in RAM (do not wipe). */
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
         return;
-    }
     memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);

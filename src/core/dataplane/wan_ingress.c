@@ -484,9 +484,8 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
 }
 
 /*
- * Bảng policy khớp theo chiều LAN->WAN; gói WAN->LAN là chiều ngược nên phải
- * đảo src/dst IP + port trước khi khớp. Không policy nào của profile khớp
- * => chặn, không TX xuống LAN.
+ * Gate WAN->LAN: bảng nén đã đảo chiều IN lúc load, 5-tuple gói as-is.
+ * Không policy nào khớp => chặn, không TX xuống LAN.
  */
 static int wan_policy_in_ok(struct forwarder *fwd, int profile_pi,
                             const uint8_t *pkt, uint32_t len)
@@ -500,9 +499,8 @@ static int wan_policy_in_ok(struct forwarder *fwd, int profile_pi,
     if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
                       &src_port, &dst_port, &proto) != 0)
         return 0;
-    return config_select_crypto_policy(fwd->cfg, profile_pi,
-                                       dst_ip, src_ip, dst_port, src_port,
-                                       proto) != NULL;
+    return config_policy_in_ok(fwd->cfg, profile_pi,
+                               src_ip, dst_ip, src_port, dst_port, proto);
 }
 
 static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
@@ -643,18 +641,23 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (dec != 0)
             goto drop;
         pkt = ne_packet_data(&fwd->pair, job.addr);
-        wan_clamp_tcp_mss(fwd, pkt, job.len);
         profile_pi = wan_profile_pi(fwd, wire_buf, wire_len);
+        if (profile_pi < 0)
+            goto drop;
+        /* Any/any: không so 5-tuple từng gói. Không any mới wan_policy_in_ok. */
+        if (!fwd->cfg->profiles[profile_pi].policy_in_any) {
+            if (!wan_policy_in_ok(fwd, profile_pi, pkt, job.len))
+                goto policy_drop;
+        }
+        wan_clamp_tcp_mss(fwd, pkt, job.len);
     } else {
         if (!wan_l2_plain_ipv4(pkt, job.len))
             goto drop;
+        /* Bypass đã AND 5-tuple trong wan_profile_pi_bypass — không quét lại. */
         profile_pi = wan_profile_pi(fwd, wire_buf, wire_len);
+        if (profile_pi < 0)
+            goto drop;
     }
-    if (profile_pi < 0)
-        goto drop;
-    if (!fwd->cfg->profiles[profile_pi].policy_in_any &&
-        !wan_policy_in_ok(fwd, profile_pi, pkt, job.len))
-        goto policy_drop;
 
     if (forward_wan_to_local(fwd, &job, profile_pi,
                              job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)

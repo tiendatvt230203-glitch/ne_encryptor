@@ -481,13 +481,90 @@ static int crypto_policy_is_catchall(const struct crypto_policy *cp)
     return 1;
 }
 
+#define POL_IN_SRC_NEG  1u
+#define POL_IN_DST_NEG  2u
+
+/* 32 byte/entry, 2 entry / cache line. Field đã đảo chiều IN (packet src = policy dst). */
+struct pol_in_match {
+    uint32_t src_net;
+    uint32_t src_mask;
+    uint32_t dst_net;
+    uint32_t dst_mask;
+    uint16_t sport_lo;
+    uint16_t sport_hi;
+    uint16_t dport_lo;
+    uint16_t dport_hi;
+    uint8_t  proto;
+    uint8_t  flags;
+    uint8_t  _pad[6];
+};
+_Static_assert(sizeof(struct pol_in_match) == 32, "pol_in_match packing");
+
+static struct pol_in_match s_pol_in[MAX_PROFILES][MAX_CRYPTO_POLICIES];
+static int s_pol_in_n[MAX_PROFILES];
+
+static void pol_in_port_range(int from, int to, uint16_t *lo, uint16_t *hi)
+{
+#if CRYPTO_POLICY_MATCH_IP_ONLY
+    *lo = 0;
+    *hi = 65535;
+    return;
+#endif
+    if (from < 0 || to < 0) {
+        *lo = 0;
+        *hi = 65535;
+        return;
+    }
+    if (from > 65535)
+        from = 65535;
+    if (to > 65535)
+        to = 65535;
+    if (from > to) {
+        int tmp = from;
+        from = to;
+        to = tmp;
+    }
+    *lo = (uint16_t)from;
+    *hi = (uint16_t)to;
+}
+
+/* Policy LAN->WAN: src=LAN, dst=WAN. Gói WAN->LAN ngược lại nên đảo lúc dựng bảng. */
+static void pol_in_fill(struct pol_in_match *e, const struct crypto_policy *cp)
+{
+    memset(e, 0, sizeof(*e));
+    if (cp->dst_any) {
+        e->src_net = 0;
+        e->src_mask = 0;
+    } else {
+        e->src_mask = cp->dst_mask;
+        e->src_net = cp->dst_net & cp->dst_mask;
+        if (cp->dst_negate)
+            e->flags |= POL_IN_SRC_NEG;
+    }
+    if (cp->src_any) {
+        e->dst_net = 0;
+        e->dst_mask = 0;
+    } else {
+        e->dst_mask = cp->src_mask;
+        e->dst_net = cp->src_net & cp->src_mask;
+        if (cp->src_negate)
+            e->flags |= POL_IN_DST_NEG;
+    }
+    pol_in_port_range(cp->dst_port_from, cp->dst_port_to, &e->sport_lo, &e->sport_hi);
+    pol_in_port_range(cp->src_port_from, cp->src_port_to, &e->dport_lo, &e->dport_hi);
+    e->proto = cp->protocol;
+}
+
 void config_refresh_policy_in_any(struct app_config *cfg)
 {
+    memset(s_pol_in, 0, sizeof(s_pol_in));
+    memset(s_pol_in_n, 0, sizeof(s_pol_in_n));
     if (!cfg)
         return;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
+    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
         struct profile_config *p = &cfg->profiles[pi];
         int skip = 0;
+        int n = 0;
 
         for (int i = 0; i < p->policy_count; i++) {
             int poli = p->policy_indices[i];
@@ -500,16 +577,78 @@ void config_refresh_policy_in_any(struct app_config *cfg)
             }
         }
         p->policy_in_any = skip;
+        if (!skip) {
+            for (int i = 0; i < p->policy_count; i++) {
+                int poli = p->policy_indices[i];
+
+                if (poli < 0 || poli >= cfg->policy_count)
+                    continue;
+                if (n < MAX_CRYPTO_POLICIES)
+                    pol_in_fill(&s_pol_in[pi][n++], &cfg->policies[poli]);
+            }
+        }
+        s_pol_in_n[pi] = n;
         fprintf(stderr,
-                "[CRYPTO-GUARD] profile %d (%s) WAN IN 5-tuple gate %s\n",
-                p->id, p->name, skip ? "OFF (catch-all any/any)" : "ON");
+                "[CRYPTO-GUARD] profile %d (%s) WAN IN 5-tuple gate %s (%d compact rules)\n",
+                p->id, p->name, skip ? "OFF (catch-all any/any)" : "ON", n);
     }
+}
+
+int config_policy_in_ok(const struct app_config *cfg, int profile_idx,
+                        uint32_t src_ip, uint32_t dst_ip,
+                        uint16_t src_port, uint16_t dst_port,
+                        uint8_t protocol)
+{
+    int n;
+    const struct pol_in_match *tbl;
+
+    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count ||
+        profile_idx >= MAX_PROFILES)
+        return 0;
+
+    n = s_pol_in_n[profile_idx];
+    tbl = s_pol_in[profile_idx];
+    for (int i = 0; i < n; i++) {
+        const struct pol_in_match *e = &tbl[i];
+        int src_ok;
+        int dst_ok;
+
+        /* Ít loại → nhiều loại: proto (TCP/UDP/ICMP/OSPF) → IP (NAT, ít) → port (nhiều). */
+        if (e->proto == POLICY_PROTO_TCP_UDP) {
+            if (protocol != 6 && protocol != 17)
+                continue;
+        } else if (e->proto != POLICY_PROTO_ANY && e->proto != protocol) {
+            continue;
+        }
+        src_ok = ((src_ip & e->src_mask) == e->src_net);
+        dst_ok = ((dst_ip & e->dst_mask) == e->dst_net);
+        if (e->flags & POL_IN_SRC_NEG)
+            src_ok = !src_ok;
+        if (e->flags & POL_IN_DST_NEG)
+            dst_ok = !dst_ok;
+        if (!src_ok || !dst_ok)
+            continue;
+        if (src_port < e->sport_lo || src_port > e->sport_hi)
+            continue;
+        if (dst_port < e->dport_lo || dst_port > e->dport_hi)
+            continue;
+        return 1;
+    }
+    return 0;
 }
 
 static int crypto_policy_match_packet(const struct crypto_policy *cp,
                                       uint32_t src_ip, uint32_t dst_ip,
                                       uint16_t src_port, uint16_t dst_port,
                                       uint8_t protocol) {
+    /* Ít loại → nhiều loại: proto → IP → port. */
+    if (cp->protocol == POLICY_PROTO_TCP_UDP) {
+        if (protocol != 6 && protocol != 17)
+            return 0;
+    } else if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol) {
+        return 0;
+    }
+
     if (!cidr_match_with_negate(cp->src_any, cp->src_negate, src_ip, cp->src_net, cp->src_mask))
         return 0;
     if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, dst_ip, cp->dst_net, cp->dst_mask))
@@ -525,13 +664,6 @@ static int crypto_policy_match_packet(const struct crypto_policy *cp,
             return 0;
     }
 #endif
-
-    if (cp->protocol == POLICY_PROTO_TCP_UDP) {
-        if (protocol != 6 && protocol != 17)
-            return 0;
-    } else if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol) {
-        return 0;
-    }
 
     return 1;
 }

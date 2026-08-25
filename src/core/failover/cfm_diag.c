@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
 #include <arpa/inet.h>
@@ -18,6 +20,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <errno.h>
+
+#define CFM_STATUS_IPC_PATH "/var/run/network-encryptor-gs.sock"
 
 #define CFM_INTERVAL_MS         100
 #define CFM_TIMEOUT_MS          350
@@ -166,6 +170,132 @@ int cfm_snapshot_wan_peers(struct cfm_wan_snap *out, int max)
         n++;
     }
     return n;
+}
+
+/* Same is_up the [mac] table prints — lookup by wan ifname or bridge. */
+int cfm_wan_status_by_name(const char *name)
+{
+    int matched = 0;
+    int any_up = 0;
+
+    if (!name || !name[0])
+        return -1;
+    for (int i = 0; i < g_link_count; i++) {
+        int up;
+
+        pthread_mutex_lock(&g_links[i].lock);
+        if (strcmp(name, g_links[i].ifname) != 0 &&
+            strcmp(name, g_links[i].bridge) != 0) {
+            pthread_mutex_unlock(&g_links[i].lock);
+            continue;
+        }
+        up = g_links[i].is_up ? 1 : 0;
+        pthread_mutex_unlock(&g_links[i].lock);
+        matched = 1;
+        if (up)
+            any_up = 1;
+    }
+    if (!matched)
+        return -1;
+    return any_up;
+}
+
+static void *cfm_status_ipc_thread(void *arg)
+{
+    int listen_fd;
+    struct sockaddr_un addr;
+
+    (void)arg;
+    unlink(CFM_STATUS_IPC_PATH);
+    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+        return NULL;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CFM_STATUS_IPC_PATH, sizeof(addr.sun_path) - 1);
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(listen_fd, 4) < 0) {
+        close(listen_fd);
+        return NULL;
+    }
+    chmod(CFM_STATUS_IPC_PATH, 0660);
+
+    for (;;) {
+        char req[96];
+        char name[IFNAMSIZ];
+        int client_fd;
+        int st;
+
+        client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            usleep(50000);
+            continue;
+        }
+        memset(req, 0, sizeof(req));
+        name[0] = '\0';
+        if (read(client_fd, req, sizeof(req) - 1) > 0)
+            sscanf(req, "GS %15s", name);
+        st = cfm_wan_status_by_name(name);
+        if (st < 0)
+            (void)write(client_fd, "", 0);
+        else
+            (void)write(client_fd, st ? "UP\n" : "DOWN\n", st ? 3 : 5);
+        close(client_fd);
+    }
+    return NULL;
+}
+
+void cfm_status_ipc_start(void)
+{
+    pthread_t th;
+
+    if (pthread_create(&th, NULL, cfm_status_ipc_thread, NULL) == 0)
+        pthread_detach(th);
+}
+
+int cfm_status_ipc_query(const char *name)
+{
+    int fd;
+    struct sockaddr_un addr;
+    char req[64];
+    char buf[16];
+    ssize_t n;
+    int got = 0;
+
+    if (!name || !name[0]) {
+        fprintf(stderr, "[ERR] -gs requires <wan_if|bridge>\n");
+        return 1;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "[ERR] -gs: socket failed\n");
+        return 1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CFM_STATUS_IPC_PATH, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[ERR] -gs: daemon not running\n");
+        close(fd);
+        return 1;
+    }
+    snprintf(req, sizeof(req), "GS %s\n", name);
+    if (write(fd, req, strlen(req)) < 0) {
+        close(fd);
+        return 1;
+    }
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        fputs(buf, stdout);
+        got = 1;
+    }
+    close(fd);
+    if (!got) {
+        fprintf(stderr, "[ERR] no WAN matched: %s\n", name);
+        return 1;
+    }
+    return 0;
 }
 
 static uint64_t get_time_ms(void) {
