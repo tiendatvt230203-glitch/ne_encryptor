@@ -1,16 +1,16 @@
-#include "../../../inc/core/dataplane.h"
-#include "../../../inc/core/dataplane_util.h"
-#include "../../../inc/core/forwarder_crypto_runtime.h"
+#include "../../../inc/core/dataplane/dataplane.h"
+#include "../../../inc/core/dataplane/dataplane_util.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/packet_crypto.h"
 
-#include "../../../inc/core/crypto_route.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/mac_learn.h"
-#include "../../../inc/core/arp_bridge.h"
-#include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/flow/mac_learn.h"
+#include "../../../inc/core/dataplane/arp_bridge.h"
+#include "../../../inc/core/dataplane/dataplane_stats.h"
 
 #include <netinet/in.h>
 #include <string.h>

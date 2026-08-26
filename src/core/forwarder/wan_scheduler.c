@@ -1,11 +1,11 @@
-#include "../../../inc/core/forwarder_wan.h"
-#include "../../../inc/core/profile_iface_xdp.h"
-#include "../../../inc/core/wan_failover.h"
+#include "../../../inc/core/forwarder/forwarder_wan.h"
+#include "../../../inc/core/iface/profile_iface_xdp.h"
+#include "../../../inc/core/failover/wan_failover.h"
 
-#include "../../../inc/core/crypto_route.h"
-#include "../../../inc/core/forwarder_crypto_runtime.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/flow_table.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/flow/flow_table.h"
 
 #include <net/if.h>
 #include <stdio.h>

@@ -1,6 +1,6 @@
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/profile_iface_xdp.h"
-#include "../../../inc/core/dataplane_stats.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/iface/profile_iface_xdp.h"
+#include "../../../inc/core/dataplane/dataplane_stats.h"
 #include <bpf/libbpf.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>

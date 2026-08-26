@@ -1,6 +1,6 @@
 #include "pqc_l2_handshake.h"
 #include "pqc_handshake.h"
-#include "../../inc/core/config.h"
+#include "../../../inc/core/util/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

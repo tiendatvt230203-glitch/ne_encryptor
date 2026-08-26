@@ -1,8 +1,8 @@
-#include "../../../inc/core/wan_admin.h"
-#include "../../../inc/core/config.h"
-#include "../../../inc/core/forwarder.h"
-#include "../../../inc/core/forwarder_wan.h"
-#include "../../../inc/core/interface.h"
+#include "../../../inc/core/failover/wan_admin.h"
+#include "../../../inc/core/util/config.h"
+#include "../../../inc/core/forwarder/forwarder.h"
+#include "../../../inc/core/forwarder/forwarder_wan.h"
+#include "../../../inc/core/iface/interface.h"
 
 #include <net/if.h>
 #include <stdio.h>

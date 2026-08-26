@@ -1,7 +1,7 @@
-#include "../../../inc/core/dataplane_util.h"
+#include "../../../inc/core/dataplane/dataplane_util.h"
 
-#include "../../../inc/core/dataplane_stats.h"
-#include "../../../inc/core/dp_idle.h"
+#include "../../../inc/core/dataplane/dataplane_stats.h"
+#include "../../../inc/core/dataplane/dp_idle.h"
 #include "../../../inc/crypto/eth_parse.h"
 
 #include <arpa/inet.h>

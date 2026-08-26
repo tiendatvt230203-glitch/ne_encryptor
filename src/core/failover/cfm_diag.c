@@ -1,8 +1,8 @@
 #include "cfm.h"
-#include "../../../inc/core/cfm_diag.h"
-#include "../../../inc/core/config.h"
-#include "../../../inc/core/mac_learn.h"
-#include "../../../inc/core/forwarder.h"
+#include "../../../inc/core/failover/cfm_diag.h"
+#include "../../../inc/core/util/config.h"
+#include "../../../inc/core/flow/mac_learn.h"
+#include "../../../inc/core/forwarder/forwarder.h"
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,7 +1,7 @@
 #ifndef DATAPLANE_UTIL_H
 #define DATAPLANE_UTIL_H
 
-#include "forwarder.h"
+#include "core/forwarder/forwarder.h"
 
 int dp_parse_flow(void *pkt, uint32_t len,
                   uint32_t *src_ip, uint32_t *dst_ip,

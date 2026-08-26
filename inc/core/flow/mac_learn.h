@@ -1,7 +1,7 @@
 #ifndef MAC_LEARN_H
 #define MAC_LEARN_H
 
-#include "config.h"
+#include "core/util/config.h"
 #include <pthread.h>
 #include <stdint.h>
 

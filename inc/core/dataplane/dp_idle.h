@@ -1,7 +1,7 @@
 #ifndef DP_IDLE_H
 #define DP_IDLE_H
 
-#include "cpu_map.h"
+#include "core/util/cpu_map.h"
 
 #include <stdint.h>
 

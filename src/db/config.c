@@ -1,4 +1,4 @@
-#include "../../inc/core/config.h"
+#include "../../inc/core/util/config.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

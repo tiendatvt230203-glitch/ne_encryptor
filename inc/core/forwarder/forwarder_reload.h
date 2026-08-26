@@ -1,9 +1,9 @@
 #ifndef FORWARDER_RELOAD_H
 #define FORWARDER_RELOAD_H
 
-#include "config.h"
-#include "forwarder.h"
-#include "profile_iface_xdp.h"
+#include "core/util/config.h"
+#include "core/forwarder/forwarder.h"
+#include "core/iface/profile_iface_xdp.h"
 
 int forwarder_same_topology(const struct app_config *a, const struct app_config *b);
 int forwarder_is_wan_only_removal(const struct app_config *old, const struct app_config *new);

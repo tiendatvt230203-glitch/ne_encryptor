@@ -1,8 +1,8 @@
 #ifndef FORWARDER_WAN_H
 #define FORWARDER_WAN_H
 
-#include "config.h"
-#include "forwarder.h"
+#include "core/util/config.h"
+#include "core/forwarder/forwarder.h"
 
 void fwd_wan_reset_on_init(struct forwarder *fwd);
 

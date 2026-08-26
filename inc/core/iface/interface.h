@@ -1,7 +1,7 @@
 #ifndef INTERFACE_H
 #define INTERFACE_H
 
-#include "config.h"
+#include "core/util/config.h"
 #include <linux/if_link.h>
 #include <net/if.h>
 #include <pthread.h>
@@ -27,7 +27,7 @@
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 0)
 #endif
 
-#include "cpu_map.h"
+#include "core/util/cpu_map.h"
 
 struct bpf_object;
 

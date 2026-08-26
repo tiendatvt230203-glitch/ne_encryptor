@@ -1,7 +1,7 @@
 #ifndef CRYPTO_ROUTE_H
 #define CRYPTO_ROUTE_H
 
-#include "interface.h"
+#include "core/iface/interface.h"
 #include <stdint.h>
 
 struct forwarder;

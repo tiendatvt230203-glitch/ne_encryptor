@@ -1,7 +1,7 @@
 #ifndef ARP_BRIDGE_H
 #define ARP_BRIDGE_H
 
-#include "forwarder.h"
+#include "core/forwarder/forwarder.h"
 
 
 void arp_bridge_reload_policies(struct app_config *cfg);

@@ -1,11 +1,11 @@
 #ifndef FORWARDER_CRYPTO_RUNTIME_H
 #define FORWARDER_CRYPTO_RUNTIME_H
 
-#include "config.h"
-#include "forwarder.h"
-#include "flow_table.h"
-#include "../crypto/crypto_option.h"
-#include "../crypto/packet_crypto.h"
+#include "core/util/config.h"
+#include "core/forwarder/forwarder.h"
+#include "core/flow/flow_table.h"
+#include "crypto/crypto_option.h"
+#include "crypto/packet_crypto.h"
 
 #define FWD_CRYPTO_PROFILE_RELOAD_GRACE_MS 3000u
 

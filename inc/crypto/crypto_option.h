@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "../core/config.h"
+#include "../core/util/config.h"
 #include "packet_crypto.h"
 
 #define CRYPTO_OPT_FRAG_MTU_DEFAULT  1500u

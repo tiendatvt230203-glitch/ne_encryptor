@@ -1,8 +1,8 @@
 #ifndef PROFILE_IFACE_XDP_H
 #define PROFILE_IFACE_XDP_H
 
-#include "config.h"
-#include "forwarder.h"
+#include "core/util/config.h"
+#include "core/forwarder/forwarder.h"
 
 enum profile_iface_xdp_reload_mode {
     PROFILE_IFACE_XDP_ADD = 10,

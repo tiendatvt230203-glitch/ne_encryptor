@@ -1,7 +1,7 @@
 #ifndef DB_CONFIG_H
 #define DB_CONFIG_H
 
-#include "config.h"
+#include "core/util/config.h"
 
 int config_load_from_db(struct app_config *cfg, int ne_profile_id, const char *conn_str);
 

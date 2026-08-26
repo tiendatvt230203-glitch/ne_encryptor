@@ -1,8 +1,8 @@
 #define _POSIX_C_SOURCE 199309L
-#include "../../../inc/core/main_diag.h"
-#include "../../../inc/core/forwarder_crypto_runtime.h"
-#include "../../../inc/core/crypto_route.h"
-#include "../../../inc/core/arp_bridge.h"
+#include "../../../inc/core/util/main_diag.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
+#include "../../../inc/core/dataplane/arp_bridge.h"
 
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"

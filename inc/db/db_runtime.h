@@ -1,7 +1,7 @@
 #ifndef DB_RUNTIME_H
 #define DB_RUNTIME_H
 
-#include "config.h"
+#include "core/util/config.h"
 
 int run_db_check(const char *const *keywords, const char *const *values, int only_id);
 int ne_profile_id_exists(int profile_id);

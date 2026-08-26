@@ -1,9 +1,9 @@
-#include "../../../inc/core/profile_iface_lifecycle.h"
+#include "../../../inc/core/iface/profile_iface_lifecycle.h"
 
-#include "../../../inc/core/forwarder_wan.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/profile_iface_xdp.h"
-#include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/forwarder/forwarder_wan.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/iface/profile_iface_xdp.h"
+#include "../../../inc/core/flow/mac_learn.h"
 
 #include <net/if.h>
 #include <stdio.h>

@@ -1,7 +1,7 @@
 #ifndef FLOW_TABLE_H
 #define FLOW_TABLE_H
 
-#include "config.h"
+#include "core/util/config.h"
 #include <stdint.h>
 #include <pthread.h>
 

@@ -2,8 +2,8 @@
 
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/crypto/eth_parse.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/cpu_map.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/util/cpu_map.h"
 #include "crypto_pqc_layer.h"
 #include "../../options/common/opt_no_frag_ops.h"
 

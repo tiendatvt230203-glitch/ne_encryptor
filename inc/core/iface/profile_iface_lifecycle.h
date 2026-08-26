@@ -1,8 +1,8 @@
 #ifndef PROFILE_IFACE_LIFECYCLE_H
 #define PROFILE_IFACE_LIFECYCLE_H
 
-#include "config.h"
-#include "forwarder.h"
+#include "core/util/config.h"
+#include "core/forwarder/forwarder.h"
 
 struct profile_attach_sess {
     int validate_failed;

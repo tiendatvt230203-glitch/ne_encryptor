@@ -1,5 +1,5 @@
 #include "../../../inc/crypto/crypto_option.h"
-#include "../../../inc/core/interface.h"
+#include "../../../inc/core/iface/interface.h"
 
 #include <netinet/in.h>
 #include <stdatomic.h>

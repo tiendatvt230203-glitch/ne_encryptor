@@ -1,9 +1,9 @@
 #ifndef FORWARDER_H
 #define FORWARDER_H
 
-#include "interface.h"
-#include "crypto_route.h"
-#include "mac_learn.h"
+#include "core/iface/interface.h"
+#include "core/dataplane/crypto_route.h"
+#include "core/flow/mac_learn.h"
 
 struct fwd_iface {
     int ifindex;

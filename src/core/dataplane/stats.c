@@ -1,6 +1,6 @@
-#include "../../../inc/core/dataplane_stats.h"
-#include "../../../inc/core/forwarder.h"
-#include "../../../inc/core/interface.h"
+#include "../../../inc/core/dataplane/dataplane_stats.h"
+#include "../../../inc/core/forwarder/forwarder.h"
+#include "../../../inc/core/iface/interface.h"
 
 #include <stdatomic.h>
 #include <stdio.h>

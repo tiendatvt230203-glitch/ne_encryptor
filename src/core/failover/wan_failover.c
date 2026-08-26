@@ -1,7 +1,7 @@
-#include "../../../inc/core/wan_failover.h"
-#include "../../../inc/core/cfm_diag.h"
-#include "../../../inc/core/forwarder.h"
-#include "../../../inc/core/wan_admin.h"
+#include "../../../inc/core/failover/wan_failover.h"
+#include "../../../inc/core/failover/cfm_diag.h"
+#include "../../../inc/core/forwarder/forwarder.h"
+#include "../../../inc/core/failover/wan_admin.h"
 
 static struct forwarder *g_fwd;
 

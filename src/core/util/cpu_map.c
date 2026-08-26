@@ -1,4 +1,4 @@
-#include "../../../inc/core/cpu_map.h"
+#include "../../../inc/core/util/cpu_map.h"
 
 #include <stdio.h>
 

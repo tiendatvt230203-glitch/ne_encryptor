@@ -1,7 +1,7 @@
-#include "../../../inc/core/crypto_route.h"
-#include "../../../inc/core/interface.h"
-#include "../../../inc/core/dataplane_util.h"
-#include "../../../inc/core/forwarder_crypto_runtime.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
+#include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/dataplane/dataplane_util.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/crypto/crypto_option.h"
 

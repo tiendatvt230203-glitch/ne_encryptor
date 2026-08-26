@@ -1,10 +1,10 @@
-#include "../../../inc/core/forwarder_reload.h"
-#include "../../../inc/core/forwarder.h"
-#include "../../../inc/core/forwarder_wan.h"
-#include "../../../inc/core/forwarder_crypto_runtime.h"
-#include "../../../inc/core/profile_iface_xdp.h"
-#include "../../../inc/core/wan_failover.h"
-#include "../../../inc/core/mac_learn.h"
+#include "../../../inc/core/forwarder/forwarder_reload.h"
+#include "../../../inc/core/forwarder/forwarder.h"
+#include "../../../inc/core/forwarder/forwarder_wan.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
+#include "../../../inc/core/iface/profile_iface_xdp.h"
+#include "../../../inc/core/failover/wan_failover.h"
+#include "../../../inc/core/flow/mac_learn.h"
 #include "pqc_l2_handshake.h"
 
 #include <pthread.h>
