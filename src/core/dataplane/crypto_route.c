@@ -9,6 +9,7 @@
 #include <stddef.h>
 
 static __thread int tls_crypto_worker_idx;
+static __thread int tls_out_ring_idx;
 
 static uint32_t dp_flow_hash_mix(uint32_t src_ip, uint32_t dst_ip,
                                  uint16_t src_port, uint16_t dst_port,
@@ -26,13 +27,44 @@ static uint32_t dp_flow_hash_mix(uint32_t src_ip, uint32_t dst_ip,
     return hash;
 }
 
-static inline int dp_flow_hash_to_worker(uint32_t hash)
+static inline int dp_hash_to_n(uint32_t hash, uint32_t n)
 {
-    uint32_t n = NE_CRYPTO_WORKERS;
-
+    if (n == 0u)
+        return 0;
     if ((n & (n - 1u)) == 0u)
         return (int)(hash & (n - 1u));
     return (int)(hash % n);
+}
+
+static uint32_t dp_pkt_flow_hash(const uint8_t *pkt, uint32_t len)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+
+    if (!pkt || len < 14)
+        return 0;
+
+    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
+                      &src_port, &dst_port, &proto) != 0) {
+        uint32_t hash = len;
+        for (uint32_t i = 0; i < 14 && i < len; i++)
+            hash = hash * 31u + pkt[i];
+        return dp_flow_hash_mix(hash, hash >> 16, (uint16_t)len, 0, 0);
+    }
+    return dp_flow_hash_mix(ntohl(src_ip), ntohl(dst_ip), src_port, dst_port, proto);
+}
+
+void dp_out_ring_bind(int ring_idx)
+{
+    if (ring_idx < 0 || ring_idx >= (int)NE_CRYPTO_WORKERS)
+        ring_idx = 0;
+    tls_out_ring_idx = ring_idx;
+}
+
+int dp_out_ring_idx(void)
+{
+    return tls_out_ring_idx;
 }
 
 void dp_crypto_worker_bind(int worker_idx)
@@ -40,6 +72,7 @@ void dp_crypto_worker_bind(int worker_idx)
     if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
         worker_idx = 0;
     tls_crypto_worker_idx = worker_idx;
+    tls_out_ring_idx = worker_idx;
 }
 
 int dp_crypto_current_worker_idx(void)
@@ -56,27 +89,14 @@ int dp_crypto_worker_idx_for_cpu(uint8_t cpu_id)
     return -1;
 }
 
+int dp_pick_tx_slot(const uint8_t *pkt, uint32_t len)
+{
+    return dp_hash_to_n(dp_pkt_flow_hash(pkt, len), NE_TX_SLOTS);
+}
+
 int dp_crypto_pick_local_worker(const uint8_t *pkt, uint32_t len)
 {
-    uint32_t src_ip = 0, dst_ip = 0;
-    uint16_t src_port = 0, dst_port = 0;
-    uint8_t proto = 0;
-    uint32_t hash;
-
-    if (!pkt || len < 14)
-        return 0;
-
-    if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
-                      &src_port, &dst_port, &proto) != 0) {
-        hash = len;
-        for (uint32_t i = 0; i < 14 && i < len; i++)
-            hash = hash * 31u + pkt[i];
-        hash = dp_flow_hash_mix(hash, hash >> 16, (uint16_t)len, 0, 0);
-        return dp_flow_hash_to_worker(hash);
-    }
-
-    hash = dp_flow_hash_mix(ntohl(src_ip), ntohl(dst_ip), src_port, dst_port, proto);
-    return dp_flow_hash_to_worker(hash);
+    return dp_hash_to_n(dp_pkt_flow_hash(pkt, len), NE_CRYPTO_WORKERS);
 }
 
 int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
@@ -87,18 +107,17 @@ int dp_crypto_pick_wan_worker(struct forwarder *fwd, const uint8_t *pkt, uint32_
     if (!fwd || !pkt)
         return 0;
 
-    if (!fwd->cfg || !fwd->cfg->crypto_enabled)
-        return 0;
+    if (crypto_eth_l2_has_arp_marker(pkt, len) || dp_pkt_is_arp(pkt, len))
+        return dp_crypto_pick_local_worker(pkt, len);
 
-    if (!fwd_crypto_has_l2_marker(pkt, len))
-        return 0;
+    /* Encrypt data only. Bypass never calls this. */
+    if (!fwd->cfg || !fwd->cfg->crypto_enabled || !fwd_crypto_has_l2_marker(pkt, len))
+        return -1;
 
     if (crypto_eth_l2_read_worker_idx(pkt, len, &wire_id) != 0)
         return -1;
-
     if (wire_id < NE_CRYPTO_WORKERS)
         return (int)wire_id;
-
     wi = dp_crypto_worker_idx_for_cpu(wire_id);
     if (wi < 0)
         return -1;

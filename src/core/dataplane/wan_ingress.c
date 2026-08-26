@@ -416,10 +416,22 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
     if (li >= 0 && profile_owns_local(fwd, profile_pi, li)) {
         job->dir = NE_DIR_LOCAL;
         job->local_idx = (uint8_t)li;
-        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_crypto_current_worker_idx()], job);
+        return dp_ring_push(fwd, &fwd->mid_to_local[li][dp_out_ring_idx()], job);
     }
 
     return -1;
+}
+
+int dataplane_wan_needs_mid(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
+{
+    if (!fwd || !pkt || !fwd->cfg)
+        return 0;
+    /* ARP (plain or NE arp-marker) stays on crypto workers. */
+    if (crypto_eth_l2_has_arp_marker(pkt, len) || dp_pkt_is_arp(pkt, len))
+        return 1;
+    if (!fwd->cfg->crypto_enabled)
+        return 0;
+    return wan_wire_is_encrypted(fwd, pkt, len);
 }
 
 void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)

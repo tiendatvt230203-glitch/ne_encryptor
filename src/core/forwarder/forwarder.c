@@ -26,6 +26,19 @@
 #include <sys/socket.h>
 static atomic_int running = 1;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t tx_maint_tick;
+
+static void dp_maint_tick(struct forwarder *fwd)
+{
+    if (!fwd)
+        return;
+    fwd_crypto_maybe_expire_prev_grace();
+    fwd_wan_drain_tick(fwd);
+    fwd_wan_weight_blend_tick();
+    fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
+    mac_learn_tick(fwd);
+    ne_dp_stats_tick(fwd);
+}
 static void pin_cpu(unsigned int cpu)
 {
     cpu_set_t cpuset;
@@ -227,17 +240,25 @@ static void *local_rx_thread(void *arg)
         }
 
         for (int i = 0; i < rcvd; i++) {
-            int wi = dp_crypto_pick_local_worker(ne_packet_data(&fwd->pair, batch[i].addr),
-                                                 batch[i].len);
-            if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->local_to_mid[wi]));
-                ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
-                ne_dp_stats_crypto_ring_drop(wi, 1);
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            } else {
-                ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
+            const uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
+            int wi = dp_crypto_pick_local_worker(pkt, batch[i].len);
+            int li = batch[i].local_idx < fwd->local_count ? (int)batch[i].local_idx : 0;
+
+            if (dataplane_local_needs_mid(fwd, pkt, batch[i].len, li)) {
+                if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
+                    ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
+                                       ne_ring_count(&fwd->local_to_mid[wi]));
+                    ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
+                    ne_dp_stats_crypto_ring_drop(wi, 1);
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                } else {
+                    ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
+                }
+                continue;
             }
+            /* Bypass / ARP: RX → TX slot ring. Crypto cores unused. */
+            dp_out_ring_bind(dp_pick_tx_slot(pkt, batch[i].len));
+            dataplane_process_local(fwd, batch[i]);
         }
         ne_recv_release_local_slot(&fwd->pair, ctx->rx_slot);
     }
@@ -256,6 +277,13 @@ static void *tx_thread(void *arg)
 
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
+
+        if (tx_slot == 0 && pthread_mutex_trylock(&runtime_lock) == 0) {
+            (void)fwd_reload_apply_if_pending();
+            if ((++tx_maint_tick & 1023u) == 0)
+                dp_maint_tick(fwd);
+            pthread_mutex_unlock(&runtime_lock);
+        }
 
         dp_burst_drain_cq_local(fwd, tx_slot);
         dp_burst_drain_cq_wan(fwd, tx_slot);
@@ -321,21 +349,27 @@ static void *wan_rx_thread(void *arg)
                 continue;
             }
             pkt = ne_packet_data(&fwd->pair, batch[i].addr);
-            wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
-            if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                ne_dp_stats_wan_drop(1);
-                ne_frame_free(&fwd->pair, batch[i].addr);
+            if (dataplane_wan_needs_mid(fwd, pkt, batch[i].len)) {
+                wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
+                if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
+                    ne_dp_stats_wan_drop(1);
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                    continue;
+                }
+                if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
+                    ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
+                                       ne_ring_count(&fwd->wan_to_mid[wi]));
+                    ne_dp_stats_rx_ring_drop_wan(ctx->rx_slot, 1);
+                    ne_dp_stats_crypto_ring_drop(wi, 1);
+                    ne_frame_free(&fwd->pair, batch[i].addr);
+                } else {
+                    ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
+                }
                 continue;
             }
-            if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
-                                   ne_ring_count(&fwd->wan_to_mid[wi]));
-                ne_dp_stats_rx_ring_drop_wan(ctx->rx_slot, 1);
-                ne_dp_stats_crypto_ring_drop(wi, 1);
-                ne_frame_free(&fwd->pair, batch[i].addr);
-            } else {
-                ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
-            }
+            /* Bypass / ARP: RX → TX slot ring. Crypto cores unused. */
+            dp_out_ring_bind(dp_pick_tx_slot(pkt, batch[i].len));
+            dataplane_process_wan(fwd, batch[i]);
         }
         ne_recv_release_wan_slot(&fwd->pair, ctx->rx_slot);
     }
@@ -347,18 +381,6 @@ struct crypto_worker_ctx {
     int worker_idx;
     uint8_t cpu_id;
 };
-
-static void crypto_worker_tick(struct forwarder *fwd, int is_primary)
-{
-    if (!is_primary)
-        return;
-    fwd_crypto_maybe_expire_prev_grace();
-    fwd_wan_drain_tick(fwd);
-    fwd_wan_weight_blend_tick();
-    fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
-    mac_learn_tick(fwd);
-    ne_dp_stats_tick(fwd);
-}
 
 static void crypto_idle_pause(struct forwarder *fwd, struct ne_dp_idle *idle, int worker_idx)
 {
@@ -381,8 +403,6 @@ static void *crypto_worker_thread(void *arg)
     struct forwarder *fwd = ctx->fwd;
     struct ne_packet job;
     uint32_t gc_tick = 0;
-    uint32_t maint_tick = 0;
-    int is_primary = (ctx->worker_idx == 0);
     struct ne_dp_idle idle = {0};
 
     pin_cpu(ctx->cpu_id);
@@ -390,41 +410,12 @@ static void *crypto_worker_thread(void *arg)
     crypto_option_bind_worker_idx((uint8_t)ctx->worker_idx);
     crypto_l2_pqc_bind_pair(&fwd->pair);
 
+    /* Encrypt / decrypt / reasm only. Bypass never queues here. */
     while (atomic_load_explicit(&running, memory_order_acquire)) {
         int did_work = 0;
+        int crypto_on = fwd->cfg && fwd->cfg->crypto_enabled;
 
-        if (is_primary) {
-            if (pthread_mutex_trylock(&runtime_lock) != 0) {
-                if (!atomic_load_explicit(&running, memory_order_acquire))
-                    break;
-                if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
-                    dataplane_process_wan(fwd, job);
-                    ne_dp_stats_crypto_wan(ctx->worker_idx, 1);
-                    did_work = 1;
-                }
-                if (ne_ring_try_pop(&fwd->local_to_mid[ctx->worker_idx], &job) == 0) {
-                    dataplane_process_local(fwd, job);
-                    ne_dp_stats_crypto_lan(ctx->worker_idx, 1);
-                    did_work = 1;
-                }
-                if (did_work)
-                    ne_dp_idle_note_work(&idle);
-                else
-                    crypto_idle_pause(fwd, &idle, ctx->worker_idx);
-                continue;
-            }
-            if (!atomic_load_explicit(&running, memory_order_acquire)) {
-                pthread_mutex_unlock(&runtime_lock);
-                break;
-            }
-            if (fwd_reload_apply_if_pending()) {
-                pthread_mutex_unlock(&runtime_lock);
-                continue;
-            }
-            if ((++maint_tick & 1023u) == 0)
-                crypto_worker_tick(fwd, 1);
-        }
-
+        /* Always dequeue: ARP (fixed-key) + encrypt. Bypass is never queued. */
         if (ne_ring_try_pop(&fwd->wan_to_mid[ctx->worker_idx], &job) == 0) {
             dataplane_process_wan(fwd, job);
             ne_dp_stats_crypto_wan(ctx->worker_idx, 1);
@@ -435,17 +426,10 @@ static void *crypto_worker_thread(void *arg)
             ne_dp_stats_crypto_lan(ctx->worker_idx, 1);
             did_work = 1;
         }
-        if (++gc_tick >= 2048) {
+        if (crypto_on && ++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
             gc_tick = 0;
         }
-        if ((gc_tick & 511u) == 0) {
-            ne_dp_warn_crypto((int)ctx->cpu_id, ctx->worker_idx,
-                              ne_ring_count(&fwd->local_to_mid[ctx->worker_idx]),
-                              ne_ring_count(&fwd->wan_to_mid[ctx->worker_idx]));
-        }
-        if (is_primary)
-            pthread_mutex_unlock(&runtime_lock);
 
         if (did_work)
             ne_dp_idle_note_work(&idle);

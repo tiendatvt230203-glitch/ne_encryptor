@@ -20,17 +20,17 @@
 #define SPLIT_TAIL_REFILL_BATCH 32u
 static int push_to_wan(struct forwarder *fwd, struct ne_packet *job, int wan_dp)
 {
-    int wi = dp_crypto_current_worker_idx();
+    int ri = dp_out_ring_idx();
 
     job->dir = NE_DIR_WAN;
     job->wan_idx = (uint8_t)wan_dp;
-    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][wi], job);
+    return dp_ring_push(fwd, &fwd->mid_to_wan[wan_dp][ri], job);
 }
 
 static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
                             uint32_t l1, struct ne_packet *tail, uint32_t l2, int wan_dp)
 {
-    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
+    struct ne_ring *tx = &fwd->mid_to_wan[wan_dp][dp_out_ring_idx()];
 
     if (!fwd || !job || !tail)
         return -1;
@@ -147,6 +147,31 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
     *profile_idx = 0;
     *cp = c;
     return 0;
+}
+
+int dataplane_local_needs_mid(struct forwarder *fwd, const uint8_t *pkt, uint32_t len,
+                              int local_idx)
+{
+    uint32_t src_ip = 0, dst_ip = 0;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t proto = 0;
+    int flow_ok;
+    int profile_idx;
+    const struct crypto_policy *cp;
+
+    if (!fwd || !fwd->cfg || !pkt)
+        return 0;
+    /* ARP uses its own fixed-key path on crypto workers — not bypass. */
+    if (dp_pkt_is_arp(pkt, len))
+        return 1;
+    if (!fwd->cfg->crypto_enabled)
+        return 0;
+    flow_ok = dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip, &src_port, &dst_port,
+                            &proto) == 0;
+    if (pick_profile_policy(fwd, local_idx, flow_ok, src_ip, dst_ip, src_port, dst_port,
+                            proto, &profile_idx, &cp) != 0)
+        return 0;
+    return cp && cp->action != POLICY_ACTION_BYPASS;
 }
 
 void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)

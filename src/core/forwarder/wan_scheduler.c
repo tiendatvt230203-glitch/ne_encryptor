@@ -163,7 +163,7 @@ int fwd_wan_has_tx_room(struct forwarder *fwd, int wan_idx)
 {
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return 0;
-    int wi = dp_crypto_current_worker_idx();
+    int wi = dp_out_ring_idx();
     struct ne_ring *r = &fwd->mid_to_wan[wan_idx][wi];
     return ne_ring_count(r) + NE_BATCH_SIZE < r->cap;
 }
