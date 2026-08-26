@@ -121,25 +121,14 @@ static cfm_link_t *find_link_by_wan_dp(int wan_dp)
     return NULL;
 }
 
-static cfm_link_t *find_link_by_cfg_idx(int cfg_idx)
-{
-    if (cfg_idx < 0)
-        return NULL;
-    for (int i = 0; i < g_link_count; i++) {
-        if (g_links[i].cfg_wan_idx == cfg_idx)
-            return &g_links[i];
-    }
-    return NULL;
-}
-
 static void cfm_bridge_for_wan_dp(const struct app_config *cfg, int wan_dp,
                                   char out[IFNAMSIZ])
 {
     out[0] = '\0';
     if (!cfg || wan_dp < 0)
         return;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
+    if (cfg->profile_count > 0) {
+        const struct profile_config *p = &cfg->profiles[0];
 
         for (int bi = 0; bi < p->bridge_count; bi++) {
             if (p->bridges[bi].wan_dp == wan_dp && p->bridges[bi].ifname[0]) {
@@ -762,19 +751,6 @@ int cfm_init(const struct app_config *cfg) {
     return 0;
 }
 
-bool cfm_is_link_up(int wan_dp) {
-    cfm_link_t *link = find_link_by_wan_dp(wan_dp);
-    bool status;
-
-    if (!link)
-        return true; /* Not CFM-managed → treat as UP for callers. */
-
-    pthread_mutex_lock(&link->lock);
-    status = link->is_up;
-    pthread_mutex_unlock(&link->lock);
-    return status;
-}
-
 int cfm_link_is_down(int wan_dp)
 {
     cfm_link_t *link = find_link_by_wan_dp(wan_dp);
@@ -811,66 +787,10 @@ void cfm_cleanup(void) {
     pthread_mutex_unlock(&g_cfm_init_lock);
 }
 
-static bool cfm_cfg_link_up(int cfg_wan_idx)
-{
-    cfm_link_t *link = find_link_by_cfg_idx(cfg_wan_idx);
-    bool status;
-
-    if (!link)
-        return true;
-
-    pthread_mutex_lock(&link->lock);
-    status = link->is_up;
-    pthread_mutex_unlock(&link->lock);
-    return status;
-}
-
-int failover_select_wan(const struct app_config *cfg, int profile_idx, int initial_wan_idx) {
-    if (!cfg || initial_wan_idx < 0 || initial_wan_idx >= cfg->wan_count) {
-        return initial_wan_idx;
-    }
-
-    // 1. If the chosen WAN is UP, use it.
-    if (cfm_cfg_link_up(initial_wan_idx)) {
-        return initial_wan_idx;
-    }
-
-    // 2. If it is DOWN, look for an alternative WAN in the same profile
-    if (profile_idx >= 0 && profile_idx < cfg->profile_count) {
-        const struct profile_config *p = &cfg->profiles[profile_idx];
-        for (int i = 0; i < p->wan_count; i++) {
-            int w_idx = p->wan_indices[i];
-            if (w_idx >= 0 && w_idx < cfg->wan_count && cfm_cfg_link_up(w_idx)) {
-                return w_idx;
-            }
-        }
-    }
-
-    // 3. Global fallback: If no other WAN in the same profile is UP, search across all WANs
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (cfm_cfg_link_up(i)) {
-            return i;
-        }
-    }
-
-    // 4. Ultimate fallback: if all WANs are down, return the initially selected one
-    return initial_wan_idx;
-}
-
-/* Wrappers for current tree (wan_failover.c) — no extra health logic. */
 void cfm_set_state_callback(cfm_link_state_cb cb, void *user)
 {
     pthread_mutex_lock(&g_cb_lock);
     g_state_cb = cb;
     g_state_cb_user = user;
     pthread_mutex_unlock(&g_cb_lock);
-}
-
-int cfm_get_link_state(int wan_dp)
-{
-    cfm_link_t *link = find_link_by_wan_dp(wan_dp);
-
-    if (!link)
-        return CFM_LINK_STATE_UP;
-    return cfm_is_link_up(wan_dp) ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
 }

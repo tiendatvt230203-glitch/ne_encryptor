@@ -58,21 +58,6 @@ uint32_t crypto_option_get_mtu(void)
     return mtu;
 }
 
-crypto_option_id crypto_option_from_action_mode_bits(int action, int mode)
-{
-    (void)mode;
-    if (action == POLICY_ACTION_BYPASS)
-        return CRYPTO_OPT_BYPASS;
-    return CRYPTO_OPT_L2_PQC;
-}
-
-crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp)
-{
-    if (!cp)
-        return CRYPTO_OPT_BYPASS;
-    return crypto_option_from_action_mode_bits(cp->action, cp->crypto_mode);
-}
-
 uint32_t crypto_option_wire_overhead(crypto_option_id id)
 {
     if (id == CRYPTO_OPT_L2_PQC)
@@ -145,14 +130,6 @@ int crypto_option_reassemble(crypto_option_id id, crypto_proto_class proto,
 {
     CALL_OPS(reasm, id, proto, profile_slot, worker_idx, ctx, pkt_data, pkt_len,
              out_buf, out_len);
-}
-
-int crypto_option_is_any_fragment(const struct app_config *cfg,
-                                  const uint8_t *pkt_data, uint32_t pkt_len,
-                                  uint16_t *pkt_id, uint8_t *frag_index)
-{
-    return crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP,
-                                     cfg, pkt_data, pkt_len, pkt_id, frag_index);
 }
 
 void crypto_option_frag_gc(crypto_option_id id, crypto_proto_class proto,

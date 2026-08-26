@@ -3,7 +3,6 @@
 #include "../../../inc/core/forwarder/forwarder_reload.h"
 #include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
 #include "../../../inc/core/failover/wan_failover.h"
-#include "../../../inc/core/failover/wan_admin.h"
 #include "../../../inc/crypto/crypto_option.h"
 #include "../../../inc/core/dataplane/dataplane.h"
 #include "../../../inc/core/dataplane/crypto_route.h"
@@ -422,10 +421,6 @@ static void *crypto_worker_thread(void *arg)
                 pthread_mutex_unlock(&runtime_lock);
                 continue;
             }
-            if (fwd_wan_admin_apply_if_pending()) {
-                pthread_mutex_unlock(&runtime_lock);
-                continue;
-            }
             if ((++maint_tick & 1023u) == 0)
                 crypto_worker_tick(fwd, 1);
         }
@@ -565,7 +560,6 @@ void forwarder_cleanup(struct forwarder *fwd)
 {
     if (!fwd)
         return;
-    wan_admin_shutdown();
     wan_failover_stop();
     // MAC_LEARN
     mac_learn_persist(fwd);

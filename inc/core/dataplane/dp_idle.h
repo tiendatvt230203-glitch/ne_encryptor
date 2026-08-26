@@ -17,7 +17,6 @@ struct ne_dp_idle {
 
 void ne_dp_idle_init(void);
 void ne_dp_idle_shutdown(void);
-int ne_dp_idle_busy_poll(void);
 
 void ne_dp_idle_note_work(struct ne_dp_idle *st);
 

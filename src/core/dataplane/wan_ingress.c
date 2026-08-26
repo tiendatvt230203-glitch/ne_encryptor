@@ -278,12 +278,10 @@ static int profile_pi_for_wire_policy(struct forwarder *fwd, uint8_t wire_id)
     if (!fwd || !fwd->cfg)
         return -1;
     profile_id = fwd_crypto_profile_id_for_wire_id(wire_id);
-    if (profile_id < 0)
+    if (profile_id < 0 || fwd->cfg->profile_count < 1)
         return -1;
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        if (fwd->cfg->profiles[pi].id == profile_id)
-            return pi;
-    }
+    if (fwd->cfg->profiles[0].id == profile_id)
+        return 0;
     return -1;
 }
 
@@ -325,34 +323,21 @@ static int wan_profile_pi_bypass(struct forwarder *fwd, const uint8_t *pkt, uint
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
-    int best_pi = -1;
-    int best_pri = 0x7fffffff;
-    int best_id = 0x7fffffff;
+    const struct crypto_policy *cp;
 
-    if (!fwd || !pkt || !fwd->cfg)
+    if (!fwd || !pkt || !fwd->cfg || fwd->cfg->profile_count < 1)
+        return -1;
+    if (!fwd->cfg->profiles[0].enabled)
         return -1;
     if (dp_parse_flow((void *)pkt, len, &src_ip, &dst_ip,
                       &src_port, &dst_port, &proto) != 0)
         return -1;
 
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *prof = &fwd->cfg->profiles[pi];
-        const struct crypto_policy *cp;
-
-        if (!prof->enabled)
-            continue;
-        cp = config_select_crypto_policy(fwd->cfg, pi, dst_ip, src_ip,
-                                         dst_port, src_port, proto);
-        if (!cp || cp->action != POLICY_ACTION_BYPASS)
-            continue;
-        if (best_pi < 0 || cp->priority < best_pri ||
-            (cp->priority == best_pri && cp->id < best_id)) {
-            best_pi = pi;
-            best_pri = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    return best_pi;
+    cp = config_select_crypto_policy(fwd->cfg, 0, dst_ip, src_ip,
+                                     dst_port, src_port, proto);
+    if (!cp || cp->action != POLICY_ACTION_BYPASS)
+        return -1;
+    return 0;
 }
 
 static int wan_policy_in_ok(struct forwarder *fwd, int profile_pi,
@@ -376,35 +361,20 @@ static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     uint32_t src_ip = 0, dst_ip = 0;
     uint16_t src_port = 0, dst_port = 0;
     uint8_t proto = 0;
-    const struct crypto_policy *best = NULL;
-    int best_pri = 0x7fffffff;
-    int best_id = 0x7fffffff;
+    const struct crypto_policy *cp;
 
-    if (!fwd || !pkt || !fwd->cfg)
+    if (!fwd || !pkt || !fwd->cfg || fwd->cfg->profile_count < 1)
+        return;
+    if (!fwd->cfg->profiles[0].enabled)
         return;
     if (dp_parse_flow(pkt, len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) != 0)
         return;
     if (proto != IPPROTO_TCP)
         return;
 
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *prof = &fwd->cfg->profiles[pi];
-        const struct crypto_policy *cp;
-
-        if (!prof->enabled)
-            continue;
-        cp = config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip,
-                                         src_port, dst_port, proto);
-        if (!cp || cp->action == POLICY_ACTION_BYPASS)
-            continue;
-        if (!best || cp->priority < best_pri ||
-            (cp->priority == best_pri && cp->id < best_id)) {
-            best = cp;
-            best_pri = cp->priority;
-            best_id = cp->id;
-        }
-    }
-    if (!best)
+    cp = config_select_crypto_policy(fwd->cfg, 0, src_ip, dst_ip,
+                                     src_port, dst_port, proto);
+    if (!cp || cp->action == POLICY_ACTION_BYPASS)
         return;
     (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
                                crypto_option_wire_overhead(CRYPTO_OPT_L2_PQC));

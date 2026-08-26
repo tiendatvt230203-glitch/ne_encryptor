@@ -60,8 +60,8 @@ static const char *mac_bridge_for_lan_ifname(const struct forwarder *fwd,
     }
     if (local_idx < 0)
         return "-";
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *p = &fwd->cfg->profiles[pi];
+    if (fwd->cfg->profile_count > 0) {
+        const struct profile_config *p = &fwd->cfg->profiles[0];
 
         for (int bi = 0; bi < p->bridge_count; bi++) {
             if (p->bridges[bi].local_idx == local_idx && p->bridges[bi].ifname[0])
@@ -128,19 +128,15 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
                 continue;
             if (fwd)
                 br = mac_bridge_for_lan_ifname(fwd, ifname);
-            else {
-                for (int pi = 0; pi < cfg->profile_count; pi++) {
-                    const struct profile_config *p = &cfg->profiles[pi];
+            else if (cfg->profile_count > 0) {
+                const struct profile_config *p = &cfg->profiles[0];
 
-                    for (int bi = 0; bi < p->bridge_count; bi++) {
-                        if (p->bridges[bi].local_idx == li &&
-                            p->bridges[bi].ifname[0]) {
-                            br = p->bridges[bi].ifname;
-                            break;
-                        }
-                    }
-                    if (br[0] != '-')
+                for (int bi = 0; bi < p->bridge_count; bi++) {
+                    if (p->bridges[bi].local_idx == li &&
+                        p->bridges[bi].ifname[0]) {
+                        br = p->bridges[bi].ifname;
                         break;
+                    }
                 }
             }
             for (int i = 0; i < lan_n; i++) {
@@ -215,8 +211,8 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
             if (!ifname[0] || !cfg->wans[i].dataplane)
                 continue;
             wan_dp = config_wan_cfg_to_dp(cfg, i);
-            for (int pi = 0; pi < cfg->profile_count; pi++) {
-                const struct profile_config *p = &cfg->profiles[pi];
+            if (cfg->profile_count > 0) {
+                const struct profile_config *p = &cfg->profiles[0];
 
                 for (int bi = 0; bi < p->bridge_count; bi++) {
                     if (p->bridges[bi].wan_dp == wan_dp &&
@@ -225,8 +221,6 @@ void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config 
                         break;
                     }
                 }
-                if (br[0] != '-')
-                    break;
             }
             fprintf(stderr,
                     "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",

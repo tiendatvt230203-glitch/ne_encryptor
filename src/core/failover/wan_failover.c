@@ -1,38 +1,10 @@
 #include "../../../inc/core/failover/wan_failover.h"
 #include "../../../inc/core/failover/cfm_diag.h"
 #include "../../../inc/core/forwarder/forwarder.h"
-#include "../../../inc/core/failover/wan_admin.h"
-
-static struct forwarder *g_fwd;
 
 int wan_failover_enabled(void)
 {
     return FAILOVER_ENABLE != 0;
-}
-
-/*
- * CFM state callback: DOWN → kick (same as -di), UP → restore (same as -ai).
- * UP/DOWN hiện trên bảng [system] — không log [WAN-FAILOVER] tách dòng.
- */
-static void on_cfm_link_state(int wan_dp, const char *ifname,
-                              int old_state, int new_state, void *user)
-{
-    struct forwarder *fwd = user ? (struct forwarder *)user : g_fwd;
-
-    (void)old_state;
-    (void)wan_dp;
-    if (!wan_failover_enabled())
-        return;
-    if (!fwd || !ifname || !ifname[0])
-        return;
-
-    if (new_state == CFM_LINK_STATE_DOWN) {
-        // (void)wan_admin_kick(fwd, ifname);
-        return;
-    }
-    if (new_state == CFM_LINK_STATE_UP) {
-        // (void)wan_admin_restore(fwd, ifname);
-    }
 }
 
 int wan_failover_start(struct forwarder *fwd)
@@ -43,8 +15,8 @@ int wan_failover_start(struct forwarder *fwd)
     if (!wan_failover_enabled())
         return 0;
 
-    g_fwd = fwd;
-    cfm_set_state_callback(on_cfm_link_state, fwd);
+    /* user=fwd: MAC table dump in cfm notify_is_up reads g_state_cb_user. */
+    cfm_set_state_callback(NULL, fwd);
 
     if (cfm_init(fwd->cfg) != 0)
         return -1;
@@ -58,20 +30,16 @@ void wan_failover_on_cfg(struct forwarder *fwd)
     if (!wan_failover_enabled())
         return;
 
-    g_fwd = fwd;
-    cfm_set_state_callback(on_cfm_link_state, fwd);
+    cfm_set_state_callback(NULL, fwd);
     (void)cfm_init(fwd->cfg);
 }
 
 void wan_failover_stop(void)
 {
-    if (!wan_failover_enabled()) {
-        g_fwd = NULL;
+    if (!wan_failover_enabled())
         return;
-    }
     cfm_set_state_callback(NULL, NULL);
     cfm_cleanup();
-    g_fwd = NULL;
 }
 
 int wan_failover_dp_excluded(int wan_dp)

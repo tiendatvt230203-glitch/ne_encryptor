@@ -3,9 +3,7 @@
 
 #include "core/util/config.h"
 
-int run_db_check(const char *const *keywords, const char *const *values, int only_id);
 int ne_profile_id_exists(int profile_id);
-int ne_list_profile_ids(int *ids, int max_ids, int *out_count);
-int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count, const char *db_pass);
+int load_profile_config(struct app_config *out_cfg, int profile_id);
 
 #endif

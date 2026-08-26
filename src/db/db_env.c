@@ -1,7 +1,6 @@
 #include "../../inc/db/db_env.h"
 #include "../../inc/db/vault.h"
 
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -90,15 +89,4 @@ const char *resolve_db_password(void) {
     p = getenv("PGPASSWORD");
     if (p && *p) return p;
     return NULL;
-}
-
-int parse_config_id_arg(const char *s, int *out) {
-    if (!s || !*s) return -1;
-    for (const char *p = s; *p; p++) {
-        if (*p < '0' || *p > '9') return -1;
-    }
-    long v = strtol(s, NULL, 10);
-    if (v < 0 || v > INT_MAX) return -1;
-    *out = (int)v;
-    return 0;
 }

@@ -147,11 +147,3 @@ int wan_admin_restore(struct forwarder *fwd, const char *ifname)
     return 0;
 }
 
-int fwd_wan_admin_apply_if_pending(void)
-{
-    return 0;
-}
-
-void wan_admin_shutdown(void)
-{
-}

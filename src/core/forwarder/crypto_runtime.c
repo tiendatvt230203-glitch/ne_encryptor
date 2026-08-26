@@ -41,44 +41,42 @@ static int profile_flow_profile_id[MAX_PROFILES];
 
 int fwd_crypto_profile_slot_for_id(int profile_id)
 {
-    for (int i = 0; i < MAX_PROFILES; i++) {
-        if (profile_flow_table_ready[i] && profile_flow_profile_id[i] == profile_id)
-            return i;
-    }
+    if (profile_flow_table_ready[0] && profile_flow_profile_id[0] == profile_id)
+        return 0;
     return -1;
 }
 
 static int profile_slot_alloc(int profile_id)
 {
-    int slot = fwd_crypto_profile_slot_for_id(profile_id);
-    if (slot >= 0)
-        return slot;
-    for (int i = 0; i < MAX_PROFILES; i++) {
-        if (!profile_flow_table_ready[i]) {
-            profile_flow_profile_id[i] = profile_id;
-            return i;
-        }
+    if (profile_flow_table_ready[0] && profile_flow_profile_id[0] == profile_id)
+        return 0;
+    if (!profile_flow_table_ready[0]) {
+        profile_flow_profile_id[0] = profile_id;
+        return 0;
     }
-    return -1;
+    /* Replace the single live slot when the active profile id changes. */
+    profile_flow_profile_id[0] = profile_id;
+    return 0;
 }
 
 int fwd_crypto_ensure_profile_slots(struct app_config *cfg)
 {
-    if (!cfg)
+    int profile_id;
+    int slot;
+
+    if (!cfg || cfg->profile_count < 1)
         return -1;
-    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
-        int profile_id = cfg->profiles[pi].id;
-        int slot = profile_slot_alloc(profile_id);
-        if (slot < 0)
-            return -1;
-        if (!profile_flow_table_ready[slot]) {
-            uint32_t windows[MAX_INTERFACES];
-            memset(windows, 0, sizeof(windows));
-            for (int wi = 0; wi < cfg->wan_count && wi < MAX_INTERFACES; wi++)
-                windows[wi] = cfg->wans[wi].window_size;
-            flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
-            profile_flow_table_ready[slot] = 1;
-        }
+    profile_id = cfg->profiles[0].id;
+    slot = profile_slot_alloc(profile_id);
+    if (slot < 0)
+        return -1;
+    if (!profile_flow_table_ready[slot]) {
+        uint32_t windows[MAX_INTERFACES];
+        memset(windows, 0, sizeof(windows));
+        for (int wi = 0; wi < cfg->wan_count && wi < MAX_INTERFACES; wi++)
+            windows[wi] = cfg->wans[wi].window_size;
+        flow_table_init(&profile_flow_tables[slot], windows, cfg->wan_count);
+        profile_flow_table_ready[slot] = 1;
     }
     return 0;
 }
@@ -88,19 +86,16 @@ void fwd_crypto_sync_flow_table_windows(struct forwarder *fwd)
     if (!fwd || !fwd->cfg)
         return;
 
-    for (int s = 0; s < MAX_PROFILES; s++) {
+    for (int s = 0; s < 1; s++) {
         const struct profile_config *p = NULL;
         struct flow_table *ft;
 
         if (!profile_flow_table_ready[s])
             continue;
         ft = &profile_flow_tables[s];
-        for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-            if (fwd->cfg->profiles[pi].id == profile_flow_profile_id[s]) {
-                p = &fwd->cfg->profiles[pi];
-                break;
-            }
-        }
+        if (fwd->cfg->profile_count > 0 &&
+            fwd->cfg->profiles[0].id == profile_flow_profile_id[s])
+            p = &fwd->cfg->profiles[0];
         if (!p)
             continue;
         for (int i = 0; i < p->wan_count; i++) {
@@ -115,17 +110,11 @@ void fwd_crypto_cleanup_stale_profile_slots(const struct app_config *cfg)
 {
     if (!cfg || prev_grace_active)
         return;
-    for (int s = 0; s < MAX_PROFILES; s++) {
+    for (int s = 0; s < 1; s++) {
         if (!profile_flow_table_ready[s])
             continue;
         int pid = profile_flow_profile_id[s];
-        int still_active = 0;
-        for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
-            if (cfg->profiles[pi].id == pid) {
-                still_active = 1;
-                break;
-            }
-        }
+        int still_active = (cfg->profile_count > 0 && cfg->profiles[0].id == pid);
         if (still_active)
             continue;
         flow_table_cleanup(&profile_flow_tables[s]);
@@ -185,11 +174,11 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
 
 void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
 {
-    if (!cfg || !cfg->crypto_enabled)
+    if (!cfg || !cfg->crypto_enabled || cfg->profile_count < 1)
         return;
 
-    for (int pidx = 0; pidx < cfg->profile_count; pidx++) {
-        const struct profile_config *prof = &cfg->profiles[pidx];
+    {
+        const struct profile_config *prof = &cfg->profiles[0];
 
         for (int j = 0; j < prof->policy_count; j++) {
             int pi = prof->policy_indices[j];
@@ -288,8 +277,8 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
     }
 
-    for (int pidx = 0; pidx < cfg->profile_count && pidx < MAX_PROFILES; pidx++) {
-        const struct profile_config *p = &cfg->profiles[pidx];
+    if (cfg->profile_count > 0) {
+        const struct profile_config *p = &cfg->profiles[0];
         for (int j = 0; j < p->policy_count && j < MAX_CRYPTO_POLICIES; j++) {
             int pi = p->policy_indices[j];
             if (pi < 0 || pi >= cfg->policy_count)
@@ -297,15 +286,8 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             const struct crypto_policy *cp = &cfg->policies[pi];
             if (!crypto_policy_is_encrypt(cp))
                 continue;
-            if (cp->id >= 0 && cp->id <= 255) {
-                int old_pid = policy_profile_id_by_wire_id[(uint8_t)cp->id];
-                if (old_pid > 0 && old_pid != p->id) {
-                    fprintf(stderr,
-                            "[RELOAD] wire id collision id=%d profile=%d conflicts with profile=%d (warn)\n",
-                            cp->id, p->id, old_pid);
-                }
+            if (cp->id >= 0 && cp->id <= 255)
                 policy_profile_id_by_wire_id[(uint8_t)cp->id] = p->id;
-            }
             if (policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
                 policy_crypto_ctx[pi].policy_id = cp->db_id;
@@ -374,13 +356,11 @@ void fwd_crypto_frag_gc_worker_tick(int worker_idx)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
-    for (int s = 0; s < MAX_PROFILES; s++) {
-        if (!profile_flow_table_ready[s])
-            continue;
+    if (profile_flow_table_ready[0]) {
         if (worker_idx == 0)
-            flow_table_gc_slice(&profile_flow_tables[s], &profile_flow_gc_cursor[s],
+            flow_table_gc_slice(&profile_flow_tables[0], &profile_flow_gc_cursor[0],
                                 FLOW_GC_BUCKETS_PER_TICK);
-        crypto_option_frag_gc_all(s, worker_idx, now_ns);
+        crypto_option_frag_gc_all(0, worker_idx, now_ns);
     }
 }
 

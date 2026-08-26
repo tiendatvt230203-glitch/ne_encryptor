@@ -12,10 +12,6 @@ void fwd_wan_weight_blend_tick(void);
 void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_config *new,
                                 int (*profile_slot_for_id)(int profile_id));
 
-void fwd_wan_configure_removal_drains(struct forwarder *fwd,
-                                      const struct app_config *old,
-                                      const struct app_config *cfg);
-
 void fwd_wan_configure_live_drains(struct forwarder *fwd,
                                    const struct app_config *old,
                                    const struct app_config *cfg);

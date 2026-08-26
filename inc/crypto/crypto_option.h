@@ -62,9 +62,6 @@ struct crypto_option_ops {
 
 const struct crypto_option_ops *crypto_option_ops(crypto_option_id id, crypto_proto_class proto);
 
-crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp);
-crypto_option_id crypto_option_from_action_mode_bits(int action, int mode);
-
 uint32_t crypto_option_wire_overhead(crypto_option_id id);
 
 int crypto_option_need_split(crypto_option_id id, crypto_proto_class proto, uint32_t pkt_len);
@@ -83,9 +80,6 @@ int crypto_option_is_fragment(crypto_option_id id, crypto_proto_class proto,
                               const struct app_config *cfg,
                               const uint8_t *pkt_data, uint32_t pkt_len,
                               uint16_t *pkt_id, uint8_t *frag_index);
-int crypto_option_is_any_fragment(const struct app_config *cfg,
-                                  const uint8_t *pkt_data, uint32_t pkt_len,
-                                  uint16_t *pkt_id, uint8_t *frag_index);
 int crypto_option_reassemble(crypto_option_id id, crypto_proto_class proto,
                              int profile_slot, int worker_idx,
                              struct packet_crypto_ctx *ctx,

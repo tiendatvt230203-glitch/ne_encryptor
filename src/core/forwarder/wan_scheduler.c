@@ -59,16 +59,16 @@ static uint64_t monotonic_ms(void)
 static int wan_seed_weight_from_cfg(const struct app_config *cfg, int cfg_wan)
 {
     int best = 1;
-    if (!cfg)
+    const struct profile_config *p;
+
+    if (!cfg || cfg->profile_count < 1)
         return best;
-    for (int pr = 0; pr < cfg->profile_count; pr++) {
-        const struct profile_config *p = &cfg->profiles[pr];
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            if (p->wan_indices[wi] != cfg_wan)
-                continue;
-            if (p->wan_bandwidth_weight[wi] > best)
-                best = p->wan_bandwidth_weight[wi];
-        }
+    p = &cfg->profiles[0];
+    for (int wi = 0; wi < p->wan_count; wi++) {
+        if (p->wan_indices[wi] != cfg_wan)
+            continue;
+        if (p->wan_bandwidth_weight[wi] > best)
+            best = p->wan_bandwidth_weight[wi];
     }
     return best;
 }
@@ -212,58 +212,6 @@ void fwd_wan_reset_on_init(struct forwarder *fwd)
     memset(wan_joins, 0, sizeof(wan_joins));
 }
 
-void fwd_wan_configure_removal_drains(struct forwarder *fwd,
-                                      const struct app_config *old,
-                                      const struct app_config *cfg)
-{
-    if (!fwd || !old || !cfg)
-        return;
-
-    int dp_n = fwd->wan_count;
-    if (dp_n > MAX_INTERFACES)
-        dp_n = MAX_INTERFACES;
-
-    for (int dp = 0; dp < dp_n; dp++) {
-        int ci = fwd->wan_cfg_idx[dp];
-        if (ci < 0 || ci >= old->wan_count)
-            continue;
-        if (!config_wan_live(old, ci))
-            continue;
-        if (fwd_wan_ifname_dataplane_in_cfg(cfg, old->wans[ci].ifname))
-            continue;
-
-        wan_drains[dp].active = 1;
-        wan_drains[dp].legacy_cfg_wan = ci;
-        wan_drains[dp].seed_weight = wan_seed_weight_from_cfg(old, ci);
-        snprintf(wan_drains[dp].ifname, sizeof(wan_drains[dp].ifname), "%s",
-                 old->wans[ci].ifname);
-        wan_drains[dp].start_ms = monotonic_ms();
-        wan_drains[dp].until_ms = wan_drains[dp].start_ms + WAN_DRAIN_GRACE_MS;
-        fprintf(stderr,
-                "[WAN-DRAIN] %s taper %us (existing flows migrate, no new flows)\n",
-                wan_drains[dp].ifname, (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
-    }
-    fflush(stderr);
-
-    wan_active_dp_count = config_count_dataplane_wans(cfg);
-    for (int dp = 0; dp < dp_n; dp++) {
-        if (wan_drains[dp].active)
-            continue;
-        int ci = -1;
-        const char *want = fwd->wans[dp].ifname;
-        for (int i = 0; i < cfg->wan_count; i++) {
-            if (!config_wan_live(cfg, i))
-                continue;
-            if (strcmp(cfg->wans[i].ifname, want) == 0) {
-                ci = i;
-                break;
-            }
-        }
-        if (ci >= 0)
-            fwd->wan_cfg_idx[dp] = ci;
-    }
-}
-
 void fwd_wan_configure_live_drains(struct forwarder *fwd,
                                    const struct app_config *old,
                                    const struct app_config *cfg)
@@ -319,14 +267,14 @@ static int profile_wan_weight_blended(const struct profile_config *p, int cfg_wa
     if (!p || nominal_weight <= 0)
         return nominal_weight;
 
-    for (int bi = 0; bi < MAX_PROFILES; bi++) {
-        const wan_weight_blend *b = &wan_weight_blends[bi];
+    {
+        const wan_weight_blend *b = &wan_weight_blends[0];
         int pos;
         int blend;
         int w;
 
         if (!b->active || b->profile_id != p->id)
-            continue;
+            return nominal_weight;
         pos = -1;
         for (int i = 0; i < b->n; i++) {
             if (b->wan_cfg[i] == cfg_wan) {
@@ -341,17 +289,13 @@ static int profile_wan_weight_blended(const struct profile_config *p, int cfg_wa
         w = (b->old_w[pos] * (100 - blend) + b->new_w[pos] * blend) / 100;
         return w > 0 ? w : 1;
     }
-    return nominal_weight;
 }
 
 void fwd_wan_weight_blend_tick(void)
 {
-    for (int bi = 0; bi < MAX_PROFILES; bi++) {
-        if (!wan_weight_blends[bi].active)
-            continue;
-        if (wan_weight_blend_progress(&wan_weight_blends[bi]) >= 100)
-            wan_weight_blends[bi].active = 0;
-    }
+    if (wan_weight_blends[0].active &&
+        wan_weight_blend_progress(&wan_weight_blends[0]) >= 100)
+        wan_weight_blends[0].active = 0;
     fwd_wan_join_ramp_tick();
 }
 
@@ -425,23 +369,25 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
     if (!old || !new)
         return;
 
-    for (int bi = 0; bi < MAX_PROFILES; bi++)
-        wan_weight_blends[bi].active = 0;
+    wan_weight_blends[0].active = 0;
 
-    for (int pi = 0; pi < new->profile_count; pi++) {
-        const struct profile_config *np = &new->profiles[pi];
-        const struct profile_config *op = NULL;
+    if (old->profile_count < 1 || new->profile_count < 1) {
+        fflush(stderr);
+        return;
+    }
 
-        for (int oi = 0; oi < old->profile_count; oi++) {
-            if (old->profiles[oi].id == np->id) {
-                op = &old->profiles[oi];
-                break;
-            }
-        }
-        if (!op || op->wan_count != np->wan_count)
-            continue;
-
+    {
+        const struct profile_config *np = &new->profiles[0];
+        const struct profile_config *op = &old->profiles[0];
         int changed = 0;
+        int slot;
+        wan_weight_blend *b;
+
+        (void)profile_slot_for_id;
+        if (op->id != np->id || op->wan_count != np->wan_count) {
+            fflush(stderr);
+            return;
+        }
         for (int i = 0; i < np->wan_count; i++) {
             if (op->wan_indices[i] != np->wan_indices[i] ||
                 op->wan_bandwidth_weight[i] != np->wan_bandwidth_weight[i]) {
@@ -449,14 +395,13 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
                 break;
             }
         }
-        if (!changed)
-            continue;
+        if (!changed) {
+            fflush(stderr);
+            return;
+        }
 
-        int slot = profile_slot_for_id ? profile_slot_for_id(np->id) : -1;
-        if (slot < 0)
-            slot = pi % MAX_PROFILES;
-
-        wan_weight_blend *b = &wan_weight_blends[slot];
+        slot = 0;
+        b = &wan_weight_blends[slot];
         b->active = 1;
         b->profile_id = np->id;
         b->n = np->wan_count;

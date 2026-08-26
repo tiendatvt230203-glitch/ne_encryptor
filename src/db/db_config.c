@@ -274,7 +274,7 @@ static void profile_append_locals_from_rows(struct app_config *cfg,
             p->local_indices[p->local_count++] = li;
         } else {
             fprintf(stderr,
-                    "[DB] profile \"%s\": ne_lan.interface=%s not in merged LAN list — row skipped\n",
+                    "[DB] profile \"%s\": ne_lan.interface=%s not in LAN list — row skipped\n",
                     p->name, ifname);
         }
     }
@@ -312,7 +312,7 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
             p->wan_count++;
         } else {
             fprintf(stderr,
-                    "[DB] profile \"%s\": ne_wan.interface=%s not in merged WAN list — row skipped\n",
+                    "[DB] profile \"%s\": ne_wan.interface=%s not in WAN list — row skipped\n",
                     p->name, ifname);
         }
     }
@@ -785,13 +785,11 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
     memset(cfg->crypto_key, 0, sizeof(cfg->crypto_key));
 
     if (cfg->policy_count <= 0) {
-        for (int i = 0; i < cfg->profile_count; i++) {
-            if (!cfg->profiles[i].enabled)
-                continue;
+        if (cfg->profile_count > 0 && cfg->profiles[0].enabled) {
             fprintf(stderr,
                     "[CRYPTO-GUARD] profile %d (%s) has no policy; crypto_enabled=0 "
                     "(data traffic requires policy match)\n",
-                    cfg->profiles[i].id, cfg->profiles[i].name);
+                    cfg->profiles[0].id, cfg->profiles[0].name);
         }
         return 0;
     }

@@ -29,7 +29,6 @@
 
 #define NOTIFY_CHANNEL "xdp_start"
 #define WAN_ADMIN_CHANNEL "xdp_wan_admin"
-#define MAX_ACTIVE_PROFILE_IDS 32
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_stop_logged = 0;
@@ -510,40 +509,17 @@ static int config_db_unchanged(const struct app_config *old,
     if (!policies_db_unchanged(old, new))
         return 0;
 
-    for (int i = 0; i < old->profile_count; i++) {
-        const struct profile_config *op = &old->profiles[i];
-        const struct profile_config *np = NULL;
-        for (int j = 0; j < new->profile_count; j++) {
-            if (new->profiles[j].id == op->id) {
-                np = &new->profiles[j];
-                break;
-            }
-        }
-        if (!np || !profile_db_unchanged(op, np, old, new))
-            return 0;
-    }
-
-    return 1;
+    if (old->profile_count < 1 || new->profile_count < 1)
+        return 0;
+    return profile_db_unchanged(&old->profiles[0], &new->profiles[0], old, new);
 }
 
 static int profiles_fully_unchanged(const struct app_config *old,
                                     const struct app_config *new)
 {
-    if (old->profile_count != new->profile_count)
+    if (!old || !new || old->profile_count < 1 || new->profile_count < 1)
         return 0;
-    for (int i = 0; i < old->profile_count; i++) {
-        const struct profile_config *op = &old->profiles[i];
-        const struct profile_config *np = NULL;
-        for (int j = 0; j < new->profile_count; j++) {
-            if (new->profiles[j].id == op->id) {
-                np = &new->profiles[j];
-                break;
-            }
-        }
-        if (!np || !profile_db_unchanged(op, np, old, new))
-            return 0;
-    }
-    return 1;
+    return profile_db_unchanged(&old->profiles[0], &new->profiles[0], old, new);
 }
 
 
@@ -583,49 +559,44 @@ static int runtime_tuning_only_change(const struct app_config *old,
     return profiles_fully_unchanged(old, new);
 }
 
-static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
-                                int active_id_count, int trigger_id) {
-    struct app_config *merged_cfg = calloc(1, sizeof(*merged_cfg));
-    if (!merged_cfg) {
-        fprintf(stderr, "[FATAL] out of memory building merged config\n");
+static int apply_active_configs(struct runtime_state *rt, int profile_id) {
+    struct app_config *new_cfg = calloc(1, sizeof(*new_cfg));
+    if (!new_cfg) {
+        fprintf(stderr, "[FATAL] out of memory building config\n");
         return -1;
     }
-    if (build_merged_config(merged_cfg, active_ids, active_id_count, NULL) != 0) {
+    if (load_profile_config(new_cfg, profile_id) != 0) {
         fprintf(stderr,
                 "[ERR] profile %d: failed to load config from Postgres (see [DB] lines above)\n",
-                trigger_id);
-        free(merged_cfg);
+                profile_id);
+        free(new_cfg);
         return -1;
     }
 
     if (!rt->has_thread) {
-        fprintf(stderr, "[LOAD] active:");
-        for (int i = 0; i < active_id_count; i++)
-            fprintf(stderr, " %d", active_ids[i]);
-        fprintf(stderr, "\n");
-        main_diag_log_db_apply(merged_cfg, trigger_id, NULL);
-        int rc = runtime_start(rt, merged_cfg);
-        free(merged_cfg);
+        fprintf(stderr, "[LOAD] active: %d\n", profile_id);
+        main_diag_log_db_apply(new_cfg, profile_id, NULL);
+        int rc = runtime_start(rt, new_cfg);
+        free(new_cfg);
         return rc != 0 ? -1 : 0;
     }
 
     int next_slot = 1 - rt->active_slot;
     const struct app_config *prev_cfg = &rt->cfg_slots[rt->active_slot];
 
-    rt->cfg_slots[next_slot] = *merged_cfg;
-    free(merged_cfg);
+    rt->cfg_slots[next_slot] = *new_cfg;
+    free(new_cfg);
 
     if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
         fprintf(stderr,
                 "[DB] profile %d — no change on first read (Postgres may not have committed yet), retry...\n",
-                trigger_id);
+                profile_id);
         fflush(stderr);
         usleep(500000);
-        if (build_merged_config(&rt->cfg_slots[next_slot], active_ids,
-                                active_id_count, NULL) != 0) {
+        if (load_profile_config(&rt->cfg_slots[next_slot], profile_id) != 0) {
             fprintf(stderr,
                     "[ERR] profile %d: DB reload retry failed (see [DB] lines above)\n",
-                    trigger_id);
+                    profile_id);
             return -1;
         }
     }
@@ -633,7 +604,7 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
         log_policy_db_ids("[DB] Postgres", &rt->cfg_slots[next_slot]);
         log_policy_db_ids("[DB] running", prev_cfg);
-        main_diag_log_no_update(trigger_id, prev_cfg);
+        main_diag_log_no_update(profile_id, prev_cfg);
         return 0;
     }
 
@@ -641,15 +612,15 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
     int topo_ok = forwarder_same_topology(prev_cfg, &rt->cfg_slots[next_slot]);
 
     if (policy_only)
-        main_diag_log_db_policy_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
+        main_diag_log_db_policy_apply(&rt->cfg_slots[next_slot], profile_id, prev_cfg);
     else
-        main_diag_log_db_apply(&rt->cfg_slots[next_slot], trigger_id, prev_cfg);
+        main_diag_log_db_apply(&rt->cfg_slots[next_slot], profile_id, prev_cfg);
 
     if (!topo_ok) {
         fprintf(stderr,
                 "[RELOAD] profile %d — LAN/WAN change — full dataplane restart "
                 "(clean UMEM; service stays up)\n",
-                trigger_id);
+                profile_id);
         fflush(stderr);
         if (runtime_stop_forwarder(rt) != 0)
             return -1;
@@ -660,8 +631,8 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
             return -1;
         fprintf(stderr,
                 "[RELOAD] OK profile %d — applied (full dataplane restart)\n",
-                trigger_id);
-        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 0);
+                profile_id);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], profile_id, 1, 0);
         fflush(stderr);
         return 0;
     }
@@ -671,46 +642,43 @@ static int apply_active_configs(struct runtime_state *rt, const int *active_ids,
         int tuning = runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot]);
         fprintf(stderr,
                 "[RELOAD] profile %d — same LAN/WAN ifnames (%s, hot reload)\n",
-                trigger_id, tuning ? "tuning" : "settings/profile fields");
+                profile_id, tuning ? "tuning" : "settings/profile fields");
         fflush(stderr);
         if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
             rt->active_slot = next_slot;
             fprintf(stderr,
                     "[RELOAD] OK profile %d — applied (same-topology hot reload)\n",
-                    trigger_id);
+                    profile_id);
             main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot],
-                                         trigger_id, 1, 0);
+                                         profile_id, 1, 0);
             fflush(stderr);
             return 0;
         }
         fprintf(stderr,
                 "[ERR] profile %d: same-topology hot reload failed — "
                 "running dataplane unchanged (no full restart)\n",
-                trigger_id);
+                profile_id);
         fflush(stderr);
         return -1;
     }
 
     fprintf(stderr,
             "[RELOAD] profile %d — policies/crypto only (LAN/WAN ifaces unchanged)\n",
-            trigger_id);
+            profile_id);
     fflush(stderr);
 
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
         rt->active_slot = next_slot;
-        fprintf(stderr, "[RELOAD] OK profile %d — applied (hot reload)\n", trigger_id);
-        fprintf(stderr, "[RELOAD] active:");
-        for (int i = 0; i < active_id_count; i++)
-            fprintf(stderr, " %d", active_ids[i]);
-        fprintf(stderr, "\n");
-        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], trigger_id, 1, 1);
+        fprintf(stderr, "[RELOAD] OK profile %d — applied (hot reload)\n", profile_id);
+        fprintf(stderr, "[RELOAD] active: %d\n", profile_id);
+        main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], profile_id, 1, 1);
         fflush(stderr);
         return 0;
     }
     fprintf(stderr,
             "[ERR] profile %d: policy hot reload failed — "
             "running dataplane unchanged (no full restart)\n",
-            trigger_id);
+            profile_id);
     fflush(stderr);
     return -1;
 }
@@ -755,17 +723,12 @@ static int runtime_stop_forwarder(struct runtime_state *rt) {
 
 
 static int load_profile_and_run(struct runtime_state *rt,
-                                int *active_ids,
-                                int *active_id_count,
+                                int *active_profile_id,
                                 int profile_id) {
-    int load_ids[1];
-
-    load_ids[0] = profile_id;
-    if (apply_active_configs(rt, load_ids, 1, profile_id) != 0)
+    if (apply_active_configs(rt, profile_id) != 0)
         return -1;
 
-    active_ids[0] = profile_id;
-    *active_id_count = 1;
+    *active_profile_id = profile_id;
     return 0;
 }
 
@@ -780,13 +743,10 @@ static void daemon_idle_log(void)
 }
 
 static void return_to_blank_daemon(struct runtime_state *rt,
-                                   int *active_ids,
-                                   int *active_id_count)
+                                   int *active_profile_id)
 {
-    if (active_id_count)
-        *active_id_count = 0;
-    if (active_ids)
-        memset(active_ids, 0, sizeof(int) * MAX_ACTIVE_PROFILE_IDS);
+    if (active_profile_id)
+        *active_profile_id = 0;
 
     if (rt && rt->has_thread)
         (void)runtime_stop_forwarder(rt);
@@ -804,8 +764,7 @@ static void return_to_blank_daemon(struct runtime_state *rt,
 }
 
 static int handle_profile_notify(struct runtime_state *rt,
-                                 int *active_ids,
-                                 int *active_id_count,
+                                 int *active_profile_id,
                                  int profile_id) {
     if (g_stop_requested)
         return 0;
@@ -815,34 +774,34 @@ static int handle_profile_notify(struct runtime_state *rt,
                 "[FAIL] profile id=%d not found in DB — load aborted\n",
                 profile_id);
         fflush(stderr);
-        return_to_blank_daemon(rt, active_ids, active_id_count);
+        return_to_blank_daemon(rt, active_profile_id);
         return 0;
     }
 
-    if (rt->has_thread && *active_id_count == 0) {
+    if (rt->has_thread && *active_profile_id <= 0) {
         fprintf(stderr,
                 "[LOAD] stale dataplane (thread without active profile) — reset to idle\n");
         fflush(stderr);
-        return_to_blank_daemon(rt, active_ids, active_id_count);
+        return_to_blank_daemon(rt, active_profile_id);
     } else if (rt->has_thread && !rt->running) {
         fprintf(stderr,
                 "[LOAD] dataplane thread not running — reset to idle before load\n");
         fflush(stderr);
-        return_to_blank_daemon(rt, active_ids, active_id_count);
-    } else if (*active_id_count >= 1 && active_ids[0] != profile_id) {
+        return_to_blank_daemon(rt, active_profile_id);
+    } else if (*active_profile_id > 0 && *active_profile_id != profile_id) {
         fprintf(stderr,
                 "[LOAD] replace profile %d → %d (clear old, then load)\n",
-                active_ids[0], profile_id);
+                *active_profile_id, profile_id);
         fflush(stderr);
-        return_to_blank_daemon(rt, active_ids, active_id_count);
+        return_to_blank_daemon(rt, active_profile_id);
     }
 
-    if (load_profile_and_run(rt, active_ids, active_id_count, profile_id) != 0) {
+    if (load_profile_and_run(rt, active_profile_id, profile_id) != 0) {
         fprintf(stderr,
                 "[FAIL] load profile id=%d failed — load aborted\n",
                 profile_id);
         fflush(stderr);
-        return_to_blank_daemon(rt, active_ids, active_id_count);
+        return_to_blank_daemon(rt, active_profile_id);
         return -1;
     }
     return 0;
@@ -981,8 +940,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int active_ids[MAX_ACTIVE_PROFILE_IDS] = {0};
-    int active_id_count = 0;
+    int active_profile_id = 0;
 
     while (!g_stop_requested) {
         int pq_fd = PQsocket(listen_conn);
@@ -1030,7 +988,7 @@ int main(int argc, char **argv) {
                 } else {
                     fprintf(stderr, "\n[NOTIFY] profile %d\n", id);
                     fflush(stderr);
-                    (void)handle_profile_notify(rt, active_ids, &active_id_count, id);
+                    (void)handle_profile_notify(rt, &active_profile_id, id);
                 }
             }
             PQfreemem(notify);

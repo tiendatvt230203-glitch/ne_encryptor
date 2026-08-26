@@ -35,17 +35,10 @@ struct packet_crypto_ctx {
 int packet_crypto_init(struct packet_crypto_ctx *ctx,
                        const uint8_t master_key[AES_MAX_KEY_SIZE],
                        int aes_bits);
-void packet_crypto_cleanup(struct packet_crypto_ctx *ctx);
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx);
 void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx);
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot);
-
-uint32_t packet_crypto_next_counter(void);
-void packet_crypto_reset_counter(void);
-
-void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag,
-                           uint8_t *out_nonce, int *out_nonce_len);
 
 #endif

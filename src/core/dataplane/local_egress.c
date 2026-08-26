@@ -123,38 +123,29 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
                             uint16_t src_port, uint16_t dst_port, uint8_t proto,
                             int *profile_idx, const struct crypto_policy **cp)
 {
-    if (!fwd || !fwd->cfg || !profile_idx || !cp)
+    const struct crypto_policy *c;
+    const struct profile_config *p;
+    int found = 0;
+
+    if (!fwd || !fwd->cfg || !profile_idx || !cp || fwd->cfg->profile_count < 1)
         return -1;
 
-    const struct crypto_policy *best = NULL;
-    int best_pi = -1, best_pri = 0x7fffffff, best_id = 0x7fffffff;
-
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *p = &fwd->cfg->profiles[pi];
-        int found = 0;
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->local_count; i++)
-            if (p->local_indices[i] == local_idx)
-                found = 1;
-        if (!found)
-            continue;
-        const struct crypto_policy *c = flow_ok
-            ? config_select_crypto_policy(fwd->cfg, pi, src_ip, dst_ip, src_port, dst_port, proto)
-            : NULL;
-        if (!c)
-            continue;
-        if (!best || c->priority < best_pri || (c->priority == best_pri && c->id < best_id)) {
-            best = c;
-            best_pi = pi;
-            best_pri = c->priority;
-            best_id = c->id;
-        }
+    p = &fwd->cfg->profiles[0];
+    if (!p->enabled)
+        return -1;
+    for (int i = 0; i < p->local_count; i++) {
+        if (p->local_indices[i] == local_idx)
+            found = 1;
     }
-    if (!best)
+    if (!found)
         return -1;
-    *profile_idx = best_pi;
-    *cp = best;
+    c = flow_ok
+        ? config_select_crypto_policy(fwd->cfg, 0, src_ip, dst_ip, src_port, dst_port, proto)
+        : NULL;
+    if (!c)
+        return -1;
+    *profile_idx = 0;
+    *cp = c;
     return 0;
 }
 

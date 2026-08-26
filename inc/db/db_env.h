@@ -14,6 +14,5 @@ struct ne_postgres_conn {
 int load_ne_env(void);
 int ne_postgres_conn_fill(struct ne_postgres_conn *out);
 const char *resolve_db_password(void);
-int parse_config_id_arg(const char *s, int *out);
 
 #endif

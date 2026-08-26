@@ -1,15 +1,11 @@
 #include "../../../inc/crypto/packet_crypto.h"
-#include "../../../inc/crypto/traffic_crypto.h"
 #include "../../../inc/core/util/config.h"
 #include "../../../inc/core/util/main_diag.h"
 
 #include <openssl/hmac.h>
-#include <stdatomic.h>
 #include <string.h>
 
 #include "pqc_handshake.h"
-
-static atomic_uint_fast32_t g_nonce_counter;
 
 static int key_nonzero(const uint8_t *key, size_t len)
 {
@@ -69,16 +65,6 @@ static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
                                ctx->keys[KEY_SLOT_CURRENT]);
 }
 
-uint32_t packet_crypto_next_counter(void)
-{
-    return atomic_fetch_add(&g_nonce_counter, 1) & 0x7FFFFFFFu;
-}
-
-void packet_crypto_reset_counter(void)
-{
-    atomic_store(&g_nonce_counter, 0);
-}
-
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot)
 {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT)
@@ -123,32 +109,5 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx, const uint8_t master_key[A
     ctx->crypto_mode = CRYPTO_MODE_PQC;
     ctx->initialized = true;
     fill_static_slots(ctx->master_key, ctx->keys);
-    packet_crypto_reset_counter();
     return 0;
-}
-
-void packet_crypto_cleanup(struct packet_crypto_ctx *ctx)
-{
-    if (!ctx)
-        return;
-    memset(ctx->master_key, 0, sizeof(ctx->master_key));
-    memset(ctx->keys, 0, sizeof(ctx->keys));
-    ctx->initialized = false;
-}
-
-void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag, uint8_t *out_nonce,
-                           int *out_nonce_len)
-{
-    (void)counter;
-    (void)proto_flag;
-
-    if (!out_nonce || !out_nonce_len)
-        return;
-
-    (void)trf_pqc_init_global();
-    if (trf_pqc_generate_nonce(out_nonce) != TRF_PQC_OK) {
-        *out_nonce_len = 0;
-        return;
-    }
-    *out_nonce_len = PACKET_CRYPTO_NONCE_BYTES;
 }

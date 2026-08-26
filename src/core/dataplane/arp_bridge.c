@@ -218,17 +218,17 @@ static int profile_pi_for_wan_dp(struct forwarder *fwd, int wan_dp)
     if (!fwd || !fwd->cfg)
         return -1;
     cfg_idx = config_wan_dp_to_cfg(fwd->cfg, wan_dp);
-    if (cfg_idx < 0)
+    if (cfg_idx < 0 || fwd->cfg->profile_count < 1)
         return -1;
 
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *p = &fwd->cfg->profiles[pi];
+    {
+        const struct profile_config *p = &fwd->cfg->profiles[0];
 
         if (!p->enabled)
-            continue;
+            return -1;
         for (int wi = 0; wi < p->wan_count; wi++) {
             if (p->wan_indices[wi] == cfg_idx)
-                return pi;
+                return 0;
         }
     }
     return -1;
@@ -550,21 +550,21 @@ static int profile_pi_for_fwd_local(struct forwarder *fwd, int fwd_li)
     if (!fwd || !fwd->cfg || fwd_li < 0 || fwd_li >= fwd->local_count)
         return -1;
     ifname = fwd->locals[fwd_li].ifname;
-    if (!ifname[0])
+    if (!ifname[0] || fwd->cfg->profile_count < 1)
         return -1;
 
-    for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-        const struct profile_config *p = &fwd->cfg->profiles[pi];
+    {
+        const struct profile_config *p = &fwd->cfg->profiles[0];
 
         if (!p->enabled)
-            continue;
+            return -1;
         for (int i = 0; i < p->local_count; i++) {
             int ci = p->local_indices[i];
 
             if (ci < 0 || ci >= fwd->cfg->local_count)
                 continue;
             if (strcmp(fwd->cfg->locals[ci].ifname, ifname) == 0)
-                return pi;
+                return 0;
         }
     }
     return -1;

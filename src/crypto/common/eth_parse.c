@@ -193,23 +193,6 @@ int crypto_eth_l2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8
     return 0;
 }
 
-void crypto_ipv4_checksum_replace_word(uint8_t *ip_hdr, uint16_t old_word, uint16_t new_word)
-{
-    uint32_t sum;
-    uint16_t hc;
-
-    if (!ip_hdr || old_word == new_word)
-        return;
-
-    hc = (uint16_t)(((uint16_t)ip_hdr[10] << 8) | ip_hdr[11]);
-    sum = (uint32_t)(~hc & 0xFFFFu) + (uint32_t)(~old_word & 0xFFFFu) + (uint32_t)new_word;
-    while (sum >> 16)
-        sum = (sum & 0xFFFFu) + (sum >> 16);
-    hc = (uint16_t)(~sum);
-    ip_hdr[10] = (uint8_t)(hc >> 8);
-    ip_hdr[11] = (uint8_t)(hc & 0xFF);
-}
-
 static void tcp_checksum_replace_word(uint8_t *tcp, uint16_t old_word, uint16_t new_word)
 {
     uint32_t sum;

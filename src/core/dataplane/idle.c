@@ -96,13 +96,6 @@ void ne_dp_idle_shutdown(void)
     g_busy_poll = -1;
 }
 
-int ne_dp_idle_busy_poll(void)
-{
-    if (g_busy_poll < 0)
-        ne_dp_idle_init();
-    return g_busy_poll;
-}
-
 void ne_dp_idle_note_work(struct ne_dp_idle *st)
 {
     if (st)

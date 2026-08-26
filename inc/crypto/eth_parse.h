@@ -37,8 +37,6 @@ int crypto_eth_l2_core_id_off(const uint8_t *packet, size_t pkt_len);
 int crypto_eth_l2_frag_magic_off(const uint8_t *packet, size_t pkt_len, int nonce_size);
 int crypto_eth_l2_read_worker_idx(const uint8_t *packet, uint32_t pkt_len, uint8_t *worker_idx_out);
 
-void crypto_ipv4_checksum_replace_word(uint8_t *ip_hdr, uint16_t old_word, uint16_t new_word);
-
 int crypto_eth_arp_offset(const uint8_t *pkt, size_t pkt_len);
 int crypto_pkt_is_arp(const uint8_t *pkt, size_t pkt_len);
 void crypto_eth_set_arp_et(uint8_t *pkt, int inner_et_off);

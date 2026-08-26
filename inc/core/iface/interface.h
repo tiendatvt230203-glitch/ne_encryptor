@@ -125,29 +125,21 @@ uint32_t ne_ring_count(const struct ne_ring *r);
 
 int ne_pair_open(struct ne_pair *p, const struct app_config *cfg);
 void ne_pair_close(struct ne_pair *p, const struct app_config *cfg);
-void ne_pair_delete_all_xsks(struct ne_pair *p);
 void ne_pair_delete_local_xsks(struct ne_pair *p, int pair_li);
 void ne_pair_delete_wan_xsks(struct ne_pair *p, int dp_slot);
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max);
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max);
 int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
 int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max);
-void ne_recv_release_local(struct ne_pair *p);
-void ne_recv_release_wan(struct ne_pair *p);
 void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot);
 void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot);
 
 void ne_drain_cq_local(struct ne_pair *p, int tx_slot);
 void ne_drain_cq_wan(struct ne_pair *p, int tx_slot);
-void ne_refill_fq_local(struct ne_pair *p);
-void ne_refill_fq_wan(struct ne_pair *p);
 void ne_refill_fq_local_slot(struct ne_pair *p, int rx_slot);
 void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot);
 void ne_dp_tx_ctx(const char *dir, int tx_slot);
 void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd);
 void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth);
-void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending);
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q);
 int ne_tx_drain_local_all(struct ne_pair *p, struct ne_ring *srcs[], int src_count,
                           int local_idx, int tx_slot);
@@ -168,7 +160,6 @@ int interface_get_queue_count(const char *ifname);
 
 int ne_rx_lan_slots_for(int local_queue_total);
 int ne_rx_wan_slots_for(int wan_queue_total);
-void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total);
 
 int ne_rx_local_fds(struct ne_pair *p, int rx_slot, int *fds, int max);
 int ne_rx_wan_fds(struct ne_pair *p, int rx_slot, int *fds, int max);

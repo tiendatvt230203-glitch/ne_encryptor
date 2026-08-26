@@ -129,13 +129,7 @@ int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
 int config_validate(struct app_config *cfg);
 int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname);
-int config_local_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id);
-int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
-int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id);
 int config_policy_db_id_taken(const struct app_config *cfg, int db_id);
-int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag);
-int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
-int config_local_policies_cover_ip(const struct app_config *cfg, int local_idx, uint32_t ip);
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,

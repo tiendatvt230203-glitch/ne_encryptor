@@ -1,9 +1,6 @@
 #include "../../../inc/core/iface/profile_iface_xdp.h"
 #include "../../../inc/core/iface/profile_iface_lifecycle.h"
 
-#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
-#include "../../../inc/core/forwarder/forwarder_reload.h"
-#include "../../../inc/core/forwarder/forwarder_wan.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/crypto/eth_parse.h"
 
@@ -134,81 +131,6 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
     interface_reset_redirect_maps();
 }
 
-static int cfg_has_wan_ifname(const struct app_config *cfg, const char *ifname)
-{
-    if (!cfg || !ifname)
-        return 0;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        if (strcmp(cfg->wans[i].ifname, ifname) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-static int cfg_locals_subset(const struct app_config *sub, const struct app_config *sup)
-{
-    for (int i = 0; i < sub->local_count; i++) {
-        if (!config_local_ifname_in_cfg(sup, sub->locals[i].ifname))
-            return 0;
-    }
-    return 1;
-}
-
-static int cfg_wans_subset(const struct app_config *sub, const struct app_config *sup)
-{
-    for (int i = 0; i < sub->wan_count; i++) {
-        if (!cfg_has_wan_ifname(sup, sub->wans[i].ifname))
-            return 0;
-    }
-    return 1;
-}
-
-static int cfg_has_lan_row_addition(const struct app_config *old, const struct app_config *new)
-{
-    for (int i = 0; i < new->local_count; i++) {
-        if (!config_local_ifname_in_cfg(old, new->locals[i].ifname))
-            return 1;
-    }
-    return 0;
-}
-
-static int cfg_has_wan_row_addition(const struct app_config *old, const struct app_config *new)
-{
-    for (int i = 0; i < new->wan_count; i++) {
-        if (!cfg_has_wan_ifname(old, new->wans[i].ifname))
-            return 1;
-    }
-    return 0;
-}
-
-static int cfg_has_lan_row_removal(const struct app_config *old, const struct app_config *new)
-{
-    for (int i = 0; i < old->local_count; i++) {
-        if (!config_local_ifname_in_cfg(new, old->locals[i].ifname))
-            return 1;
-    }
-    return 0;
-}
-
-static int cfg_has_wan_row_removal(const struct app_config *old, const struct app_config *new)
-{
-    for (int i = 0; i < old->wan_count; i++) {
-        if (!cfg_has_wan_ifname(new, old->wans[i].ifname))
-            return 1;
-    }
-    return 0;
-}
-
-static int cfg_has_iface_addition(const struct app_config *old, const struct app_config *new)
-{
-    return cfg_has_lan_row_addition(old, new) || cfg_has_wan_row_addition(old, new);
-}
-
-static int cfg_has_iface_removal(const struct app_config *old, const struct app_config *new)
-{
-    return cfg_has_lan_row_removal(old, new) || cfg_has_wan_row_removal(old, new);
-}
-
 static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname)
 {
     if (!fwd || !ifname)
@@ -220,45 +142,6 @@ static int pair_wan_dp_slot_live(const struct forwarder *fwd, const char *ifname
             return di;
     }
     return -1;
-}
-
-int profile_iface_xdp_can_add(const struct app_config *old, const struct app_config *new)
-{
-    if (!old || !new || !old->profile_count)
-        return 0;
-    if (!cfg_locals_subset(old, new) || !cfg_wans_subset(old, new))
-        return 0;
-    return cfg_has_iface_addition(old, new);
-}
-
-int profile_iface_xdp_can_remove(const struct app_config *old, const struct app_config *new)
-{
-    if (!old || !new)
-        return 0;
-    if (!cfg_locals_subset(new, old) || !cfg_wans_subset(new, old))
-        return 0;
-    return cfg_has_iface_removal(old, new);
-}
-
-int profile_iface_xdp_can_delta(const struct app_config *old, const struct app_config *new)
-{
-    if (!old || !new || !old->profile_count)
-        return 0;
-    if (!cfg_has_iface_addition(old, new) && !cfg_has_iface_removal(old, new))
-        return 0;
-    /*
-     * Kept ifaces may change WAN window/dst_ip/dataplane; those fields are
-     * applied after plumb via sync_wan_live + crypto rebuild. Do not require
-     * field equality (that previously forced a full dataplane restart).
-     */
-    return 1;
-}
-
-int profile_iface_xdp_is_add_only(const struct app_config *old, const struct app_config *new)
-{
-    if (!profile_iface_xdp_can_add(old, new))
-        return 0;
-    return cfg_has_iface_addition(old, new) && !cfg_has_iface_removal(old, new);
 }
 
 /* --- BPF / XDP bind --- */
@@ -476,34 +359,16 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
     return 0;
 }
 
-static int crypto_finish_reload(struct forwarder *fwd, struct app_config *cfg,
-                                const struct app_config *old)
-{
-    fwd_wan_weight_blend_begin(old, cfg, fwd_crypto_profile_slot_for_id);
-    if (fwd_crypto_ensure_profile_slots(cfg) != 0) {
-        fprintf(stderr, "[PROFILE-XDP] crypto reload failed: ensure_profile_slots\n");
-        return -1;
-    }
-    fwd_crypto_snapshot_active_to_prev();
-    int rc = fwd_crypto_rebuild(cfg);
-    if (rc != 0) {
-        fprintf(stderr, "[PROFILE-XDP] crypto reload failed: fwd_crypto_rebuild\n");
-        fwd_crypto_clear_grace();
-    }
-    fwd_crypto_sync_flow_table_windows(fwd);
-    fwd_crypto_cleanup_stale_profile_slots(cfg);
-    fwd_wan_reset_on_init(fwd);
-    return forwarder_should_stop() ? -1 : rc;
-}
-
 int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_config *new_cfg,
                                     const struct app_config *old_cfg)
 {
     if (!fwd || !new_cfg || !old_cfg || forwarder_should_stop())
         return -1;
+    if (new_cfg->profile_count < 1)
+        return 0;
 
-    for (int pi = 0; pi < new_cfg->profile_count; pi++) {
-        const struct profile_config *prof = &new_cfg->profiles[pi];
+    {
+        const struct profile_config *prof = &new_cfg->profiles[0];
         struct profile_attach_sess sess;
         int need_attach = 0;
 
@@ -520,7 +385,7 @@ int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_conf
             break;
         }
         if (!need_attach)
-            continue;
+            return 0;
 
         memset(&sess, 0, sizeof(sess));
         profile_iface_life_attach_wan_rows(fwd, new_cfg, prof->id, &sess);
@@ -535,83 +400,4 @@ int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_conf
             profile_iface_life_reconcile_counts(fwd);
     }
     return 0;
-}
-
-int profile_iface_xdp_reload_impl(struct forwarder *fwd, struct app_config *cfg,
-                                  enum profile_iface_xdp_reload_mode mode,
-                                  int trigger_profile_id)
-{
-    const struct app_config *old = fwd->cfg;
-
-    if (!fwd || !cfg || !old || forwarder_should_stop())
-        return -1;
-    if (trigger_profile_id <= 0) {
-        fprintf(stderr, "[PROFILE-XDP] reload missing trigger profile id\n");
-        return -1;
-    }
-
-    switch (mode) {
-    case PROFILE_IFACE_XDP_REMOVE:
-        if (!profile_iface_xdp_can_remove(old, cfg))
-            return -1;
-        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
-            return -1;
-        break;
-    case PROFILE_IFACE_XDP_ADD:
-        if (!profile_iface_xdp_can_add(old, cfg))
-            return -1;
-        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
-            return -1;
-        break;
-    case PROFILE_IFACE_XDP_DELTA:
-        if (!profile_iface_xdp_can_delta(old, cfg))
-            return -1;
-        if (profile_iface_life_rebuild_from_cfg(fwd, cfg, trigger_profile_id) != 0)
-            return -1;
-        break;
-    default:
-        return -1;
-    }
-
-    /* Apply dataplane flag / new live WAN rows on kept ifaces. */
-    fwd_wan_configure_live_drains(fwd, old, cfg);
-    if (profile_iface_xdp_sync_wan_live(fwd, cfg, old) != 0)
-        return -1;
-
-    profile_iface_life_reconcile_counts(fwd);
-    fwd->cfg = cfg;
-    return crypto_finish_reload(fwd, cfg, old);
-}
-
-int profile_iface_xdp_apply_add(struct forwarder *fwd, struct app_config *cfg,
-                                int trigger_profile_id)
-{
-    if (!fwd || !cfg || !fwd->cfg || forwarder_should_stop())
-        return -1;
-    if (!profile_iface_xdp_can_add(fwd->cfg, cfg))
-        return -1;
-    return forwarder_queue_profile_iface_xdp(fwd, cfg, PROFILE_IFACE_XDP_ADD,
-                                           trigger_profile_id);
-}
-
-int profile_iface_xdp_apply_remove(struct forwarder *fwd, struct app_config *cfg,
-                                   int trigger_profile_id)
-{
-    if (!fwd || !cfg || !fwd->cfg || forwarder_should_stop())
-        return -1;
-    if (!profile_iface_xdp_can_remove(fwd->cfg, cfg))
-        return -1;
-    return forwarder_queue_profile_iface_xdp(fwd, cfg, PROFILE_IFACE_XDP_REMOVE,
-                                           trigger_profile_id);
-}
-
-int profile_iface_xdp_apply_delta(struct forwarder *fwd, struct app_config *cfg,
-                                    int trigger_profile_id)
-{
-    if (!fwd || !cfg || !fwd->cfg || forwarder_should_stop())
-        return -1;
-    if (!profile_iface_xdp_can_delta(fwd->cfg, cfg))
-        return -1;
-    return forwarder_queue_profile_iface_xdp(fwd, cfg, PROFILE_IFACE_XDP_DELTA,
-                                             trigger_profile_id);
 }

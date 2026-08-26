@@ -42,13 +42,6 @@ void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
     (void)q_depth;
 }
 
-void ne_dp_warn_tx(int cpu, int tx_full, uint32_t pending)
-{
-    (void)cpu;
-    (void)tx_full;
-    (void)pending;
-}
-
 void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
 {
     (void)cpu;
@@ -74,12 +67,6 @@ int ne_rx_lan_slots_for(int local_queue_total)
 int ne_rx_wan_slots_for(int wan_queue_total)
 {
     return ne_rx_slots_for_queues(wan_queue_total, NE_RX_WAN_SLOTS);
-}
-
-void ne_dp_log_hw_scale(int local_queue_total, int wan_queue_total)
-{
-    (void)local_queue_total;
-    (void)wan_queue_total;
 }
 
 static int ifname_is_safe(const char *ifname)
@@ -640,13 +627,6 @@ static void delete_all_live_xsks(struct ne_pair *p)
         if (p->wan_live[i] || p->wans[i].queue_count > 0)
             delete_iface_xsks(p, &p->wans[i], p->wans[i].queue_count);
     }
-}
-
-void ne_pair_delete_all_xsks(struct ne_pair *p)
-{
-    if (!p)
-        return;
-    delete_all_live_xsks(p);
 }
 
 static int pool_reset_full(struct ne_pool *pool, uint32_t n_frames, uint32_t frame_size)
@@ -1293,11 +1273,6 @@ int ne_recv_local_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, ui
     return (int)total;
 }
 
-int ne_recv_local(struct ne_pair *p, struct ne_packet *out, uint32_t max)
-{
-    return ne_recv_local_slot(p, 0, out, max);
-}
-
 int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint32_t max)
 {
     uint32_t total = 0;
@@ -1327,12 +1302,6 @@ int ne_recv_wan_slot(struct ne_pair *p, int rx_slot, struct ne_packet *out, uint
     return (int)total;
 }
 
-int ne_recv_wan(struct ne_pair *p, struct ne_packet *out, uint32_t max)
-{
-    return ne_recv_wan_slot(p, 0, out, max);
-}
-
-
 void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot)
 {
     if (!p || rx_slot < 0 || rx_slot >= (int)NE_RX_LAN_SLOTS)
@@ -1349,12 +1318,6 @@ void ne_recv_release_local_slot(struct ne_pair *p, int rx_slot)
             }
         }
     }
-}
-
-void ne_recv_release_local(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_LAN_SLOTS; s++)
-        ne_recv_release_local_slot(p, s);
 }
 
 void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot)
@@ -1374,13 +1337,6 @@ void ne_recv_release_wan_slot(struct ne_pair *p, int rx_slot)
         }
     }
 }
-
-void ne_recv_release_wan(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_WAN_SLOTS; s++)
-        ne_recv_release_wan_slot(p, s);
-}
-
 
 // CQ
 static void drain_cq_queue(struct ne_xsk_queue *slot, struct ne_pool *pool)
@@ -1499,18 +1455,6 @@ void ne_refill_fq_wan_slot(struct ne_pair *p, int rx_slot)
             continue;
         refill_fq_iface_slot(&p->wans[i], &p->pool, rx_slot, (int)NE_RX_WAN_SLOTS);
     }
-}
-
-void ne_refill_fq_local(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_LAN_SLOTS; s++)
-        ne_refill_fq_local_slot(p, s);
-}
-
-void ne_refill_fq_wan(struct ne_pair *p)
-{
-    for (int s = 0; s < (int)NE_RX_WAN_SLOTS; s++)
-        ne_refill_fq_wan_slot(p, s);
 }
 
 static void kick_fq_queue(struct ne_xsk_queue *slot)

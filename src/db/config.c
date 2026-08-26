@@ -114,17 +114,6 @@ int config_policy_db_id_taken(const struct app_config *cfg, int db_id)
     return 0;
 }
 
-int config_policy_pkt_tag_taken(const struct app_config *cfg, int pkt_tag)
-{
-    if (!cfg)
-        return 0;
-    for (int i = 0; i < cfg->policy_count; i++) {
-        if (cfg->policies[i].id == pkt_tag)
-            return 1;
-    }
-    return 0;
-}
-
 int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname)
 {
     if (!cfg || !ifname)
@@ -136,40 +125,15 @@ int config_local_ifname_in_cfg(const struct app_config *cfg, const char *ifname)
     return 0;
 }
 
-int config_local_owner_profile(const struct app_config *cfg, int local_idx, int skip_profile_id)
-{
-    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
-        return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (p->id == skip_profile_id)
-            continue;
-        for (int li = 0; li < p->local_count; li++) {
-            if (p->local_indices[li] == local_idx)
-                return p->id;
-        }
-    }
-    return 0;
-}
-
-int config_wan_dataplane_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
-{
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    if (!cfg->wans[wan_idx].dataplane)
-        return 0;
-    return config_wan_owner_profile(cfg, wan_idx, skip_profile_id);
-}
-
 int config_wan_profile_weight(const struct app_config *cfg, int wan_idx)
 {
     int best = 0;
 
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count || cfg->profile_count < 1)
         return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
+
+    {
+        const struct profile_config *p = &cfg->profiles[0];
 
         for (int wi = 0; wi < p->wan_count; wi++) {
             if (p->wan_indices[wi] != wan_idx)
@@ -239,123 +203,6 @@ int config_wan_dp_to_cfg(const struct app_config *cfg, int dp_idx)
     return -1;
 }
 
-int config_wan_owner_profile(const struct app_config *cfg, int wan_idx, int skip_profile_id)
-{
-    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
-        return 0;
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (p->id == skip_profile_id)
-            continue;
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            if (p->wan_indices[wi] == wan_idx)
-                return p->id;
-        }
-    }
-    return 0;
-}
-
-static int profile_has_dup_index(const int *indices, int count)
-{
-    for (int i = 0; i < count; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (indices[i] == indices[j])
-                return 1;
-        }
-    }
-    return 0;
-}
-
-static int config_validate_policy_db_ids_across_profiles(const struct app_config *cfg)
-{
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *a = &cfg->profiles[pi];
-
-        for (int pj = pi + 1; pj < cfg->profile_count; pj++) {
-            const struct profile_config *b = &cfg->profiles[pj];
-
-            for (int ai = 0; ai < a->policy_count; ai++) {
-                int a_idx = a->policy_indices[ai];
-
-                if (a_idx < 0 || a_idx >= cfg->policy_count)
-                    continue;
-                for (int bi = 0; bi < b->policy_count; bi++) {
-                    int b_idx = b->policy_indices[bi];
-
-                    if (b_idx < 0 || b_idx >= cfg->policy_count)
-                        continue;
-                    if (cfg->policies[a_idx].db_id <= 0)
-                        continue;
-                    if (cfg->policies[a_idx].db_id == cfg->policies[b_idx].db_id) {
-                        fprintf(stderr,
-                                "[VALIDATE] duplicate policy db_id=%d (profile %d and %d)\n",
-                                cfg->policies[a_idx].db_id, a->id, b->id);
-                        return -1;
-                    }
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-static int config_validate_profiles(const struct app_config *cfg)
-{
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-
-        if (profile_has_dup_index(p->local_indices, p->local_count)) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: duplicate LAN binding in profile config\n",
-                    p->id);
-            return -1;
-        }
-        if (profile_has_dup_index(p->wan_indices, p->wan_count)) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: duplicate WAN binding in profile config\n",
-                    p->id);
-            return -1;
-        }
-        if (profile_has_dup_index(p->policy_indices, p->policy_count)) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: duplicate policy binding in profile config\n",
-                    p->id);
-            return -1;
-        }
-
-        for (int li = 0; li < p->local_count; li++) {
-            int idx = p->local_indices[li];
-            int owner;
-
-            if (idx < 0 || idx >= cfg->local_count)
-                continue;
-            owner = config_local_owner_profile(cfg, idx, p->id);
-            if (owner > 0) {
-                fprintf(stderr,
-                        "[VALIDATE] profile %d: LAN %s already used by profile %d\n",
-                        p->id, cfg->locals[idx].ifname, owner);
-                return -1;
-            }
-        }
-        for (int wi = 0; wi < p->wan_count; wi++) {
-            int idx = p->wan_indices[wi];
-            int owner;
-
-            if (idx < 0 || idx >= cfg->wan_count)
-                continue;
-            owner = config_wan_owner_profile(cfg, idx, p->id);
-            if (owner > 0) {
-                fprintf(stderr,
-                        "[VALIDATE] profile %d: WAN %s already used by profile %d\n",
-                        p->id, cfg->wans[idx].ifname, owner);
-                return -1;
-            }
-        }
-    }
-    return config_validate_policy_db_ids_across_profiles(cfg);
-}
-
 int config_validate(struct app_config *cfg) {
     for (int i = 0; i < cfg->local_count; i++) {
         struct local_config *local = &cfg->locals[i];
@@ -380,8 +227,6 @@ int config_validate(struct app_config *cfg) {
         }
     }
 
-    if (config_validate_profiles(cfg) != 0)
-        return -1;
     return 0;
 }
 
@@ -391,69 +236,6 @@ static int cidr_match_with_negate(int any_flag, int negate,
         return 1;
     int in_cidr = ((ip & mask) == (net & mask));
     return negate ? !in_cidr : in_cidr;
-}
-
-int config_select_profile_for_local(const struct app_config *cfg, int local_idx) {
-    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
-        return -1;
-
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->local_count; i++) {
-            if (p->local_indices[i] == local_idx)
-                return pi;
-        }
-    }
-    return -1;
-}
-
-static int policy_covers_ip(const struct crypto_policy *cp, uint32_t ip)
-{
-    int src_hit = 0, dst_hit = 0;
-
-    if (!cp)
-        return 0;
-    /* Catch-all any/any: every IP is in scope. Otherwise only non-any sides. */
-    if (cp->src_any && cp->dst_any)
-        return 1;
-    if (!cp->src_any)
-        src_hit = cidr_match_with_negate(0, cp->src_negate, ip, cp->src_net, cp->src_mask);
-    if (!cp->dst_any)
-        dst_hit = cidr_match_with_negate(0, cp->dst_negate, ip, cp->dst_net, cp->dst_mask);
-    return src_hit || dst_hit;
-}
-
-int config_local_policies_cover_ip(const struct app_config *cfg, int local_idx, uint32_t ip)
-{
-    if (!cfg || local_idx < 0 || local_idx >= cfg->local_count)
-        return 0;
-
-    for (int pi = 0; pi < cfg->profile_count; pi++) {
-        const struct profile_config *p = &cfg->profiles[pi];
-        int owns = 0;
-
-        if (!p->enabled)
-            continue;
-        for (int i = 0; i < p->local_count; i++) {
-            if (p->local_indices[i] == local_idx) {
-                owns = 1;
-                break;
-            }
-        }
-        if (!owns)
-            continue;
-
-        for (int i = 0; i < p->policy_count; i++) {
-            int poli = p->policy_indices[i];
-            if (poli < 0 || poli >= cfg->policy_count)
-                continue;
-            if (policy_covers_ip(&cfg->policies[poli], ip))
-                return 1;
-        }
-    }
-    return 0;
 }
 
 static int policy_port_is_any(int from, int to)
@@ -561,8 +343,8 @@ void config_refresh_policy_in_any(struct app_config *cfg)
     memset(s_pol_in_n, 0, sizeof(s_pol_in_n));
     if (!cfg)
         return;
-    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
-        struct profile_config *p = &cfg->profiles[pi];
+    if (cfg->profile_count > 0) {
+        struct profile_config *p = &cfg->profiles[0];
         int skip = 0;
         int n = 0;
 
@@ -584,10 +366,10 @@ void config_refresh_policy_in_any(struct app_config *cfg)
                 if (poli < 0 || poli >= cfg->policy_count)
                     continue;
                 if (n < MAX_CRYPTO_POLICIES)
-                    pol_in_fill(&s_pol_in[pi][n++], &cfg->policies[poli]);
+                    pol_in_fill(&s_pol_in[0][n++], &cfg->policies[poli]);
             }
         }
-        s_pol_in_n[pi] = n;
+        s_pol_in_n[0] = n;
         fprintf(stderr,
                 "[CRYPTO-GUARD] profile %d (%s) WAN IN 5-tuple gate %s (%d compact rules)\n",
                 p->id, p->name, skip ? "OFF (catch-all any/any)" : "ON", n);
