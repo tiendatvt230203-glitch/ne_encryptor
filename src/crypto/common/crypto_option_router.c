@@ -60,11 +60,10 @@ uint32_t crypto_option_get_mtu(void)
 
 crypto_option_id crypto_option_from_action_mode_bits(int action, int mode)
 {
+    (void)mode;
     if (action == POLICY_ACTION_BYPASS)
         return CRYPTO_OPT_BYPASS;
-    if (action == POLICY_ACTION_ENCRYPT_L2 && mode == CRYPTO_MODE_PQC)
-        return CRYPTO_OPT_L2_PQC;
-    return CRYPTO_OPT_BYPASS;
+    return CRYPTO_OPT_L2_PQC;
 }
 
 crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp)

@@ -571,9 +571,6 @@ void config_refresh_policy_in_any(struct app_config *cfg)
 
             if (poli < 0 || poli >= cfg->policy_count)
                 continue;
-            if (cfg->policies[poli].action == POLICY_ACTION_ENCRYPT_L3 ||
-                cfg->policies[poli].action == POLICY_ACTION_ENCRYPT_L4)
-                continue;
             if (crypto_policy_is_catchall(&cfg->policies[poli])) {
                 skip = 1;
                 break;
@@ -585,9 +582,6 @@ void config_refresh_policy_in_any(struct app_config *cfg)
                 int poli = p->policy_indices[i];
 
                 if (poli < 0 || poli >= cfg->policy_count)
-                    continue;
-                if (cfg->policies[poli].action == POLICY_ACTION_ENCRYPT_L3 ||
-                    cfg->policies[poli].action == POLICY_ACTION_ENCRYPT_L4)
                     continue;
                 if (n < MAX_CRYPTO_POLICIES)
                     pol_in_fill(&s_pol_in[pi][n++], &cfg->policies[poli]);
@@ -694,9 +688,6 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
             continue;
 
         const struct crypto_policy *cp = &cfg->policies[pi];
-        if (cp->action == POLICY_ACTION_ENCRYPT_L3 ||
-            cp->action == POLICY_ACTION_ENCRYPT_L4)
-            continue;
         if (!crypto_policy_match_packet(cp, src_ip, dst_ip, src_port, dst_port, protocol))
             continue;
 

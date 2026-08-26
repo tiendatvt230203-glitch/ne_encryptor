@@ -159,9 +159,9 @@ void fwd_crypto_snapshot_active_to_prev(void)
     prev_grace_active = (prev_active_policy_count > 0) ? 1 : 0;
     prev_grace_until_ms = monotonic_ms() + FWD_CRYPTO_PROFILE_RELOAD_GRACE_MS;
 }
-static int crypto_action_valid(int action)
+static int crypto_policy_is_encrypt(const struct crypto_policy *cp)
 {
-    return action == POLICY_ACTION_ENCRYPT_L2;
+    return cp && cp->action != POLICY_ACTION_BYPASS;
 }
 
 static void crypto_runtime_reset_indexes(void)
@@ -199,7 +199,7 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
             if (pi < 0 || pi >= cfg->policy_count)
                 continue;
             cp = &cfg->policies[pi];
-            if (cp->crypto_mode != CRYPTO_MODE_PQC)
+            if (!crypto_policy_is_encrypt(cp))
                 continue;
 
             for (int i = 0; i < active_policy_count; i++) {
@@ -226,12 +226,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
     int old_policy_crypto_ready[MAX_CRYPTO_POLICIES];
     int old_policy_index_by_wire_id[256];
-    struct crypto_policy old_active_policies[MAX_CRYPTO_POLICIES];
     int old_active_policy_count = active_policy_count;
     memcpy(old_policy_crypto_ctx, policy_crypto_ctx, sizeof(old_policy_crypto_ctx));
     memcpy(old_policy_crypto_ready, policy_crypto_ready, sizeof(old_policy_crypto_ready));
     memcpy(old_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(old_policy_index_by_wire_id));
-    memcpy(old_active_policies, active_policies, sizeof(old_active_policies));
 
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
     memset(active_policies, 0, sizeof(active_policies));
@@ -260,9 +258,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     for (int i = 0; i < active_policy_count; i++) {
         const struct crypto_policy *cp = &cfg->policies[i];
         active_policies[i] = *cp;
-        if (!crypto_action_valid(cp->action))
-            continue;
-        if (cp->crypto_mode != CRYPTO_MODE_PQC)
+        if (!crypto_policy_is_encrypt(cp))
             continue;
         if (cp->id >= 0 && cp->id <= 255)
             policy_index_by_wire_id[(uint8_t)cp->id] = i;
@@ -271,30 +267,25 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         if (cp->id >= 0 && cp->id <= 255) {
             int old_i = old_policy_index_by_wire_id[(uint8_t)cp->id];
             if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
-                const struct crypto_policy *old_cp = &old_active_policies[old_i];
-                if (old_cp->crypto_mode == cp->crypto_mode) {
-                    policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
-                    policy_crypto_ready[i] = 1;
-                    reused = 1;
-                    policy_crypto_ctx[i].pqc_from_handshake = true;
-                    packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
-                }
+                policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
+                policy_crypto_ready[i] = 1;
+                reused = 1;
+                policy_crypto_ctx[i].pqc_from_handshake = true;
+                packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
             }
         }
         if (reused)
             continue;
 
-        if (cp->crypto_mode == CRYPTO_MODE_PQC) {
-            memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
-            policy_crypto_ctx[i].initialized = true;
-            policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
-            policy_crypto_ctx[i].policy_id = cp->db_id;
-            policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
-            policy_crypto_ctx[i].pqc_from_handshake = true;
-            policy_crypto_ready[i] = 1;
-            /* Only populate keys when handshake key_ready; else keep all-zero (block TX/RX). */
-            packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
-        }
+        memset(&policy_crypto_ctx[i], 0, sizeof(policy_crypto_ctx[i]));
+        policy_crypto_ctx[i].initialized = true;
+        policy_crypto_ctx[i].crypto_mode = CRYPTO_MODE_PQC;
+        policy_crypto_ctx[i].policy_id = cp->db_id;
+        policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
+        policy_crypto_ctx[i].pqc_from_handshake = true;
+        policy_crypto_ready[i] = 1;
+        /* Only populate keys when handshake key_ready; else keep all-zero (block TX/RX). */
+        packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
     }
 
     for (int pidx = 0; pidx < cfg->profile_count && pidx < MAX_PROFILES; pidx++) {
@@ -304,9 +295,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             if (pi < 0 || pi >= cfg->policy_count)
                 continue;
             const struct crypto_policy *cp = &cfg->policies[pi];
-            if (!crypto_action_valid(cp->action))
-                continue;
-            if (cp->crypto_mode != CRYPTO_MODE_PQC)
+            if (!crypto_policy_is_encrypt(cp))
                 continue;
             if (cp->id >= 0 && cp->id <= 255) {
                 int old_pid = policy_profile_id_by_wire_id[(uint8_t)cp->id];
@@ -317,7 +306,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
                 }
                 policy_profile_id_by_wire_id[(uint8_t)cp->id] = p->id;
             }
-            if (cp->crypto_mode == CRYPTO_MODE_PQC && policy_crypto_ready[pi]) {
+            if (policy_crypto_ready[pi]) {
                 policy_crypto_ctx[pi].profile_id = p->id;
                 policy_crypto_ctx[pi].policy_id = cp->db_id;
             }

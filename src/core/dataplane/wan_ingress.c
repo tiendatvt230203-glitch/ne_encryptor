@@ -44,13 +44,15 @@ static int wan_l2_is_udp_frag(const uint8_t *pkt, uint32_t len)
     return frag_index <= 1u && reserved == 0u;
 }
 
-static const struct crypto_policy *fwd_policy_by_action_wire_id(struct forwarder *fwd, int action, uint8_t wire_id)
+static const struct crypto_policy *fwd_policy_by_wire_id(struct forwarder *fwd, uint8_t wire_id)
 {
     if (!fwd || !fwd->cfg)
         return NULL;
     for (int i = 0; i < fwd->cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
         const struct crypto_policy *cp = &fwd->cfg->policies[i];
-        if (cp->action == action && (uint8_t)cp->id == wire_id)
+        if (cp->action == POLICY_ACTION_BYPASS)
+            continue;
+        if ((uint8_t)cp->id == wire_id)
             return cp;
     }
     return NULL;
@@ -82,8 +84,6 @@ static int wan_wire_is_encrypted(struct forwarder *fwd, const uint8_t *pkt, uint
 static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
 {
     struct packet_crypto_ctx *ctx;
-    const struct crypto_policy *cp;
-    crypto_option_id opt;
     uint8_t wire_id = 0;
     uint8_t scratch[NE_FRAME];
     uint32_t orig_len;
@@ -97,15 +97,13 @@ static int decrypt_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len)
     ctx = fwd_crypto_ctx_for_wire_id(wire_id);
     if (!ctx)
         return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_PQC;
 
     orig_len = *len;
     if (orig_len > NE_FRAME)
         return -1;
     memcpy(scratch, pkt, orig_len);
 
-    if (crypto_option_decrypt(opt, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
+    if (crypto_option_decrypt(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_TCP, ctx, pkt, len) == 0 &&
         crypto_pkt_is_ipv4(pkt, *len))
         return 0;
 
@@ -118,8 +116,6 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
                          uint8_t policy_id, uint64_t addr, int *pending)
 {
     struct packet_crypto_ctx *ctx;
-    const struct crypto_policy *cp;
-    crypto_option_id opt;
     int slot, rr;
     uint32_t blen = 0;
 
@@ -130,10 +126,8 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
         fwd_crypto_profile_id_for_wire_id(policy_id));
     if (slot < 0)
         return -1;
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, policy_id);
-    opt = cp ? crypto_option_from_policy(cp) : CRYPTO_OPT_L2_PQC;
     crypto_l2_pqc_reasm_set_addr(addr);
-    rr = crypto_option_reassemble(opt, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
+    rr = crypto_option_reassemble(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP, slot, dp_crypto_current_worker_idx(),
                                   ctx, pkt, len, pkt, &blen);
     if (rr == 0) {
         *pending = crypto_l2_pqc_reasm_held() ? 2 : 1;
@@ -152,7 +146,6 @@ static int reassemble_l2(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
 static int wan_try_l2_pqc_frag(struct forwarder *fwd, uint8_t *pkt, uint32_t *len,
                                uint64_t addr, int *pending)
 {
-    const struct crypto_policy *cp;
     uint8_t wire_pol = 0;
     uint8_t scratch[NE_FRAME];
     uint32_t orig_len;
@@ -163,8 +156,7 @@ static int wan_try_l2_pqc_frag(struct forwarder *fwd, uint8_t *pkt, uint32_t *le
     if (crypto_eth_l2_read_policy_id(pkt, *len, &wire_pol) != 0)
         return 0;
 
-    cp = fwd_policy_by_action_wire_id(fwd, POLICY_ACTION_ENCRYPT_L2, wire_pol);
-    if (!cp || cp->crypto_mode != CRYPTO_MODE_PQC)
+    if (!fwd_policy_by_wire_id(fwd, wire_pol))
         return 0;
 
     if (!fwd_crypto_ctx_for_wire_id(wire_pol))
@@ -415,7 +407,7 @@ static void wan_clamp_tcp_mss(struct forwarder *fwd, uint8_t *pkt, uint32_t len)
     if (!best)
         return;
     (void)crypto_tcp_clamp_mss(pkt, len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
-                               crypto_option_wire_overhead(crypto_option_from_policy(best)));
+                               crypto_option_wire_overhead(CRYPTO_OPT_L2_PQC));
 }
 
 static int wan_profile_pi(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)

@@ -525,14 +525,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         cp_base.priority = atoi(PQgetvalue(res, r, 1));
         cp_base.action = parse_action_name(PQgetvalue(res, r, 2));
 
-        if (cp_base.action == POLICY_ACTION_ENCRYPT_L3 ||
-            cp_base.action == POLICY_ACTION_ENCRYPT_L4) {
-            fprintf(stderr,
-                    "[CRYPTO] skip policy db_id=%d: L3/L4 encrypt unused, not loaded into datapath\n",
-                    db_policy_id);
-            continue;
-        }
-
         int proto_null = PQgetisnull(res, r, 3);
         cp_base.protocol = parse_protocol_name(proto_null ? NULL : PQgetvalue(res, r, 3));
 
@@ -544,38 +536,25 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         const char *dport_joined = PQgetvalue(res, r, 9);
         int method_null = PQgetisnull(res, r, 10);
         const char *method_txt = method_null ? NULL : PQgetvalue(res, r, 10);
+        (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
 
+        memset(cp_base.key, 0, sizeof(cp_base.key));
         if (cp_base.action == POLICY_ACTION_BYPASS) {
-            memset(cp_base.key, 0, sizeof(cp_base.key));
             cp_base.id = 0;
         } else {
-            (void)ne_parse_method(method_txt, method_null, &cp_base.crypto_mode, &cp_base.aes_bits);
-            if (cp_base.crypto_mode == CRYPTO_MODE_PQC) {
-                const int profile_pi = cfg->profile_count - 1;
-                sig_pqc_load_and_bind_policy(conn, cfg, profile_pi, db_policy_id, p->id);
-                int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
-                if (wire_id < 0) {
-                    fprintf(stderr, "[DB CRYPTO] no free wire policy id for PQC policy %d\n",
-                            db_policy_id);
-                    PQclear(res);
-                    return -1;
-                }
-                cp_base.id = wire_id;
-                cp_base.aes_bits = 256;
-                memset(cp_base.key, 0, sizeof(cp_base.key));
+            /* Encrypt = L2 PQC only. DB L3/L4/CTR/GCM strings stay parsed, then coerced. */
+            cp_base.action = POLICY_ACTION_ENCRYPT_L2;
+            cp_base.crypto_mode = CRYPTO_MODE_PQC;
+            cp_base.aes_bits = 256;
+            sig_pqc_load_and_bind_policy(conn, cfg, cfg->profile_count - 1, db_policy_id, p->id);
+            int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
+            if (wire_id < 0) {
+                fprintf(stderr, "[DB CRYPTO] no free wire policy id for encrypt policy %d\n",
+                        db_policy_id);
+                PQclear(res);
+                return -1;
             }
-            else {
-                memset(cp_base.key, 0, sizeof(cp_base.key));
-                {
-                    int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
-                    if (wire_id < 0) {
-                        fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
-                        PQclear(res);
-                        return -1;
-                    }
-                    cp_base.id = wire_id;
-                }
-            }
+            cp_base.id = wire_id;
         }
 
         if (config_policy_db_id_taken(cfg, cp_base.db_id)) {
@@ -817,22 +796,17 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
         return 0;
     }
 
-    int has_l2_pqc = 0;
+    int has_encrypt = 0;
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp) continue;
-        if (cp->action == POLICY_ACTION_ENCRYPT_L2 && cp->crypto_mode == CRYPTO_MODE_PQC)
-            has_l2_pqc = 1;
-        else if (cp->action != POLICY_ACTION_BYPASS) {
-            fprintf(stderr,
-                    "[CRYPTO] policy db_id=%d action=%d mode=%d loaded but not on datapath (L2 PQC only)\n",
-                    cp->db_id, cp->action, cp->crypto_mode);
-        }
+        if (cp->action != POLICY_ACTION_BYPASS)
+            has_encrypt = 1;
     }
 
-    cfg->crypto_enabled = has_l2_pqc ? 1 : 0;
-    if (has_l2_pqc)
+    cfg->crypto_enabled = has_encrypt ? 1 : 0;
+    if (has_encrypt)
         cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
 
     return 0;

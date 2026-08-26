@@ -93,9 +93,10 @@ static int encrypt_to_wan(struct forwarder *fwd, struct ne_packet *job,
     uint8_t *tail_buf = NULL;
     uint32_t len = job->len;
     uint32_t l1 = 0, l2 = 0;
-    crypto_option_id opt_id = crypto_option_from_policy(cp);
+    crypto_option_id opt_id = CRYPTO_OPT_L2_PQC;
 
     (void)flow_ok;
+    (void)cp;
 
     if (crypto_option_need_split(opt_id, pclass, len)) {
         if (split_tail_take(fwd, worker_idx, &tail.addr) != 0)
@@ -196,24 +197,12 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         (void)push_to_wan(fwd, &job, wan_dp);
         return;
     }
-    if (cp->action != POLICY_ACTION_ENCRYPT_L2 || cp->crypto_mode != CRYPTO_MODE_PQC) {
-        static int unsupported_logged;
-        if (!unsupported_logged) {
-            unsupported_logged = 1;
-            fprintf(stderr,
-                    "[CRYPTO] datapath is L2 PQC only; drop unsupported policy db_id=%d action=%d mode=%d\n",
-                    cp->db_id, cp->action, cp->crypto_mode);
-            fflush(stderr);
-        }
-        goto drop;
-    }
     if (!fwd->cfg->crypto_enabled)
         goto drop;
 
     if (proto == IPPROTO_TCP) {
-        crypto_option_id opt = crypto_option_from_policy(cp);
         (void)crypto_tcp_clamp_mss(pkt, job.len, CRYPTO_OPT_FRAG_MTU_DEFAULT,
-                                   crypto_option_wire_overhead(opt));
+                                   crypto_option_wire_overhead(CRYPTO_OPT_L2_PQC));
     }
 
     pi = (int)(cp - fwd->cfg->policies);
@@ -224,8 +213,8 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
     pctx->wire_id = (uint8_t)cp->id;
-    pctx->policy_id = (cp->crypto_mode == CRYPTO_MODE_PQC) ? cp->db_id : cp->id;
-    if (cp->crypto_mode == CRYPTO_MODE_PQC) {
+    pctx->policy_id = cp->db_id;
+    {
         uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
         const uint8_t *k;
         const char *why = NULL;
