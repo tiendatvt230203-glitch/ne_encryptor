@@ -1,10 +1,8 @@
 #include "../../../inc/crypto/crypto_option.h"
-#include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/interface.h"
 
 #include <netinet/in.h>
 #include <stdatomic.h>
-#include <string.h>
 
 /* ===================== worker bind ===================== */
 
@@ -31,106 +29,6 @@ crypto_proto_class crypto_proto_classify(uint8_t ip_proto)
     if (ip_proto == 89) /* IPPROTO_OSPF */
         return CRYPTO_PROTO_OSPF;
     return CRYPTO_PROTO_OTHER;
-}
-
-/* ===================== ingress policy extract ===================== */
-
-int crypto_l3_extract_policy_id(const struct app_config *cfg,
-                                uint8_t *pkt,
-                                uint32_t pkt_len,
-                                uint8_t *policy_id_out)
-{
-    const int tunnel_hdr_size = PACKET_CRYPTO_NONCE_BYTES + 2;
-
-    if (!cfg || !pkt || !policy_id_out || pkt_len < 14 + 20)
-        return -1;
-
-    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800)
-        return -1;
-
-    int l3_off = 14;
-    int ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
-        return -1;
-
-    if (pkt[l3_off + 9] != L3_FAKE_PROTOCOL)
-        return -1;
-
-    int tunnel_off = l3_off + ip_hdr_len;
-    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size))
-        return -1;
-
-    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-        const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L3)
-            continue;
-        const int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 1 >= (int)pkt_len)
-            continue;
-        if (pkt[tunnel_off + ns] != (uint8_t)cp->id)
-            continue;
-        *policy_id_out = (uint8_t)cp->id;
-        return 0;
-    }
-    return -1;
-}
-
-int crypto_l4_extract_policy_id_ipv4(const struct app_config *cfg,
-                                      uint8_t *pkt,
-                                      uint32_t pkt_len,
-                                      uint8_t *policy_id_out)
-{
-    if (!cfg || !pkt || !policy_id_out)
-        return -1;
-
-    int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
-    if (l3_off < 0)
-        return -1;
-    if (pkt_len < (uint32_t)(l3_off + 20))
-        return -1;
-
-    uint8_t ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-    if (ip_hdr_len < 20)
-        return -1;
-    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 4))
-        return -1;
-
-    uint8_t ip_proto = pkt[l3_off + 9];
-    if (ip_proto != 6 && ip_proto != 17 && ip_proto != 1)
-        return -1;
-    int transport_off = l3_off + ip_hdr_len;
-    if (transport_off >= (int)pkt_len)
-        return -1;
-
-    int tunnel_off = transport_off + L4_WIRE_PORT_LEN;
-    if (tunnel_off >= (int)pkt_len)
-        return -1;
-
-    /* New: nonce|core|policy|marker ; Old: nonce|policy|magic (UDP/ICMP chưa đổi) */
-    for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-        const struct crypto_policy *cp = &cfg->policies[pi];
-        if (!cp || cp->action != POLICY_ACTION_ENCRYPT_L4)
-            continue;
-        const int ns = PACKET_CRYPTO_NONCE_BYTES;
-        if (tunnel_off + ns + 2 < (int)pkt_len) {
-            uint8_t marker = pkt[tunnel_off + ns + 2];
-            if ((marker == 0xA5 || marker == 0x5A) &&
-                pkt[tunnel_off + ns + 1] == (uint8_t)cp->id) {
-                *policy_id_out = (uint8_t)cp->id;
-                return 0;
-            }
-        }
-        if (tunnel_off + ns + 1 < (int)pkt_len) {
-            uint8_t magic = pkt[tunnel_off + ns + 1];
-            if ((magic == 0xA5 || magic == 0x5A) &&
-                pkt[tunnel_off + ns] == (uint8_t)cp->id) {
-                *policy_id_out = (uint8_t)cp->id;
-                return 0;
-            }
-        }
-    }
-
-    return -1;
 }
 
 /* ===================== option router ===================== */
@@ -160,25 +58,12 @@ uint32_t crypto_option_get_mtu(void)
     return mtu;
 }
 
-crypto_option_id crypto_option_from_action_mode_bits(int action, int mode, int aes_bits)
+crypto_option_id crypto_option_from_action_mode_bits(int action, int mode)
 {
     if (action == POLICY_ACTION_BYPASS)
         return CRYPTO_OPT_BYPASS;
-    if (action == POLICY_ACTION_ENCRYPT_L2) {
-        if (mode == CRYPTO_MODE_PQC) return CRYPTO_OPT_L2_PQC;
-        if (mode == CRYPTO_MODE_GCM) return (aes_bits == 256) ? CRYPTO_OPT_L2_GCM256 : CRYPTO_OPT_L2_GCM128;
-        return (aes_bits == 256) ? CRYPTO_OPT_L2_CTR256 : CRYPTO_OPT_L2_CTR128;
-    }
-    if (action == POLICY_ACTION_ENCRYPT_L3) {
-        if (mode == CRYPTO_MODE_PQC) return CRYPTO_OPT_L3_PQC;
-        if (mode == CRYPTO_MODE_GCM) return (aes_bits == 256) ? CRYPTO_OPT_L3_GCM256 : CRYPTO_OPT_L3_GCM128;
-        return (aes_bits == 256) ? CRYPTO_OPT_L3_CTR256 : CRYPTO_OPT_L3_CTR128;
-    }
-    if (action == POLICY_ACTION_ENCRYPT_L4) {
-        if (mode == CRYPTO_MODE_PQC) return CRYPTO_OPT_L4_PQC;
-        if (mode == CRYPTO_MODE_GCM) return (aes_bits == 256) ? CRYPTO_OPT_L4_GCM256 : CRYPTO_OPT_L4_GCM128;
-        return (aes_bits == 256) ? CRYPTO_OPT_L4_CTR256 : CRYPTO_OPT_L4_CTR128;
-    }
+    if (action == POLICY_ACTION_ENCRYPT_L2 && mode == CRYPTO_MODE_PQC)
+        return CRYPTO_OPT_L2_PQC;
     return CRYPTO_OPT_BYPASS;
 }
 
@@ -186,37 +71,14 @@ crypto_option_id crypto_option_from_policy(const struct crypto_policy *cp)
 {
     if (!cp)
         return CRYPTO_OPT_BYPASS;
-    return crypto_option_from_action_mode_bits(cp->action, cp->crypto_mode, cp->aes_bits);
+    return crypto_option_from_action_mode_bits(cp->action, cp->crypto_mode);
 }
 
 uint32_t crypto_option_wire_overhead(crypto_option_id id)
 {
-    switch (id) {
-    case CRYPTO_OPT_L2_CTR128:
-    case CRYPTO_OPT_L2_CTR256:
-        return 14u;
-    case CRYPTO_OPT_L2_GCM128:
-    case CRYPTO_OPT_L2_GCM256:
-    case CRYPTO_OPT_L2_PQC:
+    if (id == CRYPTO_OPT_L2_PQC)
         return 30u;
-    case CRYPTO_OPT_L3_CTR128:
-    case CRYPTO_OPT_L3_CTR256:
-        return 14u;
-    case CRYPTO_OPT_L3_GCM128:
-    case CRYPTO_OPT_L3_GCM256:
-    case CRYPTO_OPT_L3_PQC:
-        return 30u;
-    case CRYPTO_OPT_L4_CTR128:
-    case CRYPTO_OPT_L4_CTR256:
-        return 15u; /* nonce12 + core + policy + marker */
-    case CRYPTO_OPT_L4_GCM128:
-    case CRYPTO_OPT_L4_GCM256:
-    case CRYPTO_OPT_L4_PQC:
-        return 31u; /* 15 + GCM tag 16 */
-    case CRYPTO_OPT_BYPASS:
-    default:
-        return 0u;
-    }
+    return 0u;
 }
 
 #define CALL_OPS(fn, id, proto, ...) do { \
@@ -290,14 +152,8 @@ int crypto_option_is_any_fragment(const struct app_config *cfg,
                                   const uint8_t *pkt_data, uint32_t pkt_len,
                                   uint16_t *pkt_id, uint8_t *frag_index)
 {
-    for (int i = 0; i < CRYPTO_OPT_COUNT; i++) {
-        if (i == CRYPTO_OPT_BYPASS)
-            continue;
-        if (crypto_option_is_fragment((crypto_option_id)i, CRYPTO_PROTO_UDP,
-                                      cfg, pkt_data, pkt_len, pkt_id, frag_index))
-            return 1;
-    }
-    return 0;
+    return crypto_option_is_fragment(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP,
+                                     cfg, pkt_data, pkt_len, pkt_id, frag_index);
 }
 
 void crypto_option_frag_gc(crypto_option_id id, crypto_proto_class proto,
@@ -308,10 +164,6 @@ void crypto_option_frag_gc(crypto_option_id id, crypto_proto_class proto,
 
 void crypto_option_frag_gc_all(int profile_slot, int worker_idx, uint64_t now_ns)
 {
-    for (int i = 0; i < CRYPTO_OPT_COUNT; i++) {
-        if (i == CRYPTO_OPT_BYPASS)
-            continue;
-        crypto_option_frag_gc((crypto_option_id)i, CRYPTO_PROTO_UDP,
-                                profile_slot, worker_idx, now_ns);
-    }
+    crypto_option_frag_gc(CRYPTO_OPT_L2_PQC, CRYPTO_PROTO_UDP,
+                          profile_slot, worker_idx, now_ns);
 }

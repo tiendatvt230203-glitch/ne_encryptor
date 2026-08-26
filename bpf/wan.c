@@ -23,7 +23,6 @@ struct {
 #define IPPROTO_TCP_VAL 6
 #define IPPROTO_UDP_VAL 17
 #define IPPROTO_OSPF_VAL 89
-#define IPPROTO_CUSTOM_VAL 99
 #define ETH_P_NE_ARP_ENC 0x1048
 #define ETH_P_CFM        0x8902
 
@@ -57,8 +56,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             return XDP_PASS;
 
         if (ip->protocol == IPPROTO_ICMP_VAL || ip->protocol == IPPROTO_TCP_VAL ||
-            ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_OSPF_VAL ||
-            ip->protocol == IPPROTO_CUSTOM_VAL) {
+            ip->protocol == IPPROTO_UDP_VAL || ip->protocol == IPPROTO_OSPF_VAL) {
             goto redirect;
         }
 

@@ -31,46 +31,9 @@ static int key_prefix_nonzero(const uint8_t *key, size_t len)
     return 0;
 }
 
-static void policy_ne_key_prefix_loaded(char *out, size_t outsz, int policy_index)
-{
-    struct packet_crypto_ctx *live_ctx = NULL;
-    const uint8_t *key;
-
-    if (policy_index < 0 || !fwd_crypto_policy_ready(policy_index)) {
-        out[0] = '\0';
-        return;
-    }
-
-    live_ctx = fwd_crypto_policy_ctx(policy_index);
-    if (!live_ctx || !live_ctx->initialized) {
-        out[0] = '\0';
-        return;
-    }
-
-    key = packet_crypto_get_key(live_ctx, KEY_SLOT_CURRENT);
-    if (!key_prefix_nonzero(key, 4)) {
-        out[0] = '\0';
-        return;
-    }
-
-    snprintf(out, outsz, "%02X%02X%02X%02X", key[0], key[1], key[2], key[3]);
-}
-
 static void print_system_table(const struct app_config *cfg, const char *event)
 {
     mac_learn_log_runtime_table(NULL, cfg, event);
-}
-
-void main_diag_log_ne_policy_key(int policy_index, int db_id)
-{
-    char prefix[DIAG_KEY_PREFIX_LEN];
-
-    policy_ne_key_prefix_loaded(prefix, sizeof(prefix), policy_index);
-    if (!prefix[0])
-        return;
-
-    fprintf(stderr, "[NE-KEY] policy db_id=%d Key prefix: %s\n", db_id, prefix);
-    fflush(stderr);
 }
 
 static void key_prefix_hex(char *out, size_t outsz, const uint8_t *key)

@@ -12,6 +12,7 @@
 #define PQC_HS_MSG_HELLO   1
 #define PQC_HS_MSG_RESP    2
 #define PQC_HS_MSG_KEEPALIVE 3
+/* L3: signed responder-to-initiator request to restart HELLO after reboot. */
 #define PQC_HS_MSG_POKE    4
 
 #define PQC_KEM_PK_SIZE    1184 // ML-KEM-768 PK size
@@ -84,6 +85,9 @@ typedef struct {
     uint64_t local_keepalive_seq;
     uint64_t peer_keepalive_epoch;
     uint64_t peer_keepalive_seq;
+    uint64_t keepalive_monitor_start_time;
+    uint64_t last_keepalive_rx_time;
+    uint64_t next_auto_retry_time;
 
     char *local_priv;
     char *local_pub;
@@ -119,14 +123,14 @@ typedef struct {
     char wan_ifname[64];
     char key_id[256];
 
-    bool key_ready;
-    bool is_initiator;
-    bool thread_started;
-    bool handshake_give_up;
-    bool rotation_give_up;
+    volatile bool key_ready;
+    volatile bool is_initiator;
+    volatile bool thread_started;
+    volatile bool handshake_give_up;
+    volatile bool rotation_give_up;
     bool giveup_logged;
-    bool send_poke;
-    bool keepalive_enabled;
+    volatile bool send_poke;
+    volatile bool keepalive_enabled;
     bool is_tunnel;
     volatile bool thread_exit_sig;
 } policy_key_binding_t;

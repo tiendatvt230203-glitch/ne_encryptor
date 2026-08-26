@@ -43,11 +43,6 @@ void cfm_set_state_callback(cfm_link_state_cb cb, void *user);
 /* Snapshot WAN peer MAC + UP/DOWN for unified [mac] table. */
 int cfm_snapshot_wan_peers(struct cfm_wan_snap *out, int max);
 
-/*
- * Same CFM is_up as the terminal [mac] WAN column.
- * name = wan ifname or bridge. Returns 1=UP, 0=DOWN, -1=not found.
- * CLI -gs talks to daemon over a tiny Unix socket (separate process).
- */
 int cfm_wan_status_by_name(const char *name);
 void cfm_status_ipc_start(void);
 int cfm_status_ipc_query(const char *name);

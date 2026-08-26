@@ -223,7 +223,7 @@ static struct opt_table *opt_table(int profile_slot, int worker_idx)
 }
 
 static int opt_policy_match(const struct app_config *cfg, int action, int mode,
-                            int aes_bits, uint8_t wire_id)
+                            uint8_t wire_id)
 {
     if (!cfg)
         return 0;
@@ -232,8 +232,6 @@ static int opt_policy_match(const struct app_config *cfg, int action, int mode,
         if (!cp || cp->action != action)
             continue;
         if (cp->crypto_mode != mode)
-            continue;
-        if (cp->aes_bits != aes_bits)
             continue;
         if ((uint8_t)cp->id == wire_id)
             return 1;
@@ -728,7 +726,7 @@ static int l2_udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_d
         return 0;
     if (crypto_eth_l2_read_policy_id(pkt_data, pkt_len, &wire_pol) != 0)
         return 0;
-    if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L2, CRYPTO_MODE_PQC, 256, wire_pol))
+    if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L2, CRYPTO_MODE_PQC, wire_pol))
         return 0;
     opt_read_frag_tag(pkt_data + tag_off + 1, pkt_id, frag_index);
     if (pkt_data[tag_off + 4] != 0) {

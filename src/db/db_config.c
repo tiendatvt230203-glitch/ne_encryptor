@@ -9,7 +9,6 @@
 #include <libpq-fe.h>
 #include <strings.h>
 #include <net/if.h>
-#include <openssl/sha.h>
 #include "../../inc/crypto/pqc_handshake.h"
 
 static int str_is_any(const char *v) {
@@ -234,18 +233,6 @@ static int ne_parse_method(const char *v, int pq_null, int *crypto_mode_out, int
     *crypto_mode_out = CRYPTO_MODE_GCM;
     *aes_bits_out = 128;
     return 0;
-}
-
-static void ne_fill_policy_key(const char *enc_key, int enc_null, int key_len_bytes, uint8_t *out) {
-    
-    memset(out, 0, AES_KEY_LEN);
-    if (enc_null || !enc_key || !enc_key[0])
-        return;
-    if (parse_hex_bytes_pub(enc_key, out, key_len_bytes) == 0)
-        return;
-    unsigned char md[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char *)enc_key, strlen(enc_key), md);
-    memcpy(out, md, (size_t)key_len_bytes);
 }
 
 static void ne_cidr_buf_with_invert(char *buf, size_t bufsz, const char *tok, int invert_db) {
@@ -538,14 +525,16 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         cp_base.priority = atoi(PQgetvalue(res, r, 1));
         cp_base.action = parse_action_name(PQgetvalue(res, r, 2));
 
-        int proto_null = PQgetisnull(res, r, 3);
-        cp_base.protocol = parse_protocol_name(proto_null ? NULL : PQgetvalue(res, r, 3));
-        if (cp_base.action == POLICY_ACTION_ENCRYPT_L4 && cp_base.protocol == 89) {
+        if (cp_base.action == POLICY_ACTION_ENCRYPT_L3 ||
+            cp_base.action == POLICY_ACTION_ENCRYPT_L4) {
             fprintf(stderr,
-                    "[DB CRYPTO] skip policy id=%d: protocol OSPF(89) is not supported with action L4\n",
+                    "[CRYPTO] skip policy db_id=%d: L3/L4 encrypt unused, not loaded into datapath\n",
                     db_policy_id);
             continue;
         }
+
+        int proto_null = PQgetisnull(res, r, 3);
+        cp_base.protocol = parse_protocol_name(proto_null ? NULL : PQgetvalue(res, r, 3));
 
         const char *src_joined = PQgetvalue(res, r, 4);
         int invert_src = (strcmp(PQgetvalue(res, r, 5), "t") == 0);
@@ -555,12 +544,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         const char *dport_joined = PQgetvalue(res, r, 9);
         int method_null = PQgetisnull(res, r, 10);
         const char *method_txt = method_null ? NULL : PQgetvalue(res, r, 10);
-        int enc_null = PQgetisnull(res, r, 11);
-        const char *enc_key = enc_null ? NULL : PQgetvalue(res, r, 11);
 
         if (cp_base.action == POLICY_ACTION_BYPASS) {
-            cp_base.crypto_mode = CRYPTO_MODE_GCM;
-            cp_base.aes_bits = 128;
             memset(cp_base.key, 0, sizeof(cp_base.key));
             cp_base.id = 0;
         } else {
@@ -580,10 +565,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 memset(cp_base.key, 0, sizeof(cp_base.key));
             }
             else {
-                if (cp_base.aes_bits != 256)
-                    cp_base.aes_bits = 128;
-                int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
-                ne_fill_policy_key(enc_key, enc_null, key_len, cp_base.key);
+                memset(cp_base.key, 0, sizeof(cp_base.key));
                 {
                     int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
                     if (wire_id < 0) {
@@ -818,11 +800,9 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
 
 int config_apply_crypto_from_policies(struct app_config *cfg) {
     cfg->crypto_enabled = 0;
-    cfg->encrypt_layer = 0;
-    cfg->fake_protocol = 0;
     cfg->fake_ethertype_ipv4 = 0;
-    cfg->crypto_mode = CRYPTO_MODE_CTR;
-    cfg->aes_bits = 128;
+    cfg->crypto_mode = CRYPTO_MODE_PQC;
+    cfg->aes_bits = 256;
     memset(cfg->crypto_key, 0, sizeof(cfg->crypto_key));
 
     if (cfg->policy_count <= 0) {
@@ -837,46 +817,23 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
         return 0;
     }
 
-    int has_l2 = 0, has_l3 = 0, has_l4 = 0;
-    int first_key_pi = -1;
+    int has_l2_pqc = 0;
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp) continue;
-        if (cp->action == POLICY_ACTION_ENCRYPT_L2) has_l2 = 1;
-        else if (cp->action == POLICY_ACTION_ENCRYPT_L3) has_l3 = 1;
-        else if (cp->action == POLICY_ACTION_ENCRYPT_L4) has_l4 = 1;
-
-        if (cp->action != POLICY_ACTION_BYPASS) {
-            int nonzero = 0;
-            for (int k = 0; k < AES_KEY_LEN; k++) {
-                if (cp->key[k] != 0) { nonzero = 1; break; }
-            }
-            if (nonzero && first_key_pi < 0)
-                first_key_pi = pi;
+        if (cp->action == POLICY_ACTION_ENCRYPT_L2 && cp->crypto_mode == CRYPTO_MODE_PQC)
+            has_l2_pqc = 1;
+        else if (cp->action != POLICY_ACTION_BYPASS) {
+            fprintf(stderr,
+                    "[CRYPTO] policy db_id=%d action=%d mode=%d loaded but not on datapath (L2 PQC only)\n",
+                    cp->db_id, cp->action, cp->crypto_mode);
         }
     }
 
-    cfg->crypto_enabled = (has_l2 || has_l3 || has_l4) ? 1 : 0;
-    if (cfg->crypto_enabled) {
-        if (has_l3 || has_l4) cfg->encrypt_layer = 3;
-        else if (has_l2) cfg->encrypt_layer = 2;
-        else cfg->encrypt_layer = 4;
-    }
-
-    if (cfg->crypto_enabled && first_key_pi >= 0) {
-        const struct crypto_policy *cp = &cfg->policies[first_key_pi];
-        cfg->crypto_mode = cp->crypto_mode;
-        cfg->aes_bits = (cp->aes_bits == 256) ? 256 : 128;
-        memcpy(cfg->crypto_key, cp->key, sizeof(cfg->crypto_key));
-    }
-
-    if (has_l3 || has_l4) {
-        cfg->fake_protocol = 99;
-    }
-    if (has_l2) {
+    cfg->crypto_enabled = has_l2_pqc ? 1 : 0;
+    if (has_l2_pqc)
         cfg->fake_ethertype_ipv4 = (uint16_t)NE_L2_FAKE_ETHERTYPE;
-    }
 
     return 0;
 }

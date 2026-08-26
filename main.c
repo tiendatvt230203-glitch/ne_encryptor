@@ -486,8 +486,6 @@ static int config_db_unchanged(const struct app_config *old,
         old->policy_count != new->policy_count ||
         old->profile_count != new->profile_count ||
         old->crypto_enabled != new->crypto_enabled ||
-        old->encrypt_layer != new->encrypt_layer ||
-        old->fake_protocol != new->fake_protocol ||
         old->fake_ethertype_ipv4 != new->fake_ethertype_ipv4 ||
         old->crypto_mode != new->crypto_mode ||
         old->aes_bits != new->aes_bits ||

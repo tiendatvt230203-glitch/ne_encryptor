@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "aes_crypto.h"
+#define AES_MAX_KEY_SIZE   32
+#define AES_GCM_TAG_SIZE   16
 
 #define ETH_HEADER_SIZE            14
 #define PROTO_FLAG_IPV4            0
@@ -26,7 +27,7 @@ struct packet_crypto_ctx {
     uint8_t wire_id; /* policy wire id written into packet headers */
     int profile_id;
     int aes_bits;
-    /* 1 = keys come from PQC handshake (refresh when HS has key; keep last in RAM).
+    /* 1 = keys come from PQC handshake (diversify/clear on !key_ready).
      * 0 = static/master-derived keys (e.g. ARP default) — never HS-refresh. */
     bool pqc_from_handshake;
 };
@@ -46,7 +47,5 @@ void packet_crypto_reset_counter(void);
 
 void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag,
                            uint8_t *out_nonce, int *out_nonce_len);
-void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size,
-                        uint8_t iv[AES128_IV_SIZE]);
 
 #endif

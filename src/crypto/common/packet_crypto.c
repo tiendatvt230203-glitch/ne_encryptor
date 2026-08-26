@@ -11,11 +11,6 @@
 
 static atomic_uint_fast32_t g_nonce_counter;
 
-static int key_size_bytes(int aes_bits)
-{
-    return (aes_bits == 256) ? 32 : 16;
-}
-
 static int key_nonzero(const uint8_t *key, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -25,19 +20,29 @@ static int key_nonzero(const uint8_t *key, size_t len)
     return 0;
 }
 
-static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE], int aes_bits, uint64_t epoch,
-                       uint8_t out[AES_MAX_KEY_SIZE])
+/* Same 32-byte slot fill ARP used with aes_bits=256 (HMAC-SHA256, epoch 0). */
+static void fill_static_slots(const uint8_t master[AES_MAX_KEY_SIZE],
+                              uint8_t slots[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE])
 {
-    int ks = key_size_bytes(aes_bits);
     uint8_t epoch_buf[8];
     unsigned char hmac_out[32];
     unsigned int hmac_len;
 
-    for (int i = 0; i < 8; i++)
-        epoch_buf[i] = (uint8_t)(epoch >> (i * 8));
+    memset(epoch_buf, 0, sizeof(epoch_buf));
+    HMAC(EVP_sha256(), master, AES_MAX_KEY_SIZE, epoch_buf, sizeof(epoch_buf),
+         hmac_out, &hmac_len);
+    memcpy(slots[KEY_SLOT_PREV], hmac_out, AES_MAX_KEY_SIZE);
+    memcpy(slots[KEY_SLOT_CURRENT], hmac_out, AES_MAX_KEY_SIZE);
+    memcpy(slots[KEY_SLOT_NEXT], hmac_out, AES_MAX_KEY_SIZE);
+}
 
-    HMAC(EVP_sha256(), master, ks, epoch_buf, sizeof(epoch_buf), hmac_out, &hmac_len);
-    memcpy(out, hmac_out, (size_t)ks);
+static void pqc_clear_ctx_keys(struct packet_crypto_ctx *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->pqc_from_handshake && ctx->profile_id > 0 && ctx->policy_id > 0)
+        main_diag_ne_pqc_clear(ctx->profile_id, ctx->policy_id);
+    memset(ctx->keys, 0, sizeof(ctx->keys));
 }
 
 static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
@@ -47,9 +52,11 @@ static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
 
-    /* HS temporarily not ready: keep last key in RAM (do not wipe). */
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
+        if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
+            pqc_clear_ctx_keys(ctx);
         return;
+    }
 
     if (key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ) &&
         memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) == 0)
@@ -90,9 +97,11 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
-    /* HS temporarily not ready: keep last key in RAM (do not wipe). */
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0)
+    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
+        if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
+            pqc_clear_ctx_keys(ctx);
         return;
+    }
     memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
     memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
@@ -103,24 +112,18 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 int packet_crypto_init(struct packet_crypto_ctx *ctx, const uint8_t master_key[AES_MAX_KEY_SIZE],
                        int aes_bits)
 {
-    int ks;
-
     if (!ctx || !master_key)
         return -1;
     if (aes_bits != 128 && aes_bits != 256)
         aes_bits = 128;
 
-    ks = key_size_bytes(aes_bits);
     memset(ctx, 0, sizeof(*ctx));
-    memcpy(ctx->master_key, master_key, (size_t)ks);
+    memcpy(ctx->master_key, master_key, AES_MAX_KEY_SIZE);
     ctx->aes_bits = aes_bits;
+    ctx->crypto_mode = CRYPTO_MODE_PQC;
     ctx->initialized = true;
-
-    derive_key(ctx->master_key, aes_bits, 0, ctx->keys[KEY_SLOT_PREV]);
-    derive_key(ctx->master_key, aes_bits, 0, ctx->keys[KEY_SLOT_CURRENT]);
-    derive_key(ctx->master_key, aes_bits, 0, ctx->keys[KEY_SLOT_NEXT]);
+    fill_static_slots(ctx->master_key, ctx->keys);
     packet_crypto_reset_counter();
-
     return 0;
 }
 
@@ -142,18 +145,10 @@ void crypto_generate_nonce(uint32_t counter, uint8_t proto_flag, uint8_t *out_no
     if (!out_nonce || !out_nonce_len)
         return;
 
-    /* Shared with PQC: salt[8] + counter[4] via trf_pqc_generate_nonce. */
     (void)trf_pqc_init_global();
     if (trf_pqc_generate_nonce(out_nonce) != TRF_PQC_OK) {
         *out_nonce_len = 0;
         return;
     }
     *out_nonce_len = PACKET_CRYPTO_NONCE_BYTES;
-}
-
-void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size, uint8_t iv[AES128_IV_SIZE])
-{
-    memcpy(iv, nonce, (size_t)nonce_size);
-    if (nonce_size < AES128_IV_SIZE)
-        memset(iv + nonce_size, 0, (size_t)(AES128_IV_SIZE - nonce_size));
 }

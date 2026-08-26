@@ -75,8 +75,6 @@ struct profile_config {
     int wan_count;
     int policy_indices[MAX_CRYPTO_POLICIES];
     int policy_count;
-    /* 1 nếu profile có policy catch-all (any/any, proto any, port any):
-     * gói WAN->LAN luôn khớp, khỏi quét bảng mỗi packet. */
     int policy_in_any;
     char local_identity_fingerprint[16];
     char peer_fingerprint[16];
@@ -111,9 +109,7 @@ struct app_config {
 
     int crypto_enabled;
     uint8_t crypto_key[AES_KEY_LEN];
-    int encrypt_layer;
     uint16_t fake_ethertype_ipv4;
-    uint8_t fake_protocol;
     int crypto_mode;
     int aes_bits;
     struct profile_config profiles[MAX_PROFILES];
@@ -145,7 +141,6 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                                                         uint16_t src_port, uint16_t dst_port,
                                                         uint8_t protocol);
 void config_refresh_policy_in_any(struct app_config *cfg);
-/* Gate WAN->LAN: bảng nén đã đảo chiều IN lúc load. 5-tuple gói as-is. */
 int config_policy_in_ok(const struct app_config *cfg, int profile_idx,
                         uint32_t src_ip, uint32_t dst_ip,
                         uint16_t src_port, uint16_t dst_port,

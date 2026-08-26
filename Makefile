@@ -12,9 +12,6 @@ LIB_DIR = lib
 TARGET  = network-encryptor
 
 OPT_SRCS = $(wildcard src/crypto/options/common/*.c) \
-           $(wildcard src/crypto/options/l2/*/*.c) \
-           $(wildcard src/crypto/options/l3/*/*.c) \
-           $(wildcard src/crypto/options/l4/*/*.c) \
            src/crypto/options/bypass.c
 
 PQC_SRCS = $(wildcard src/crypto/pqc/*.c)
@@ -61,5 +58,4 @@ $(LIB_DIR)/%.o: bpf/%.c
 clean:
 	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
-		src/crypto/options/l2/*/*.o src/crypto/options/l3/*/*.o \
-		src/crypto/options/l4/*/*.o src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)
+		src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)
