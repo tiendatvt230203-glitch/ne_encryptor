@@ -32,20 +32,24 @@ static inline int crypto_pqc_key_is_all_zero(const byte *key, size_t len)
 static inline int crypto_pqc_sess_load(struct packet_crypto_ctx *ctx, crypto_pqc_sess_t *sess)
 {
     const byte *key;
+    static __thread uint8_t zero_key_logged[256];
 
     if (!ctx || !sess)
         return -1;
-    packet_crypto_update_keys(ctx);
     key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     if (!key)
         return -1;
     if (crypto_pqc_key_is_all_zero(key, PQC_TRAFFIC_KEY_SZ)) {
-        if (ctx->pqc_from_handshake)
+        if (ctx->pqc_from_handshake && !zero_key_logged[ctx->wire_id]) {
+            zero_key_logged[ctx->wire_id] = 1;
             fprintf(stderr,
                     "[PQC-KEY] invalid CURRENT key (all-zero) for profile=%d policy=%d; blocking PQC crypto path\n",
                     ctx->profile_id, ctx->policy_id);
+        }
         return -1;
     }
+    if (ctx->pqc_from_handshake)
+        zero_key_logged[ctx->wire_id] = 0;
     sess->key = key;
     sess->aad = HARDCODED_AAD;
     sess->aad_len = 12;

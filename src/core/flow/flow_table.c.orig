@@ -351,7 +351,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     if (!ft || !allowed_wans || allowed_count <= 0)
         return flow_table_get_wan(ft, src_ip, dst_ip, src_port, dst_port, protocol,
                                   window_bytes);
-    if (allowed_count == 1 && protocol != IPPROTO_TCP)
+    if (allowed_count == 1)
         return allowed_wans[0];
 
     normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
@@ -461,10 +461,7 @@ void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
         struct flow_entry **pp = &ft->buckets[i];
         while (*pp) {
             struct flow_entry *entry = *pp;
-            uint64_t timeout = entry->key.protocol == IPPROTO_TCP
-                ? FLOW_TCP_TIMEOUT_SEC : FLOW_TIMEOUT_SEC;
-
-            if (now - entry->last_seen > timeout) {
+            if (now - entry->last_seen > FLOW_TIMEOUT_SEC) {
                 *pp = entry->next;
                 free(entry);
             } else {

@@ -1,0 +1,321 @@
+========================================================================================
+SOURCE TRANSCRIPT (ASCII)
+File: bài_test_thông_số chia_tải.docx
+Pages: 7
+Images: word/media/image1.png .. image5.png  (htop screenshots)
+Rule: numbers copied as displayed. No rounding. No inferred missing digits.
+      CPU bar '|' is proportional visualization only; the printed xx.x% is the data.
+      htop CPU% like 522. / 102. / 587. is the truncated on-screen column (digit after
+      the decimal was not visible). Do not expand to 522.0.
+      Hex 0x0000000 on Core 5 vdso line is truncated in the Word dump; not completed.
+      Uptime was not readable in the screenshots; omitted (not invented).
+      Author Vietnamese notes kept verbatim (UTF-8); only line-wrap for readability.
+      Word typos kept (ip I chang, chỉa tải, Connec, nghi  ngờ).
+========================================================================================
+
+## TEST 1
+TITLE:
+Phần trăm CPU khi chia tải cho 1 connect mã hóa Layer2 băng thông 1 connect duy nhất 7G
+
+### HTOP snapshot  [image1 top pane]
+Host: 10.5.15.66  ssh, clover
+   0[||||||||||             47.5%]   3[                        0.0%]   6[                        0.7%]   9[||||||                 26.0%]
+   1[||||||||||||||||||||||100.0%]   4[                        0.7%]   7[||||||||||||||||||||||100.0%]  10[|||||||||||||||||||||  97.3%]
+   2[|||||||||||||||||||||| 98.0%]   5[|||||                  21.6%]   8[||                      7.4%]  11[||||||                 25.7%]
+  Mem[  8.54G/62.5G]   Tasks: 72, 108 thr; 7 running
+  Swp[  0K/8.00G]   Load average: 1.82 1.93 1.98
+
+    PID USER PRI NI  VIRT   RES   SHR S  CPU% MEM% TIME+     Command
+  87664 root  20  0  2939M  2081M 13152 S  522.  3.3  1:37.33 /usr/bin/bin-ne/network-encryptor
+  87771 root  20  0  2939M  2081M 13152 R  102.  3.3  0:17.29 /usr/bin/bin-ne/network-encryptor
+  87779 root  20  0  2939M  2081M 13152 R  102.  3.3  0:15.78 /usr/bin/bin-ne/network-encryptor
+  87772 root  20  0  2939M  2081M 13152 R  98.1  3.3  0:16.03 /usr/bin/bin-ne/network-encryptor
+  87774 root  20  0  2939M  2081M 13152 R  96.7  3.3  0:17.45 /usr/bin/bin-ne/network-encryptor
+  87770 root  20  0  2939M  2081M 13152 S  45.3  3.3  0:08.82 /usr/bin/bin-ne/network-encryptor
+  87773 root  20  0  2939M  2081M 13152 R  26.1  3.3  0:05.12 /usr/bin/bin-ne/network-encryptor
+  87781 root  20  0  2939M  2081M 13152 S  26.1  3.3  0:06.94 /usr/bin/bin-ne/network-encryptor
+
+### HTOP snapshot  [image1 bottom pane]
+Host: 10.5.15.67  ssh, clover
+   0[|||||||||||||          57.4%]   3[                        0.0%]   6[                        0.7%]   9[|||||                  21.0%]
+   1[||||||||||||||||||||   89.9%]   4[                        1.3%]   7[||||||||||||||||||||   89.8%]  10[|||||||||||||||||      77.0%]
+   2[||||||||||||||||||||   92.7%]   5[|||||                  24.2%]   8[                        0.7%]  11[|||||||                29.9%]
+  Mem[  8.62G/62.5G]   Tasks: 119, 125 thr; 7 running
+  Swp[  0K/8.00G]   Load average: 0.53 0.18 0.06
+  (process list not visible in this snapshot)
+
+### PERF
+Word heading: Thông số các core làm việc
+Layout-only cleanup: split scrollbar glyphs and Word [BR] joins.
+Percent and symbol strings unchanged.
+
+Core 0:
+  32.60%  network-encryptor  [.] refill_fq_queue
+  10.19%  network-encryptor  [.] crypto_eth_inner_et_off
+   7.76%  network-encryptor  [.] ne_refill_fq_local_slot
+   6.14%  [kernel]           [k] slab_free_freelist_hook.constprop.0
+   5.95%  network-encryptor  [.] recv_queue
+   3.32%  network-encryptor  [.] kick_fq_iface_slot.constprop.0
+   1.93%  network-encryptor  [.] ne_recv_local_slot
+   1.85%  network-encryptor  [.] dp_parse_flow
+   1.76%  [kernel]           [k] __slab_free
+   1.64%  network-encryptor  [.] local_rx_thread
+   1.56%  network-encryptor  [.] config_select_crypto_policy
+   1.37%  libc.so.6          [.] pthread_spin_lock
+   1.35%  network-encryptor  [.] ne_dp_idle_arm
+   1.20%  [kernel]           [k] sock_wfree
+
+Core1:
+  13.81%  [kernel]           [k] memcpy_erms
+  10.71%  network-encryptor  [.] drain_cq_queue
+   6.91%  [kernel]           [k] __alloc_skb
+   6.69%  network-encryptor  [.] ne_drain_cq_wan
+   5.97%  network-encryptor  [.] ne_drain_cq_local
+   5.16%  network-encryptor  [.] ne_ring_try_pop
+   4.02%  libc.so.6          [.] pthread_spin_lock
+   3.26%  [kernel]           [k] sock_def_write_space
+   3.10%  network-encryptor  [.] tx_drain_iface_all_rings.part.0
+   2.95%  network-encryptor  [.] tx_drain_queue
+   2.33%  [kernel]           [k] clear_page_erms
+   2.33%  [kernel]           [k] mutex_unlock
+   1.77%  network-encryptor  [.] tx_thread
+   1.68%  libc.so.6          [.] sendto
+   1.36%  [kernel]           [k] memset_erms
+
+Core2:
+  12.10%  network-encryptor  [.] drain_cq_queue
+   7.42%  [kernel]           [k] __fget_files
+   6.02%  network-encryptor  [.] ne_drain_cq_local
+   5.73%  [kernel]           [k] fput_many
+   5.37%  [kernel]           [k] _raw_spin_lock_irqsave
+   5.33%  network-encryptor  [.] ne_drain_cq_wan
+   4.81%  [kernel]           [k] mutex_unlock
+   3.43%  [kernel]           [k] xsk_poll
+   2.85%  network-encryptor  [.] collect_iface_tx_fds.part.0
+   2.81%  [kernel]           [k] xsk_generic_xmit
+   2.66%  [kernel]           [k] do_poll.constprop.0
+   2.63%  [kernel]           [k] __pollwait
+   2.56%  [kernel]           [k] mutex_lock
+   2.40%  libc.so.6          [.] pthread_spin_lock
+   1.26%  [kernel]           [k] sock_poll
+
+Core mã hóa Core 7
+  18.84%  libscrypt.so       [.] AES_GCM_encrypt_update_avx2
+   8.55%  network-encryptor  [.] crypto_eth_inner_et_off
+   3.56%  libc.so.6          [.] 0x00000000001a0a65
+   3.46%  libscrypt.so       [.] AES_256_Key_Expansion_AESNI
+   3.41%  libc.so.6          [.] pthread_mutex_lock
+   2.76%  libc.so.6          [.] 0x00000000001a0a4c
+   2.69%  libc.so.6          [.] pthread_mutex_unlock
+   2.10%  [kernel]           [k] __fget_files
+   1.83%  network-encryptor  [.] fwd_wan_build_profile_pool.part.0
+   1.82%  libscrypt.so       [.] wc_AesFree
+   1.73%  [vdso]             [.] 0x00000000000006e5
+
+Core 5 (đang không rõ làm công việc gì vì bản chất đổ 1 connect thì chỉ dùng 1 core duy nhất để mã hóa)
+  42.27%  network-encryptor     [.] ne_dp_idle_arm
+   8.28%  [vdso]                [.] 0x00000000000006e5
+   4.55%  network-encryptor     [.] ne_ring_try_pop
+   4.00%  network-encryptor     [.] crypto_worker_thread
+   3.99%  network-encryptor     [.] l2_udp_frag_gc
+   1.29%  [kernel]              [k] psi_group_change
+   1.01%  network-encryptor     [.] crypto_eth_inner_et_off
+   0.94%  [kernel]              [k] native_write_msr
+   0.71%  libc.so.6             [.] clock_gettime
+   0.68%  [kernel]              [k] _raw_spin_lock_irqsave
+   0.68%  libscrypt.so          [.] AES_256_Key_Expansion_AESNI
+   0.59%  [kernel]              [k] native_irq_return_iret
+   0.55%  network-encryptor     [.] l2_udp_decrypt
+   0.55%  [kernel]              [k] read_tsc
+   0.54%  [vdso]                [.] 0x0000000
+
+Core 9
+  25.09%  network-encryptor     [.] drain_cq_queue
+  15.30%  network-encryptor     [.] ne_drain_cq_wan
+  15.01%  network-encryptor     [.] ne_drain_cq_local
+   3.27%  network-encryptor     [.] ne_dp_idle_arm
+   3.08%  libc.so.6             [.] pthread_spin_lock
+   2.45%  network-encryptor     [.] tx_thread
+   2.25%  network-encryptor     [.] tx_drain_iface_all_rings.part.0
+   2.01%  network-encryptor     [.] tx_drain_queue
+   1.34%  [kernel]              [k] psi_group_change
+   1.31%  network-encryptor     [.] ne_ring_try_pop
+   1.05%  [kernel]              [k] _raw_spin_lock_irqsave
+   0.95%  [kernel]              [k] native_write_msr
+   0.63%  [kernel]              [k] __schedule
+   0.61%  [vdso]                [.] 0x00000000000006e5
+   0.54%  [kernel]              [k] memcpy_erms
+
+Core 10
+   9.09%  network-encryptor     [.] drain_cq_queue
+   7.52%  [kernel]              [k] __fget_files
+   5.90%  network-encryptor     [.] ne_drain_cq_local
+   5.63%  [kernel]              [k] _raw_spin_lock_irqsave
+   5.13%  network-encryptor     [.] ne_drain_cq_wan
+   4.97%  [kernel]              [k] fput_many
+   4.93%  [kernel]              [k] mutex_unlock
+   3.78%  [kernel]              [k] xsk_poll
+   3.34%  [kernel]              [k] xsk_generic_xmit
+   2.66%  [kernel]              [k] do_poll.constprop.0
+   2.54%  [kernel]              [k] mutex_lock
+   2.35%  network-encryptor     [.] collect_iface_tx_fds.part.0
+   2.31%  [kernel]              [k] __pollwait
+   1.11%  [kernel]              [k] sock_poll
+   1.01%  [kernel]              [k] __slab_free
+
+### AUTHOR_NOTES
+=> Nhận thấy server gửi đang có vấn đề
+TX,RX chia chưa đều cấp 4 core tx cho lan wan thì 3 core nghẽn còn 1 core 9 đang nhàn
+đang chưa rõ vấn đề tại sao ?
+đang nghi ngờ là 2 core tx ra wan core còn lại tx lan xuống có 1 đường duy nhất
+nhưng chia chưa đều nên mới xuất hiện tình trạng core 9 còn dư CPU xử lý
+Mã hóa: Vấn đề tại sao đổ 1 connect duy nhất thì toàn bộ logic mã hóa của connect
+đó chỉ được phép 1 core xử lý thôi thì lại thêm 1 Core nữa tăng CPU để làm việc gì đó
+cụ thể là Core số 5 đang gọi hàm   (40.44%  network-encryptor         [.] ne_dp_idle_arm).
+Đang không rõ như này có tối ưu chưa
+
+NOTE: author cites 40.44% ne_dp_idle_arm; Core 5 perf dump above lists 42.27%. Both kept. Do not merge.
+
+
+========================================================================================
+## TEST 1b  receiver 1 connect  (CPU meters only)
+Word caption:
+Log server nhận với 1 Connect
+tổng phần trăm CPU
+
+### HTOP snapshot  [image2]
+Host: (host title not visible in screenshot; Word caption = server nhận / 1 Connect)
+   0[||||||||||||           56.7%]   3[                        0.0%]   6[                        1.3%]   9[|||||                  22.6%]
+   1[||||||||||||||||||||   92.8%]   4[                        0.7%]   7[||||||||||||||||||||   92.8%]  10[|||||||||||||||||||    84.6%]
+   2[|||||||||||||||||||||  95.4%]   5[||||||                 25.2%]   8[                        0.7%]  11[||||||||               36.5%]
+  Mem[  8.63G/62.5G]   Tasks: 122, 125 thr; 8 running
+  Swp[  0K/8.00G]   Load average: 5.01 4.60 2.91
+  (process list not visible in this snapshot)
+
+### AUTHOR_NOTES
+Tương tự với Core gửi TX vẫn đang bị vấn đề đó là TX chưa đều cho Lan và WAN
+đang nghi  ngờ là do Wan có 2 wan nhưng Lan chỉ có 1 => chỉ có 3 Core bị nghẽn
+1 core có vẻ nhàn nhưng logic đúng là tất cả các core sẽ phải chia tải đều nhau
+vì các core này có thể tx cả lan và wan
+
+Mã hóa vẫn tương tự đó là không hiểu tại sao Core 5 lại có phần trăm CPU của hàm
+  41.95%  network-encryptor     [.] ne_dp_idle_arm
+Vì để đảm bảo tính ổn định thì 1 connect chỉ được mã hóa rã ráp bởi 1 core duy nhất thôi
+
+
+========================================================================================
+## TEST 2
+TITLE:
+Bài test số 2 Đổ traffic với 2 Lan khác nhau với  2 Connect. Connect 1 Lan 1 Connect 2 Lan 2
+
+### HTOP snapshot  [image3 top pane]
+Host: 10.5.15.66  ssh, clover
+   0[|||||||||||            47.9%]   3[                        1.3%]   6[||||||||||||||||||||||100.0%]   9[|||||                  22.4%]
+   1[|||||||||||||||||||||| 99.3%]   4[||||||                 26.1%]   7[|||||||||||||||||||||| 99.3%]  10[|||||||||||||||||||    88.1%]
+   2[|||||                  24.3%]   5[||||                   18.1%]   8[||                      9.7%]  11[|||||||||              42.1%]
+  Mem[  8.54G/62.5G]   Tasks: 84, 108 thr; 7 running
+  Swp[  0K/8.00G]   Load average: 4.98 4.89 4.37
+
+    PID USER PRI NI  VIRT   RES   SHR S  CPU% MEM% TIME+     Command
+  87664 root  20  0  2939M  2085M 13152 S  587.  3.3  2h03:20 /usr/bin/bin-ne/network-encryptor
+  87771 root  20  0  2939M  2085M 13152 R  102.  3.3  24:14.60 /usr/bin/bin-ne/network-encryptor
+  87779 root  20  0  2939M  2085M 13152 R  102.  3.3  24:13.42 /usr/bin/bin-ne/network-encryptor
+  87778 root  20  0  2939M  2085M 13152 S  102.  3.3  0:30.02 /usr/bin/bin-ne/network-encryptor
+  87774 root  20  0  2939M  2085M 13152 R  90.6  3.3  22:46.41 /usr/bin/bin-ne/network-encryptor
+  87770 root  20  0  2939M  2085M 13152 S  48.7  3.3  10:35.19 /usr/bin/bin-ne/network-encryptor
+  87781 root  20  0  2939M  2085M 13152 R  42.5  3.3  6:31.84 /usr/bin/bin-ne/network-encryptor
+  87772 root  20  0  2939M  2085M 13152 R  26.1  3.3  22:41.63 /usr/bin/bin-ne/network-encryptor
+
+### HTOP snapshot  [image3 bottom pane]
+Host: 10.5.15.66 (1)  ssh, clover
+   0[||||||||||             46.8%]   3[                        1.3%]   6[||||||||||||||||||||||100.0%]   9[|||||                  22.4%]
+   1[|||||||||||||||||||||| 99.3%]   4[||||||                 26.6%]   7[|||||||||||||||||||||| 99.3%]  10[|||||||||||||||||||    88.6%]
+   2[|||||                  24.1%]   5[||||                   19.2%]   8[||                      9.0%]  11[|||||||||              42.1%]
+  Mem[  8.55G/62.5G]   Tasks: 84, 108 thr; 7 running
+  Swp[  0K/8.00G]   Load average: 4.98 4.89 4.37
+  (process list not visible in this snapshot)
+
+### AUTHOR_NOTES
+Thông số chia tải vẫn như trên vẫn là 1 thêm 1 Core cho mã hóa và thêm 1 Core để xử lý cái
+41.00%  network-encryptor     [.] ne_dp_idle_arm
+Đang đặt ra khả năng đó là 1 Core xử lý hết toàn bộ liệu có được không
+
+
+========================================================================================
+## TEST 3
+TITLE:
+Bài test tiếp theo để 2 connect trên 1 thiết bị tức là chỉ khác cái port thôi ip I chang nhau
+
+### HTOP snapshot  [image4 top pane]
+Host: 10.5.15.66  ssh, clover
+   0[|||||||||||            51.4%]   3[|||                    11.7%]   6[|||||||||||||||||||||| 99.3%]   9[|||||||||||||||||||||| 97.9%]
+   1[|||||||||||||||||||||  96.1%]   4[||||                   16.4%]   7[|||||||||||||||||||||  96.0%]  10[|||||||||||||||||||||| 99.3%]
+   2[||||||                 26.7%]   5[                        1.4%]   8[|                       3.4%]  11[|||||||                31.5%]
+  Mem[  8.54G/62.5G]   Tasks: 84, 108 thr; 4 running
+  Swp[  0K/8.00G]   Load average: 5.34 5.14 4.55
+
+    PID USER PRI NI  VIRT   RES   SHR S  CPU% MEM% TIME+     Command
+  87664 root  20  0  2939M  2086M 13152 S  634.  3.3  2h17:44 /usr/bin/bin-ne/network-encryptor
+  87774 root  20  0  2939M  2086M 13152 S  103.  3.3  25:00.32 /usr/bin/bin-ne/network-encryptor
+  87778 root  20  0  2939M  2086M 13152 S  103.  3.3  2:57.27 /usr/bin/bin-ne/network-encryptor
+  87773 root  20  0  2939M  2086M 13152 S  100.  3.3  6:49.97 /usr/bin/bin-ne/network-encryptor
+  87771 root  20  0  2939M  2086M 13152 S  99.7  3.3  26:43.00 /usr/bin/bin-ne/network-encryptor
+  87779 root  20  0  2939M  2086M 13152 R  99.0  3.3  26:41.55 /usr/bin/bin-ne/network-encryptor
+  87770 root  20  0  2939M  2086M 13152 S  53.3  3.3  11:46.23 /usr/bin/bin-ne/network-encryptor
+  87781 root  20  0  2939M  2086M 13152 S  33.9  3.3  7:30.11 /usr/bin/bin-ne/network-encryptor
+
+### HTOP snapshot  [image4 bottom pane]
+Host: 10.5.15.66 (1)  ssh, clover
+   0[|||||||||||            48.6%]   3[||                      7.2%]   6[|||||||||||||||||||||| 98.0%]   9[|||||||||||||||||||||  97.3%]
+   1[|||||||||||||||||||||  95.4%]   4[||||                   16.4%]   7[|||||||||||||||||||||  94.2%]  10[|||||||||||||||||||||| 98.0%]
+   2[||||||                 28.5%]   5[                        1.3%]   8[|                       2.8%]  11[|||||||                33.3%]
+  Mem[  8.54G/62.5G]   Tasks: 84, 108 thr; 8 running
+  Swp[  0K/8.00G]   Load average: 5.34 5.14 4.55
+  (process list not visible in this snapshot)
+
+### AUTHOR_NOTES
+Kết quả cũng tương tự TX chỉ có 3 core có vẻ là đang làm việc sẽ dư ra 1 Core nhàn,Mã hóa tương tự như trên
+
+
+========================================================================================
+## TEST 4
+TITLE:
+giữa chừng đổ tiếp thêm 1 Connec nữa thì Core 8 là Core mã hóa cho connect đó chuẩn rồi nhưng bị yếu vì nghi ngờ lý do là TX,RX nghẽn rồi chia CPU đang có vấn đề .Nhưng vẫn check lại logic chỉa tải của mã hóa check kỹ xem đã chia chuẩn %CPU chọn CPU có phần trăm thấp nhất để mã hóa cho connect hay không
+
+### HTOP snapshot  [image5 top pane]
+Host: 10.5.15.66  ssh, clover
+   0[||||||||||             44.1%]   3[||                      9.1%]   6[||||||||||||||||||||||100.0%]   9[|||||||||||||||||||||  97.3%]
+   1[||||||||||||||||||     80.4%]   4[|||                    12.8%]   7[|||||||||||||          60.7%]  10[||||||||||||||||||||||100.0%]
+   2[|||||                  23.9%]   5[                        0.7%]   8[||||                   19.4%]  11[|||||||||              41.3%]
+  Mem[  8.54G/62.5G]   Tasks: 84, 108 thr; 6 running
+  Swp[  0K/8.00G]   Load average: 5.90 5.32 4.65
+
+    PID USER PRI NI  VIRT   RES   SHR S  CPU% MEM% TIME+     Command
+  87664 root  20  0  2939M  2086M 13152 S  596.  3.3  2h22:34 /usr/bin/bin-ne/network-encryptor
+  87778 root  20  0  2939M  2086M 13152 R  103.  3.3  3:44.91 /usr/bin/bin-ne/network-encryptor
+  87774 root  20  0  2939M  2086M 13152 R  103.  3.3  25:47.90 /usr/bin/bin-ne/network-encryptor
+  87773 root  20  0  2939M  2086M 13152 R  99.7  3.3  7:36.20 /usr/bin/bin-ne/network-encryptor
+  87771 root  20  0  2939M  2086M 13152 R  81.1  3.3  27:27.33 /usr/bin/bin-ne/network-encryptor
+  87779 root  20  0  2939M  2086M 13152 S  62.5  3.3  27:24.03 /usr/bin/bin-ne/network-encryptor
+  87770 root  20  0  2939M  2086M 13152 S  45.4  3.3  12:09.77 /usr/bin/bin-ne/network-encryptor
+  87781 root  20  0  2939M  2086M 13152 S  41.9  3.3  7:46.32 /usr/bin/bin-ne/network-encryptor
+
+### HTOP snapshot  [image5 bottom pane]
+Host: 10.5.15.66 (1)  ssh, clover
+   0[||||||||||             43.6%]   3[||                      8.0%]   6[||||||||||||||||||||||100.0%]   9[|||||||||||||||||||||  97.3%]
+   1[|||||||||||||||||      79.3%]   4[||                     10.7%]   7[|||||||||||||          59.7%]  10[|||||||||||||||||||||| 99.3%]
+   2[||||||                 27.2%]   5[                        0.7%]   8[||||                   18.2%]  11[|||||||||              42.9%]
+  Mem[  8.54G/62.5G]   Tasks: 85, 108 thr; 7 running
+  Swp[  0K/8.00G]   Load average: 5.80 5.30 4.63
+  (process list not visible in this snapshot)
+
+### AUTHOR_NOTES
+giữa chừng đổ tiếp thêm 1 Connec nữa thì Core 8 là Core mã hóa cho connect đó
+chuẩn rồi nhưng bị yếu vì nghi ngờ lý do là TX,RX nghẽn rồi chia CPU đang có vấn đề.
+Nhưng vẫn check lại logic chỉa tải của mã hóa check kỹ xem đã chia chuẩn %CPU
+chọn CPU có phần trăm thấp nhất để mã hóa cho connect hay không
+
+
+========================================================================================
+END OF TRANSCRIPT
+========================================================================================

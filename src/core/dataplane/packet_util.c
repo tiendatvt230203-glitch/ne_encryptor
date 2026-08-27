@@ -2,6 +2,7 @@
 
 #include "../../../inc/core/dataplane/dataplane_stats.h"
 #include "../../../inc/core/dataplane/dp_idle.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
 #include "../../../inc/crypto/eth_parse.h"
 
 #include <arpa/inet.h>
@@ -127,6 +128,6 @@ int dp_ring_push(struct forwarder *fwd, struct ne_ring *ring, struct ne_packet *
         ne_frame_free(&fwd->pair, pkt->addr);
         return -1;
     }
-    ne_dp_idle_wake_tx_dir(pkt->dir);
+    ne_dp_idle_wake_tx_worker(dp_out_ring_idx());
     return 0;
 }

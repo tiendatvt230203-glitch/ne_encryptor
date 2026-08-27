@@ -7,7 +7,6 @@
 
 #define FLOW_TABLE_SIZE 16384
 #define FLOW_TIMEOUT_SEC 60
-#define FLOW_TCP_TIMEOUT_SEC 3600
 #define FLOW_WAN_SWITCH_DRAIN_MS 1000
 
 struct flow_key {

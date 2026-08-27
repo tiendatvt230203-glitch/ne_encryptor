@@ -11,7 +11,6 @@
 
 static __thread int tls_crypto_worker_idx = -1;
 static __thread int tls_out_ring_idx;
-static uint32_t dp_active_tx_slots(void);
 
 static uint32_t dp_flow_hash_mix(uint32_t src_ip, uint32_t dst_ip,
                                  uint16_t src_port, uint16_t dst_port,
@@ -136,7 +135,7 @@ void dp_route_set_active_tx_slots(uint32_t slots)
     if (slots > NE_TX_SLOTS)
         slots = NE_TX_SLOTS;
     atomic_store_explicit(&g_active_tx_slots, slots, memory_order_release);
-}
+
 static int dp_route_key_parse(const uint8_t *pkt, uint32_t len, struct dp_route_key *key)
 {
     uint32_t src_ip = 0, dst_ip = 0;

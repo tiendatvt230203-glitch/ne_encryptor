@@ -19,7 +19,6 @@ int dp_crypto_current_worker_idx(void);
 int dp_flow_pick_tx_slot(const uint8_t *pkt, uint32_t len, int worker_hint);
 void dp_route_connection_counts(uint64_t worker_counts[NE_CRYPTO_WORKERS],
                                 uint64_t tx_counts[NE_TX_SLOTS]);
-void dp_route_set_active_tx_slots(uint32_t slots);
 
 /* Bypass TX affinity: hash → TX slot (RX/TX cores only). Not a crypto worker. */
 int dp_pick_tx_slot(const uint8_t *pkt, uint32_t len);

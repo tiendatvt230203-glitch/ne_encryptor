@@ -11,9 +11,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NE_DP_IDLE_HOT_NS   20000ull
-#define NE_DP_IDLE_COLD_NS  200000ull
-#define NE_DP_IDLE_WARM_NS  10000L
+#define NE_DP_IDLE_HOT_NS   5000ull
+#define NE_DP_IDLE_COLD_NS  25000ull
+#define NE_DP_IDLE_WARM_NS  5000L
 #define NE_DP_IDLE_POLL_MS  1
 
 static int g_busy_poll = -1;

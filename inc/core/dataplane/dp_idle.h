@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 #define NE_DP_WAKE_CRYPTO(w) ((int)(w))
-#define NE_DP_WAKE_TX        ((int)NE_CRYPTO_WORKERS)
-#define NE_DP_WAKE_N         ((int)NE_CRYPTO_WORKERS + 1)
+#define NE_DP_WAKE_TX(slot)  ((int)NE_CRYPTO_WORKERS + (int)(slot))
+#define NE_DP_WAKE_N         ((int)NE_CRYPTO_WORKERS + (int)NE_TX_SLOTS)
 
 #define NE_DP_POLLFD_MAX 128
 
@@ -33,10 +33,19 @@ void ne_dp_idle_disarm(int wake_id);
 void ne_dp_idle_wake(int wake_id);
 void ne_dp_idle_wake_all(void);
 
-static inline void ne_dp_idle_wake_tx_dir(uint8_t dir)
+static inline void ne_dp_idle_wake_tx_slot(int tx_slot)
 {
-    (void)dir;
-    ne_dp_idle_wake(NE_DP_WAKE_TX);
+    if (tx_slot < 0 || tx_slot >= (int)NE_TX_SLOTS)
+        return;
+    ne_dp_idle_wake(NE_DP_WAKE_TX(tx_slot));
+}
+
+/* Output ring w is owned by TX slot (w % NE_TX_SLOTS). */
+static inline void ne_dp_idle_wake_tx_worker(int worker_idx)
+{
+    if (worker_idx < 0)
+        return;
+    ne_dp_idle_wake_tx_slot(worker_idx % (int)NE_TX_SLOTS);
 }
 
 #endif

@@ -52,12 +52,12 @@ static int push_split_to_wan(struct forwarder *fwd, struct ne_packet *job,
         ne_frame_free(&fwd->pair, tail->addr);
         return -1;
     }
-    ne_dp_idle_wake(NE_DP_WAKE_TX);
+    ne_dp_idle_wake_tx_worker(dp_out_ring_idx());
     if (ne_ring_try_push(tx, tail) != 0) {
         /* Head already queued; drop only the tail fragment. */
         ne_frame_free(&fwd->pair, tail->addr);
     } else {
-        ne_dp_idle_wake(NE_DP_WAKE_TX);
+        ne_dp_idle_wake_tx_worker(dp_out_ring_idx());
     }
     return 0;
 }
@@ -227,44 +227,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     pctx = fwd_crypto_policy_ctx(pi);
     if (!pctx)
         goto drop;
-    pctx->profile_id = fwd->cfg->profiles[profile_idx].id;
-    pctx->wire_id = (uint8_t)cp->id;
-    pctx->policy_id = cp->db_id;
-    {
-        uint8_t hs_key[PQC_TRAFFIC_KEY_SZ];
-        const uint8_t *k;
-        const char *why = NULL;
-        int has_key = 0;
-        packet_crypto_update_keys(pctx);
-        k = packet_crypto_get_key(pctx, KEY_SLOT_CURRENT);
-        if (k) {
-            for (size_t i = 0; i < AES_MAX_KEY_SIZE; i++) {
-                if (k[i]) {
-                    has_key = 1;
-                    break;
-                }
-            }
-        }
-        if (!has_key)
-            why = "NO_KEY_IN_RAM";
-        
-        // Kiểm tra Key Core và Key PQC có MATCH không nếu bị miss chặn luôn không dùng key đó để mã hóa
-        else if (sig_pqc_diversify_key(pctx->profile_id, pctx->policy_id, hs_key) == 0 &&
-                 memcmp(k, hs_key, PQC_TRAFFIC_KEY_SZ) != 0)
-            why = "NE_KEY_MISMATCH_HS";
-        if (why) {
-            static int fail_logged[256];
-            int slot = pctx->policy_id & 0xFF;
-            if (!fail_logged[slot]) {
-                fail_logged[slot] = 1;
-                fprintf(stderr,
-                        "[PQC-TX-GATE] FAIL once policy_id=%d profile=%d wire_id=%u: %s (drop)\n",
-                        pctx->policy_id, pctx->profile_id, (unsigned)pctx->wire_id, why);
-                fflush(stderr);
-            }
-            goto drop;
-        }
-    }
     enc = encrypt_to_wan(fwd, &job, cp, wan_dp, pctx,
                         crypto_proto_classify(proto), flow_ok);
     if (enc < 0)

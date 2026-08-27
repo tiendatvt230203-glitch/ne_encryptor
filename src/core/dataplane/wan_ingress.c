@@ -463,6 +463,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         int wan_dp = job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1;
         int bridged = -1;
 
+        dp_out_ring_bind(dp_pick_tx_slot(pkt, job.len));
         if (wan_dp >= 0)
             bridged = arp_bridge_from_wan(fwd, &job, pkt, wan_dp, NULL);
 
@@ -502,6 +503,12 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (profile_pi < 0)
             goto drop;
     }
+
+    if (encrypted)
+        dp_out_ring_bind(dp_flow_pick_tx_slot(pkt, job.len,
+                                              dp_crypto_current_worker_idx()));
+    else
+        dp_out_ring_bind(dp_pick_tx_slot(pkt, job.len));
 
     if (forward_wan_to_local(fwd, &job, profile_pi,
                              job.wan_idx < fwd->wan_count ? (int)job.wan_idx : -1) != 0)

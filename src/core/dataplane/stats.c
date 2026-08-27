@@ -1,4 +1,5 @@
 #include "../../../inc/core/dataplane/dataplane_stats.h"
+#include "../../../inc/core/dataplane/crypto_route.h"
 #include "../../../inc/core/forwarder/forwarder.h"
 #include "../../../inc/core/iface/interface.h"
 
@@ -38,6 +39,8 @@ static atomic_uint_fast64_t s_crypto_ring_drop[NE_CRYPTO_WORKERS];
 static uint64_t s_prev[4];
 static uint64_t s_prev_crypto_lan[NE_CRYPTO_WORKERS];
 static uint64_t s_prev_crypto_wan[NE_CRYPTO_WORKERS];
+static uint64_t s_prev_tx_lan_bytes[NE_TX_SLOTS];
+static uint64_t s_prev_tx_wan_bytes[NE_TX_SLOTS];
 static struct timespec s_last_ts;
 static uint32_t s_tick_count;
 
@@ -55,6 +58,8 @@ void ne_dp_stats_init(void)
     memset(s_prev, 0, sizeof(s_prev));
     memset(s_prev_crypto_lan, 0, sizeof(s_prev_crypto_lan));
     memset(s_prev_crypto_wan, 0, sizeof(s_prev_crypto_wan));
+    memset(s_prev_tx_lan_bytes, 0, sizeof(s_prev_tx_lan_bytes));
+    memset(s_prev_tx_wan_bytes, 0, sizeof(s_prev_tx_wan_bytes));
     s_tick_count = 0;
 }
 
@@ -286,6 +291,37 @@ void ne_dp_stats_tick(struct forwarder *fwd)
                 (unsigned long long)load64(&s_tx_full_lan[0]),
                 (unsigned long long)load64(&s_tx_full_wan[0]),
                 ne_pool_free_count(&fwd->pair));
+
+        {
+            uint64_t worker_connections[NE_CRYPTO_WORKERS];
+            uint64_t tx_connections[NE_TX_SLOTS];
+
+            dp_route_connection_counts(worker_connections, tx_connections);
+            fprintf(stderr, "[DP-STATS] tx_slot_gbps");
+            for (int slot = 0; slot < (int)NE_TX_SLOTS; slot++) {
+                uint64_t cur_lan = load64(&s_tx_lan_bytes[slot]);
+                uint64_t cur_wan = load64(&s_tx_wan_bytes[slot]);
+                double lan_rate = sec > 0.0
+                    ? ((double)(cur_lan - s_prev_tx_lan_bytes[slot]) * 8.0 / sec) / 1e9
+                    : 0.0;
+                double wan_rate = sec > 0.0
+                    ? ((double)(cur_wan - s_prev_tx_wan_bytes[slot]) * 8.0 / sec) / 1e9
+                    : 0.0;
+
+                s_prev_tx_lan_bytes[slot] = cur_lan;
+                s_prev_tx_wan_bytes[slot] = cur_wan;
+                fprintf(stderr, " tx%d(L=%.2fG W=%.2fG)", slot, lan_rate, wan_rate);
+            }
+            fprintf(stderr, "\n[DP-STATS] route_connections crypto=[");
+            for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
+                fprintf(stderr, "%s%llu", w ? "," : "",
+                        (unsigned long long)worker_connections[w]);
+            fprintf(stderr, "] tx=[");
+            for (int slot = 0; slot < (int)NE_TX_SLOTS; slot++)
+                fprintf(stderr, "%s%llu", slot ? "," : "",
+                        (unsigned long long)tx_connections[slot]);
+            fprintf(stderr, "]\n");
+        }
 
         {
             char pps_buf[256];

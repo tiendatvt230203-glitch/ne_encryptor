@@ -9,7 +9,9 @@
 #include "../../../inc/crypto/traffic_crypto.h"
 #include "../../../inc/crypto/pqc_handshake.h"
 
+#include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -22,7 +24,13 @@ static uint64_t monotonic_ms(void)
 }
 
 static struct packet_crypto_ctx policy_crypto_ctx[MAX_CRYPTO_POLICIES];
+static struct packet_crypto_ctx worker_policy_crypto_ctx[NE_CRYPTO_WORKERS][MAX_CRYPTO_POLICIES];
 static int policy_crypto_ready[MAX_CRYPTO_POLICIES];
+static struct packet_crypto_ctx worker_prev_policy_crypto_ctx[NE_CRYPTO_WORKERS][MAX_CRYPTO_POLICIES];
+static pthread_mutex_t policy_crypto_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_uint policy_crypto_generation = ATOMIC_VAR_INIT(1u);
+static __thread unsigned int tls_policy_crypto_generation;
+static __thread int tls_policy_crypto_worker = -1;
 static int policy_index_by_wire_id[256];
 static int policy_profile_id_by_wire_id[256];
 static struct crypto_policy active_policies[MAX_CRYPTO_POLICIES];
@@ -32,6 +40,54 @@ static int prev_policy_crypto_ready[MAX_CRYPTO_POLICIES];
 static int prev_policy_index_by_wire_id[256];
 static int prev_policy_profile_id_by_wire_id[256];
 static struct crypto_policy prev_active_policies[MAX_CRYPTO_POLICIES];
+
+static void policy_crypto_publish_unlock(void)
+{
+    atomic_fetch_add_explicit(&policy_crypto_generation, 1u, memory_order_release);
+    pthread_mutex_unlock(&policy_crypto_lock);
+}
+
+/*
+ * Crypto workers use private immutable packet contexts. Handshake/reload only
+ * bumps the generation after updating the master copy, so the steady-state
+ * packet path pays one atomic load and never takes g_key_mutex.
+ */
+static void policy_crypto_sync_worker(int worker_idx)
+{
+    unsigned int generation;
+
+    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
+        return;
+
+    generation = atomic_load_explicit(&policy_crypto_generation, memory_order_acquire);
+    if (tls_policy_crypto_worker == worker_idx &&
+        tls_policy_crypto_generation == generation)
+        return;
+
+    pthread_mutex_lock(&policy_crypto_lock);
+    memcpy(worker_policy_crypto_ctx[worker_idx], policy_crypto_ctx,
+           sizeof(worker_policy_crypto_ctx[worker_idx]));
+    memcpy(worker_prev_policy_crypto_ctx[worker_idx], prev_policy_crypto_ctx,
+           sizeof(worker_prev_policy_crypto_ctx[worker_idx]));
+    generation = atomic_load_explicit(&policy_crypto_generation, memory_order_relaxed);
+    pthread_mutex_unlock(&policy_crypto_lock);
+
+    tls_policy_crypto_worker = worker_idx;
+    tls_policy_crypto_generation = generation;
+}
+
+static struct packet_crypto_ctx *policy_crypto_ctx_for_worker(int policy_index, int previous)
+{
+    int worker_idx = dp_crypto_current_worker_idx();
+
+    if (worker_idx < 0 || worker_idx >= (int)NE_CRYPTO_WORKERS)
+        return previous ? &prev_policy_crypto_ctx[policy_index]
+                        : &policy_crypto_ctx[policy_index];
+
+    policy_crypto_sync_worker(worker_idx);
+    return previous ? &worker_prev_policy_crypto_ctx[worker_idx][policy_index]
+                    : &worker_policy_crypto_ctx[worker_idx][policy_index];
+}
 static int prev_active_policy_count;
 static int prev_grace_active;
 static uint64_t prev_grace_until_ms;
@@ -138,6 +194,7 @@ void fwd_crypto_clear_grace(void)
 
 void fwd_crypto_snapshot_active_to_prev(void)
 {
+    pthread_mutex_lock(&policy_crypto_lock);
     memcpy(prev_policy_crypto_ctx, policy_crypto_ctx, sizeof(prev_policy_crypto_ctx));
     memcpy(prev_policy_crypto_ready, policy_crypto_ready, sizeof(prev_policy_crypto_ready));
     memcpy(prev_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(prev_policy_index_by_wire_id));
@@ -147,6 +204,7 @@ void fwd_crypto_snapshot_active_to_prev(void)
     prev_active_policy_count = active_policy_count;
     prev_grace_active = (prev_active_policy_count > 0) ? 1 : 0;
     prev_grace_until_ms = monotonic_ms() + FWD_CRYPTO_PROFILE_RELOAD_GRACE_MS;
+    policy_crypto_publish_unlock();
 }
 static int crypto_policy_is_encrypt(const struct crypto_policy *cp)
 {
@@ -161,6 +219,7 @@ static void crypto_runtime_reset_indexes(void)
 
 void forwarder_pre_diversify_pqc_keys(int profile_id)
 {
+    pthread_mutex_lock(&policy_crypto_lock);
     for (int i = 0; i < active_policy_count; i++) {
         if (!policy_crypto_ready[i])
             continue;
@@ -170,6 +229,7 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
     }
+    policy_crypto_publish_unlock();
 }
 
 void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
@@ -177,6 +237,7 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
     if (!cfg || !cfg->crypto_enabled || cfg->profile_count < 1)
         return;
 
+    pthread_mutex_lock(&policy_crypto_lock);
     {
         const struct profile_config *prof = &cfg->profiles[0];
 
@@ -208,6 +269,7 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[ctx_i]);
         }
     }
+    policy_crypto_publish_unlock();
 }
 
 int fwd_crypto_rebuild(struct app_config *cfg)
@@ -215,7 +277,10 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
     int old_policy_crypto_ready[MAX_CRYPTO_POLICIES];
     int old_policy_index_by_wire_id[256];
-    int old_active_policy_count = active_policy_count;
+    int old_active_policy_count;
+
+    pthread_mutex_lock(&policy_crypto_lock);
+    old_active_policy_count = active_policy_count;
     memcpy(old_policy_crypto_ctx, policy_crypto_ctx, sizeof(old_policy_crypto_ctx));
     memcpy(old_policy_crypto_ready, policy_crypto_ready, sizeof(old_policy_crypto_ready));
     memcpy(old_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(old_policy_index_by_wire_id));
@@ -233,6 +298,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     }
 
     if (!cfg || !cfg->crypto_enabled) {
+        policy_crypto_publish_unlock();
         arp_bridge_reload_policies(cfg);
         return 0;
     }
@@ -295,6 +361,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         }
     }
 
+    policy_crypto_publish_unlock();
     arp_bridge_reload_policies(cfg);
     return 0;
 }
@@ -304,11 +371,11 @@ struct packet_crypto_ctx *fwd_crypto_ctx_for_wire_id(uint8_t wire_id)
     fwd_crypto_maybe_expire_prev_grace();
     int pi = policy_index_by_wire_id[wire_id];
     if (pi >= 0 && pi < active_policy_count && policy_crypto_ready[pi])
-        return &policy_crypto_ctx[pi];
+        return policy_crypto_ctx_for_worker(pi, 0);
     if (prev_grace_active) {
         int ppi = prev_policy_index_by_wire_id[wire_id];
         if (ppi >= 0 && ppi < prev_active_policy_count && prev_policy_crypto_ready[ppi])
-            return &prev_policy_crypto_ctx[ppi];
+            return policy_crypto_ctx_for_worker(ppi, 1);
     }
     return NULL;
 }
@@ -373,7 +440,7 @@ struct packet_crypto_ctx *fwd_crypto_policy_ctx(int policy_index)
 {
     if (!fwd_crypto_policy_ready(policy_index))
         return NULL;
-    return &policy_crypto_ctx[policy_index];
+    return policy_crypto_ctx_for_worker(policy_index, 0);
 }
 
 int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len)

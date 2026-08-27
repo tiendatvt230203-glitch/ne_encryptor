@@ -203,12 +203,12 @@ void arp_bridge_reload_policies(struct app_config *cfg)
 
 static struct ne_ring *arp_mid_to_local_ring(struct forwarder *fwd, int li)
 {
-    return &fwd->mid_to_local[li][dp_crypto_current_worker_idx()];
+    return &fwd->mid_to_local[li][dp_out_ring_idx()];
 }
 
 static struct ne_ring *arp_mid_to_wan_ring(struct forwarder *fwd, int wan_dp)
 {
-    return &fwd->mid_to_wan[wan_dp][dp_crypto_current_worker_idx()];
+    return &fwd->mid_to_wan[wan_dp][dp_out_ring_idx()];
 }
 
 static int profile_pi_for_wan_dp(struct forwarder *fwd, int wan_dp)
@@ -405,7 +405,7 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
         job->local_idx = (uint8_t)li;
         if (ne_ring_try_push(ring, job) != 0)
             return -1;
-        ne_dp_idle_wake(NE_DP_WAKE_TX);
+        ne_dp_idle_wake_tx_worker(wi);
         *sent = 1;
         return 0;
     }
@@ -424,7 +424,7 @@ static int arp_flood_push_local(struct forwarder *fwd, struct ne_packet *job,
             ne_frame_free(&fwd->pair, clone.addr);
             return -1;
         }
-        ne_dp_idle_wake(NE_DP_WAKE_TX);
+        ne_dp_idle_wake_tx_worker(wi);
     }
     return 0;
 }
@@ -454,7 +454,7 @@ static int arp_flood_to_profile_locals(struct forwarder *fwd, struct ne_packet *
     if (!prof->enabled || prof->local_count <= 0)
         return -1;
 
-    wi = dp_crypto_current_worker_idx();
+    wi = dp_out_ring_idx();
 
     for (int i = 0; i < prof->local_count; i++) {
         int li = mac_fwd_local_for_cfg_idx(fwd, prof->local_indices[i]);

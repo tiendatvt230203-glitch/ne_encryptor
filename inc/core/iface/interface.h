@@ -42,6 +42,7 @@ struct ne_packet {
     uint8_t dir;
     uint8_t wan_idx;
     uint8_t local_idx;
+    uint8_t tx_slot;
 };
 
 struct ne_ring {

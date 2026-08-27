@@ -1230,6 +1230,7 @@ static int recv_queue(struct ne_xsk_queue *slot, struct ne_packet *out, uint32_t
         out[i].dir = dir;
         out[i].wan_idx = wan_idx;
         out[i].local_idx = local_idx;
+        out[i].tx_slot = 0;
     }
     slot->rx_pending = n;
     return (int)n;
@@ -1554,15 +1555,24 @@ int ne_rx_wan_fds(struct ne_pair *p, int rx_slot, int *fds, int max)
 }
 
 // TX
+#define NE_XSK_COPY_TX_BATCH 32u
+
 static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32_t max_frame,
                           uint64_t *tx_no_free)
-{   
-    struct ne_packet jobs[NE_BATCH_SIZE];
-    uint32_t free_slots = xsk_prod_nb_free(&slot->tx, NE_BATCH_SIZE);
+{
+    struct ne_packet jobs[NE_XSK_COPY_TX_BATCH];
+    uint32_t queued = ne_ring_count(src);
     uint32_t want;
+    uint32_t free_slots;
     uint32_t idx = 0;
     uint32_t reserved;
     uint32_t popped = 0;
+
+    if (!queued)
+        return 0;
+
+    want = queued > NE_XSK_COPY_TX_BATCH ? NE_XSK_COPY_TX_BATCH : queued;
+    free_slots = xsk_prod_nb_free(&slot->tx, want);
 
     if (!free_slots) {
         if (tx_no_free)
@@ -1580,7 +1590,8 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     }
 
 
-    want = free_slots > NE_BATCH_SIZE ? NE_BATCH_SIZE : free_slots;
+    if (want > free_slots)
+        want = free_slots;
     reserved = xsk_ring_prod__reserve(&slot->tx, want, &idx);
     if (!reserved)
         return 0;
@@ -1588,10 +1599,8 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     while (popped < reserved && ne_ring_try_pop(src, &jobs[popped]) == 0)
         popped++;
 
-    if (popped < reserved) {
-        
+    if (popped < reserved)
         slot->tx.cached_prod -= (reserved - popped);
-    }
     if (!popped)
         return 0;
 
