@@ -3,7 +3,6 @@
 #include "../../../inc/core/failover/wan_failover.h"
 
 #include "../../../inc/core/dataplane/crypto_route.h"
-#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/flow/flow_table.h"
 
@@ -590,6 +589,14 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                            uint16_t src_port, uint16_t dst_port,
                            uint8_t proto, uint32_t window_bytes)
 {
+    (void)flow_ok;
+    (void)src_ip;
+    (void)dst_ip;
+    (void)src_port;
+    (void)dst_port;
+    (void)proto;
+    (void)window_bytes;
+
     if (!fwd || fwd->wan_count <= 0)
         return -1;
     if (profile_idx < 0 || profile_idx >= fwd->cfg->profile_count)
@@ -603,13 +610,7 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     if (pool_n <= 0)
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
-    int slot = fwd_crypto_profile_slot_for_id(p->id);
-    int wan_cfg = flow_ok && slot >= 0 && fwd_crypto_flow_table_ready(slot)
-        ? flow_table_get_wan_profile(fwd_crypto_flow_table(slot),
-                                     src_ip, dst_ip, src_port, dst_port, proto,
-                                     window_bytes,
-                                     allowed_wans, pool_n, allowed_weights)
-        : flow_table_pick_wan_per_packet(allowed_wans, allowed_weights, pool_n);
+    int wan_cfg = flow_table_pick_wan_per_packet(allowed_wans, allowed_weights, pool_n);
     if (wan_cfg < 0)
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 

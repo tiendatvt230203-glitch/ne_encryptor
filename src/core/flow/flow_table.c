@@ -7,12 +7,7 @@
 #include <stdatomic.h>
 
 static _Atomic uint64_t g_pkt_wrr_seq;
-static _Atomic uint64_t g_flow_wrr_seq;
 
-
-static int flow_pick_wan_new_connection(const int *allowed_wans,
-                                        const int *allowed_weights,
-                                        int allowed_count, int sumw);
 static inline void normalize_flow_5tuple(uint32_t *src_ip, uint32_t *dst_ip,
                                          uint16_t *src_port, uint16_t *dst_port) {
     if (!src_ip || !dst_ip || !src_port || !dst_port)
@@ -83,7 +78,6 @@ static uint64_t get_time_ns(void) {
 void flow_table_init(struct flow_table *ft, const uint32_t *wan_window_sizes, int wan_count) {
     memset(ft, 0, sizeof(*ft));
     atomic_store(&g_pkt_wrr_seq, 0);
-    atomic_store(&g_flow_wrr_seq, 0);
     ft->wan_count = wan_count;
     for (int i = 0; i < MAX_INTERFACES; i++) {
         if (wan_window_sizes)
@@ -351,13 +345,13 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     if (!ft || !allowed_wans || allowed_count <= 0)
         return flow_table_get_wan(ft, src_ip, dst_ip, src_port, dst_port, protocol,
                                   window_bytes);
-    if (allowed_count == 1 && protocol != IPPROTO_TCP)
+    if (allowed_count == 1)
         return allowed_wans[0];
 
     normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
     uint32_t idx = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     uint64_t now = get_time_sec();
-    uint64_t now_ns = protocol == IPPROTO_TCP ? 0 : get_time_ns();
+    uint64_t now_ns = get_time_ns();
     int sumw = weights_sum_positive(allowed_weights, allowed_count);
 
     pthread_mutex_lock(&ft->locks[idx]);
@@ -373,24 +367,8 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             entry->key.protocol == protocol) {
 
             entry->last_seen = now;
-            if (protocol == IPPROTO_TCP) {
-                int pos = wan_allowed_pos(entry->current_wan, allowed_wans,
-                                          allowed_count);
-
-                /* TCP stays on one WAN for its lifetime; only failover may move it. */
-                if (pos < 0 || (sumw > 0 && allowed_weights &&
-                                allowed_weights[pos] <= 0)) {
-                    entry->current_wan = flow_pick_wan_new_connection(
-                        allowed_wans, allowed_weights, allowed_count, sumw);
-                    entry->wrr_slot = wan_allowed_pos(entry->current_wan,
-                                                      allowed_wans, allowed_count);
-                    entry->byte_count = 0;
-                    entry->drain_until_ns = 0;
-                }
-            } else {
-                flow_window_advance(entry, ft, window_bytes, now_ns,
-                                    allowed_wans, allowed_count, allowed_weights, sumw);
-            }
+            flow_window_advance(entry, ft, window_bytes, now_ns,
+                                allowed_wans, allowed_count, allowed_weights, sumw);
             {
                 int wan_idx = entry->current_wan;
                 pthread_mutex_unlock(&ft->locks[idx]);
@@ -421,12 +399,21 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     entry->next = ft->buckets[idx];
 
     {
-        entry->current_wan = flow_pick_wan_new_connection(
-            allowed_wans, allowed_weights, allowed_count, sumw);
-        entry->wrr_slot = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+        uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        if (sumw > 0 && allowed_weights) {
+            entry->current_wan = wrr_slot_to_wan((int)(h % (uint32_t)sumw),
+                                                 allowed_wans, allowed_weights,
+                                                 allowed_count, sumw);
+            entry->wrr_slot = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+            if (entry->wrr_slot < 0)
+                entry->wrr_slot = first_positive_pos(allowed_weights, allowed_count);
+        } else {
+            entry->wrr_slot = (int)(h % (uint32_t)allowed_count);
+            entry->current_wan = allowed_wans[entry->wrr_slot];
+        }
     }
 
-    if (protocol != IPPROTO_TCP) {
+    {
         uint32_t cur_limit = profile_wan_limit(ft, entry->current_wan,
                                                allowed_wans, allowed_weights,
                                                allowed_count);
@@ -461,10 +448,7 @@ void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
         struct flow_entry **pp = &ft->buckets[i];
         while (*pp) {
             struct flow_entry *entry = *pp;
-            uint64_t timeout = entry->key.protocol == IPPROTO_TCP
-                ? FLOW_TCP_TIMEOUT_SEC : FLOW_TIMEOUT_SEC;
-
-            if (now - entry->last_seen > timeout) {
+            if (now - entry->last_seen > FLOW_TIMEOUT_SEC) {
                 *pp = entry->next;
                 free(entry);
             } else {
@@ -475,17 +459,4 @@ void flow_table_gc_slice(struct flow_table *ft, int *bucket_cursor, int buckets)
         pthread_mutex_unlock(&ft->locks[i]);
     }
     *bucket_cursor = (start + buckets) % FLOW_TABLE_SIZE;
-}
-
-static int flow_pick_wan_new_connection(const int *allowed_wans,
-                                        const int *allowed_weights,
-                                        int allowed_count, int sumw)
-{
-    uint64_t n = atomic_fetch_add_explicit(&g_flow_wrr_seq, 1,
-                                           memory_order_relaxed);
-
-    if (sumw > 0 && allowed_weights)
-        return wrr_slot_to_wan((int)(n % (uint64_t)sumw), allowed_wans,
-                               allowed_weights, allowed_count, sumw);
-    return allowed_wans[n % (uint64_t)allowed_count];
 }
