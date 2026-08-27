@@ -589,12 +589,6 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                            uint16_t src_port, uint16_t dst_port,
                            uint8_t proto, uint32_t window_bytes)
 {
-    (void)flow_ok;
-    (void)src_ip;
-    (void)dst_ip;
-    (void)src_port;
-    (void)dst_port;
-    (void)proto;
     (void)window_bytes;
 
     if (!fwd || fwd->wan_count <= 0)
@@ -610,7 +604,10 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     if (pool_n <= 0)
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
-    int wan_cfg = flow_table_pick_wan_per_packet(allowed_wans, allowed_weights, pool_n);
+    int wan_cfg = flow_ok
+        ? flow_table_pick_wan_per_flow_packet(src_ip, dst_ip, src_port, dst_port, proto,
+                                              allowed_wans, allowed_weights, pool_n)
+        : flow_table_pick_wan_per_packet(allowed_wans, allowed_weights, pool_n);
     if (wan_cfg < 0)
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
@@ -620,5 +617,8 @@ int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
     if (dp < 0 || dp >= fwd->wan_count || !fwd_wan_dp_ok_for_new_traffic(dp))
         return pick_least_loaded_wan(fwd, profile_idx, 0);
 
-    return dp;
+    /* Do not drop only because the scheduled WAN ring is full while another
+     * eligible WAN still has room.  The smooth state advances as if selected,
+     * so the configured long-term ratio converges after the transient. */
+    return pick_least_loaded_wan(fwd, profile_idx, dp);
 }

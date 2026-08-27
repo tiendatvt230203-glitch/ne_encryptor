@@ -1,5 +1,6 @@
 #include "../../../inc/core/dataplane/dataplane_stats.h"
 #include "../../../inc/core/dataplane/crypto_route.h"
+#include "../../../inc/core/dataplane/udp_reorder.h"
 #include "../../../inc/core/forwarder/forwarder.h"
 #include "../../../inc/core/iface/interface.h"
 
@@ -321,6 +322,23 @@ void ne_dp_stats_tick(struct forwarder *fwd)
                 fprintf(stderr, "%s%llu", slot ? "," : "",
                         (unsigned long long)tx_connections[slot]);
             fprintf(stderr, "]\n");
+        }
+
+        {
+            struct dp_udp_reorder_stats reorder;
+
+            dp_udp_reorder_get_stats(&reorder);
+            fprintf(stderr,
+                    "[DP-STATS] udp_reorder held=%llu released=%llu "
+                    "late_dup=%llu gap_skip=%llu overflow=%llu evicted=%llu "
+                    "held_high_water=%llu\n",
+                    (unsigned long long)reorder.held,
+                    (unsigned long long)reorder.released,
+                    (unsigned long long)reorder.late_or_duplicate,
+                    (unsigned long long)reorder.gap_skipped,
+                    (unsigned long long)reorder.overflow,
+                    (unsigned long long)reorder.evicted,
+                    (unsigned long long)reorder.high_water);
         }
 
         {

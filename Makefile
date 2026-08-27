@@ -42,9 +42,21 @@ DB_OBJ = $(DB_SRC:.c=.o)
 BPF_OBJ = $(LIB_DIR)/lan.o \
           $(LIB_DIR)/wan.o
 
-.PHONY: all clean dirs
+.PHONY: all clean dirs test
+
+TEST_BINS = tests/test_wan_smooth.bin tests/test_udp_reorder.bin
 
 all: dirs $(BPF_OBJ) $(TARGET)
+
+test: $(TEST_BINS)
+	./tests/test_wan_smooth.bin
+	./tests/test_udp_reorder.bin
+
+tests/test_wan_smooth.bin: tests/test_wan_smooth.c src/core/flow/flow_table.c
+	$(CC) $(CFLAGS) -Wextra -Werror $^ -lpthread -o $@
+
+tests/test_udp_reorder.bin: tests/test_udp_reorder.c src/core/dataplane/udp_reorder.c
+	$(CC) $(CFLAGS) -Wextra -Werror $^ -lpthread -o $@
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)
@@ -59,3 +71,4 @@ clean:
 	rm -rf network-encryptor src/*.o src/core/*/*.o src/crypto/common/*.o \
 		src/crypto/options/*.o src/crypto/options/common/*.o \
 		src/crypto/pqc/*.o src/db/*.o *.o $(BPF_OBJ)
+	rm -f $(TEST_BINS)
