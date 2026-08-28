@@ -35,7 +35,6 @@ uint32_t crypto_option_get_mtu(void);
 
 typedef enum {
     CRYPTO_OPT_L2_PQC = 0,
-    CRYPTO_OPT_BYPASS,
     CRYPTO_OPT_COUNT
 } crypto_option_id;
 

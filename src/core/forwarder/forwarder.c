@@ -37,7 +37,6 @@ static void dp_maint_tick(struct forwarder *fwd)
     fwd_crypto_pqc_key_lifetime_tick();
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
-    fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);
     mac_learn_tick(fwd);
     ne_dp_stats_tick(fwd);
 }
@@ -571,8 +570,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
 
     fwd_crypto_reset_on_init();
-    if (fwd_crypto_ensure_profile_slots(cfg) != 0)
-        return -1;
 
     pqc_handshake_start_all_profiles(cfg);
 
@@ -646,7 +643,6 @@ void forwarder_cleanup(struct forwarder *fwd)
         for (int w = 0; w < (int)NE_CRYPTO_WORKERS; w++)
             ne_ring_destroy(&fwd->mid_to_local[i][w]);
     }
-    fwd_crypto_cleanup_all_profile_slots();
     ne_pair_close(&fwd->pair, fwd->cfg);
     ne_dp_idle_shutdown();
 }

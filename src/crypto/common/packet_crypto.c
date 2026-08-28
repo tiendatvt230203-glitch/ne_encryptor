@@ -1,5 +1,4 @@
 #include "../../../inc/crypto/packet_crypto.h"
-#include "../../../inc/core/util/config.h"
 #include "../../../inc/core/util/main_diag.h"
 
 #include <openssl/hmac.h>
@@ -76,18 +75,6 @@ static int pqc_load_handshake_slots(struct packet_crypto_ctx *ctx)
     return 0;
 }
 
-static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
-{
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
-        return;
-
-    if (pqc_load_handshake_slots(ctx) != 0) {
-        if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
-            pqc_clear_ctx_keys(ctx);
-        return;
-    }
-}
-
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot)
 {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT)
@@ -95,14 +82,9 @@ const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot)
     return ctx->keys[slot];
 }
 
-void packet_crypto_update_keys(struct packet_crypto_ctx *ctx)
-{
-    pqc_refresh_if_stale(ctx);
-}
-
 void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 {
-    if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
+    if (!ctx || !ctx->pqc_from_handshake)
         return;
     if (pqc_load_handshake_slots(ctx) != 0) {
         if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
@@ -110,18 +92,14 @@ void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
     }
 }
 
-int packet_crypto_init(struct packet_crypto_ctx *ctx, const uint8_t master_key[AES_MAX_KEY_SIZE],
-                       int aes_bits)
+int packet_crypto_init(struct packet_crypto_ctx *ctx,
+                       const uint8_t master_key[AES_MAX_KEY_SIZE])
 {
     if (!ctx || !master_key)
         return -1;
-    if (aes_bits != 128 && aes_bits != 256)
-        aes_bits = 128;
 
     memset(ctx, 0, sizeof(*ctx));
     memcpy(ctx->master_key, master_key, AES_MAX_KEY_SIZE);
-    ctx->aes_bits = aes_bits;
-    ctx->crypto_mode = CRYPTO_MODE_PQC;
     ctx->initialized = true;
     fill_static_slots(ctx->master_key, ctx->keys);
     return 0;

@@ -11,8 +11,7 @@ KERNEL_HEADERS = /usr/include
 LIB_DIR = lib
 TARGET  = network-encryptor
 
-OPT_SRCS = $(wildcard src/crypto/options/common/*.c) \
-           src/crypto/options/bypass.c
+OPT_SRCS = $(wildcard src/crypto/options/common/*.c)
 
 PQC_SRCS = $(wildcard src/crypto/pqc/*.c)
 

@@ -145,6 +145,9 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
         : NULL;
     if (!c)
         return -1;
+    if (c->action != POLICY_ACTION_BYPASS &&
+        (c->action != POLICY_ACTION_ENCRYPT_L2 || c->crypto_mode != CRYPTO_MODE_PQC))
+        return -1;
     *profile_idx = 0;
     *cp = c;
     return 0;
@@ -172,6 +175,8 @@ int dataplane_local_needs_mid(struct forwarder *fwd, const uint8_t *pkt, uint32_
     if (pick_profile_policy(fwd, local_idx, flow_ok, src_ip, dst_ip, src_port, dst_port,
                             proto, &profile_idx, &cp) != 0)
         return 0;
+    /* Unsupported legacy encryption policies must enter the crypto path and
+     * be rejected there, never fall through as plaintext bypass traffic. */
     return cp && cp->action != POLICY_ACTION_BYPASS;
 }
 
@@ -204,8 +209,7 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
                             &profile_idx, &cp) != 0)
         goto drop;
     wan_dp = fwd_wan_pick_for_local(fwd, profile_idx, flow_ok, src_ip, dst_ip,
-                                    src_port, dst_port, proto,
-                                    dp_flow_window_bytes(pkt, job.len, job.len));
+                                    src_port, dst_port, proto);
     if (wan_dp < 0 || !fwd_wan_has_tx_room(fwd,wan_dp))
         goto drop;
 

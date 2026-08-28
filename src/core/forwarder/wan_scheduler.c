@@ -587,10 +587,8 @@ static int pick_least_loaded_wan(struct forwarder *fwd, int profile_idx, int sel
 int fwd_wan_pick_for_local(struct forwarder *fwd, int profile_idx, int flow_ok,
                            uint32_t src_ip, uint32_t dst_ip,
                            uint16_t src_port, uint16_t dst_port,
-                           uint8_t proto, uint32_t window_bytes)
+                           uint8_t proto)
 {
-    (void)window_bytes;
-
     if (!fwd || fwd->wan_count <= 0)
         return -1;
     if (profile_idx < 0 || profile_idx >= fwd->cfg->profile_count)
