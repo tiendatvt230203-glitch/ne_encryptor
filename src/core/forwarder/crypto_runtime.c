@@ -236,6 +236,7 @@ int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id)
 {
     uint64_t now;
     int found = -1;
+    int has_key;
     uint64_t started;
     uint64_t rem_ms;
     uint64_t days;
@@ -246,7 +247,7 @@ int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id)
         return -1;
     out[0] = '\0';
     if (policy_id <= 0) {
-        snprintf(out, out_max, "NO-ENCRYPT\n");
+        snprintf(out, out_max, "không tồn tại policy này\n");
         return 0;
     }
 
@@ -260,7 +261,7 @@ int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id)
     }
     if (found < 0) {
         pthread_mutex_unlock(&policy_crypto_lock);
-        snprintf(out, out_max, "POLICY-NOT-FOUND\n");
+        snprintf(out, out_max, "không tồn tại policy này\n");
         return 0;
     }
     if (!crypto_policy_is_encrypt(&active_policies[found])) {
@@ -269,26 +270,22 @@ int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id)
         return 0;
     }
 
-    if (!policy_crypto_ready[found] || !policy_crypto_ctx[found].pqc_from_handshake ||
-        !ne_key_nonzero(policy_crypto_ctx[found].keys[KEY_SLOT_CURRENT],
-                        PQC_TRAFFIC_KEY_SZ)) {
-        pthread_mutex_unlock(&policy_crypto_lock);
-        snprintf(out, out_max, "no session key\n");
-        return 0;
-    }
-    started = policy_crypto_ctx[found].pqc_key_in_use_ms;
+    has_key = policy_crypto_ready[found] &&
+              policy_crypto_ctx[found].pqc_from_handshake &&
+              ne_key_nonzero(policy_crypto_ctx[found].keys[KEY_SLOT_CURRENT],
+                             PQC_TRAFFIC_KEY_SZ);
+    started = has_key ? policy_crypto_ctx[found].pqc_key_in_use_ms : 0;
     pthread_mutex_unlock(&policy_crypto_lock);
     now = monotonic_ms();
 
-    if (started == 0) {
-        snprintf(out, out_max, "unused (timer not started)\n");
-        return 0;
-    }
-    if (now >= started && now - started >= NE_PQC_KEY_LIFETIME_MS) {
-        snprintf(out, out_max, "expired (requesting new key)\n");
-        return 0;
-    }
-    rem_ms = NE_PQC_KEY_LIFETIME_MS - (now > started ? now - started : 0);
+    if (!has_key)
+        rem_ms = 0;
+    else if (started == 0)
+        rem_ms = NE_PQC_KEY_LIFETIME_MS;
+    else if (now >= started && now - started >= NE_PQC_KEY_LIFETIME_MS)
+        rem_ms = 0;
+    else
+        rem_ms = NE_PQC_KEY_LIFETIME_MS - (now > started ? now - started : 0);
     /* Round up to the displayed minute so a freshly started key shows the
      * full 30 days instead of 29 days 23 hours 59 minutes. */
     rem_ms = ((rem_ms + 59999ULL) / 60000ULL) * 60000ULL;

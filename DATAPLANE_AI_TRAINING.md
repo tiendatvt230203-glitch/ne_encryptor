@@ -2184,16 +2184,15 @@ network-encryptor -tk <policy_id>
 
 `policy_id` = `crypto_policy.db_id` (cùng `-r`). Thiếu argv / id ≤ 0 → usage / invalid, không query.
 
-Logic in:
+Logic in — chỉ 3 stdout:
 
 | Điều kiện | stdout |
 |-----------|--------|
-| Không tìm policy trên daemon | `POLICY-NOT-FOUND` |
-| `action==BYPASS`, hoặc `crypto_mode != PQC` | `NO-ENCRYPT` |
-| Policy PQC nhưng chưa có CURRENT / ctx chưa ready / không `pqc_from_handshake` | `no session key` |
-| Có CURRENT, `ctx->pqc_key_in_use_ms==0` (hiếm; tick sẽ start) | `unused (timer not started)` |
-| Đã quá 30 ngày (đang xin key mới) | `expired (requesting new key)` |
-| Còn hạn | `29 days 12 hours 42 minutes` (singular/plural tiếng Anh) |
+| Không tìm policy trên daemon | `không tồn tại policy này` |
+| Policy tồn tại nhưng `action==BYPASS` (không mã hóa) | `NO-ENCRYPT` |
+| Policy mã hóa tồn tại | `29 days 12 hours 42 minutes` (singular/plural tiếng Anh). Chưa có CURRENT / hết hạn → `0 days 0 hours 0 minutes`. |
+
+Không in `unused`, `no session key`, `expired`, `POLICY-NOT-FOUND`.
 
 Không dump cả profile. Một lệnh = một policy.
 
