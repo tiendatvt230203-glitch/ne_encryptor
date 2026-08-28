@@ -113,7 +113,17 @@ static void ne_wipe_key(uint8_t *key, size_t len)
         *p++ = 0;
 }
 
-/* policy_crypto_lock must be held. Clock starts only after NE encrypts. */
+/* policy_crypto_lock must be held. Clock starts when CURRENT is stored in RAM. */
+static void ne_pqc_start_lifetime_clock(struct packet_crypto_ctx *ctx, uint64_t now)
+{
+    memcpy(ctx->pqc_timed_key, ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+    ctx->pqc_key_in_use_ms = now;
+    ctx->pqc_rekey_sent = false;
+    fprintf(stderr,
+            "[NE-PQC] Policy %d session key stored in RAM; lifetime clock started.\n",
+            ctx->policy_id);
+}
+
 static void ne_pqc_on_key_material(struct packet_crypto_ctx *ctx)
 {
     if (!ctx || !ctx->pqc_from_handshake)
@@ -128,9 +138,7 @@ static void ne_pqc_on_key_material(struct packet_crypto_ctx *ctx)
                PQC_TRAFFIC_KEY_SZ) == 0)
         return;
 
-    ctx->pqc_key_in_use_ms = 0;
-    ctx->pqc_rekey_sent = false;
-    ne_wipe_key(ctx->pqc_timed_key, PQC_TRAFFIC_KEY_SZ);
+    ne_pqc_start_lifetime_clock(ctx, monotonic_ms());
 }
 
 /* UDP reassembly is keyed by the single active dataplane profile. */
@@ -145,49 +153,6 @@ void fwd_crypto_maybe_expire_prev_grace(void)
         return;
     if (monotonic_ms() >= prev_grace_until_ms)
         prev_grace_active = 0;
-}
-
-void fwd_crypto_note_pqc_key_used(struct packet_crypto_ctx *ctx)
-{
-    uint8_t wire;
-    uint64_t now;
-    int i;
-    struct packet_crypto_ctx *master;
-
-    if (!ctx || !ctx->pqc_from_handshake)
-        return;
-    wire = ctx->wire_id;
-    if (ctx->pqc_key_in_use_ms != 0)
-        return;
-    if (!ne_key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
-        return;
-
-    now = monotonic_ms();
-    pthread_mutex_lock(&policy_crypto_lock);
-    i = policy_index_by_wire_id[wire];
-    master = (i >= 0 && i < active_policy_count && policy_crypto_ready[i])
-        ? &policy_crypto_ctx[i] : NULL;
-    /* A packet may finish on an old worker snapshot while a rekey/reload is
-     * being published. Never let that stale packet start the new key's clock. */
-    if (!master || master->policy_id != ctx->policy_id ||
-        master->pqc_key_in_use_ms != 0 ||
-        memcmp(master->keys[KEY_SLOT_CURRENT], ctx->keys[KEY_SLOT_CURRENT],
-               PQC_TRAFFIC_KEY_SZ) != 0 ||
-        !ne_key_nonzero(master->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ)) {
-        pthread_mutex_unlock(&policy_crypto_lock);
-        return;
-    }
-
-    memcpy(master->pqc_timed_key, master->keys[KEY_SLOT_CURRENT],
-           PQC_TRAFFIC_KEY_SZ);
-    master->pqc_key_in_use_ms = now;
-    master->pqc_rekey_sent = false;
-    atomic_fetch_add_explicit(&policy_crypto_generation, 1u, memory_order_release);
-
-    fprintf(stderr,
-            "[NE-PQC] Policy %d session key is in RAM and in use; lifetime clock started.\n",
-            master->policy_id);
-    pthread_mutex_unlock(&policy_crypto_lock);
 }
 
 void fwd_crypto_discard_pqc_prev_key(int policy_id)
@@ -229,8 +194,14 @@ void fwd_crypto_pqc_key_lifetime_tick(void)
         if (!policy_crypto_ready[i] || !policy_crypto_ctx[i].pqc_from_handshake)
             continue;
         started = policy_crypto_ctx[i].pqc_key_in_use_ms;
-        if (started == 0 || now < started ||
-            now - started < NE_PQC_KEY_LIFETIME_MS)
+        if (started == 0) {
+            if (!ne_key_nonzero(policy_crypto_ctx[i].keys[KEY_SLOT_CURRENT],
+                                PQC_TRAFFIC_KEY_SZ))
+                continue;
+            ne_pqc_start_lifetime_clock(&policy_crypto_ctx[i], now);
+            continue;
+        }
+        if (now < started || now - started < NE_PQC_KEY_LIFETIME_MS)
             continue;
         if (policy_crypto_ctx[i].pqc_rekey_sent)
             continue;

@@ -24,7 +24,6 @@ int fwd_crypto_has_l2_marker(const uint8_t *pkt, uint32_t pkt_len);
 
 void forwarder_pre_diversify_pqc_keys(int profile_id);
 void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg);
-void fwd_crypto_note_pqc_key_used(struct packet_crypto_ctx *ctx);
 void fwd_crypto_discard_pqc_prev_key(int policy_id);
 void fwd_crypto_pqc_key_lifetime_tick(void);
 int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id);

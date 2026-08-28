@@ -646,7 +646,7 @@ Overhead ~30B → TCP MSS clamp trước encrypt.
 
 `packet_crypto_ctx`: 3 slot PREV/CURRENT/NEXT. Data policy `pqc_from_handshake=true`. ARP key tĩnh, không HS-refresh.
 
-Handshake (`pqc_handshake.c`): **chỉ trao key**. DB phải có `pqc_exchange_tunnels` → bind UDP `:7090` trên IP tunnel. Rekey dùng HELLO/RESP để stage key vào NEXT, sau đó READY/COMMIT có chữ ký mới promote; CURRENT cũ vẫn phục vụ trong cửa sổ chuyển đổi. **NE** (`crypto_runtime.c`) sở hữu đồng hồ 30 ngày per DB policy. Clock start khi policy đó **encrypt thành công lần đầu** (`fwd_crypto_note_pqc_key_used` từ `pqc_l2_option.c`). PREV chỉ bị xóa sau khi keepalive xác nhận peer đã dùng CURRENT mới và hết grace 90 giây. Chi tiết: **§19.3**, **§19.6**. **Mã hóa dataplane vẫn L2 PQC** 0x104A/0x104B.
+Handshake (`pqc_handshake.c`): **chỉ trao key**. DB phải có `pqc_exchange_tunnels` → bind UDP `:7090` trên IP tunnel. Rekey dùng HELLO/RESP để stage key vào NEXT, sau đó READY/COMMIT có chữ ký mới promote; CURRENT cũ vẫn phục vụ trong cửa sổ chuyển đổi. **NE** (`crypto_runtime.c`) sở hữu đồng hồ 30 ngày per DB policy. Clock start ngay khi CURRENT được nạp vào RAM (`ne_pqc_on_key_material`), **không** chờ traffic encrypt. PREV chỉ bị xóa sau khi keepalive xác nhận peer đã dùng CURRENT mới và hết grace 90 giây. Chi tiết: **§19.3**, **§19.6**. **Mã hóa dataplane vẫn L2 PQC** 0x104A/0x104B.
 
 Hot path: worker giữ snapshot ctx. Các event handshake copy đủ PREV/CURRENT/NEXT từ PQC control-plane vào master ctx; worker nhận snapshot mới theo generation. Không lấy `g_key_mutex` mỗi gói.
 
@@ -1952,7 +1952,7 @@ Match 5-tuple + action. Live action sau load: **chỉ** `BYPASS=0` hoặc `ENCRY
 | `policy_index_by_wire_id[256]` | byte 14 → index ctx |
 | `policy_profile_id_by_wire_id[256]` | wire → profile (reasm slot) |
 | `active_policies[]` | snapshot policy |
-| `packet_crypto_ctx.pqc_key_in_use_ms` | CLOCK_MONOTONIC ms lúc **encrypt lần đầu**; thuộc stable DB policy ctx, 0 = chưa start |
+| `packet_crypto_ctx.pqc_key_in_use_ms` | CLOCK_MONOTONIC ms lúc **CURRENT được nạp RAM**; thuộc stable DB policy ctx, 0 = chưa có key / chưa start |
 | `packet_crypto_ctx.pqc_rekey_sent` | đã gọi `sig_pqc_request_new_session` cho lần hết hạn này; request bị từ chối tạm thời thì re-arm |
 | `packet_crypto_ctx.pqc_timed_key[32]` | bản sao CURRENT lúc clock start; CURRENT khác → reset clock |
 | `profile_flow_tables[MAX_PROFILES]` | **chỉ slot 0 dùng.** Live WAN pick **không** đọc table này. GC vẫn chạy `flow_table_gc_slice` trên worker 0 |
@@ -2075,17 +2075,15 @@ Mục này là nguồn sự thật cho **key usage clock**, **rekey 30 ngày**, 
 
 Cùng interval **30 ngày** (`NE_PQC_KEY_LIFETIME_MS`) cho mọi policy PQC. Wall-clock hết hạn **khác nhau** vì mỗi policy start clock riêng.
 
-Clock **start** chỉ khi **cả ba** đúng:
+Clock **start** khi **cả hai** đúng:
 
 1. Session key đã nằm RAM NE (`policy_crypto_ctx[].keys[CURRENT]` nonzero, `pqc_from_handshake=1`).
-2. Policy đó **dùng key để encrypt** thành công (GCM xong, `l2_note_key_used` → `fwd_crypto_note_pqc_key_used`).
-3. `ctx->pqc_key_in_use_ms == 0` (chưa start cho key này).
+2. CURRENT **khác** `pqc_timed_key` (key generation mới vừa nạp) — `ne_pqc_on_key_material` ghi `pqc_key_in_use_ms = monotonic_ms()` ngay lúc đó.
 
 Clock **không** start / **không** reset vì:
 
-- Handshake HELLO/RESP xong, key nằm RAM chưa encrypt.
 - Keepalive TX/RX, miss 3 interval (45 s).
-- Decrypt WAN→LAN (chỉ encrypt path gọi `l2_note_key_used`).
+- Encrypt hay decrypt dataplane (không còn `l2_note_key_used`).
 - CLI `-tk` (chỉ đọc).
 - `-r` retry HS (đó là recovery HS fail, khác monthly rekey).
 
@@ -2096,7 +2094,7 @@ Clock **không** start / **không** reset vì:
 Ba field trong từng `packet_crypto_ctx`:
 
 ```
-ctx->pqc_key_in_use_ms    CLOCK_MONOTONIC ms lúc encrypt lần đầu bằng key timed
+ctx->pqc_key_in_use_ms    CLOCK_MONOTONIC ms lúc CURRENT được nạp RAM
 ctx->pqc_rekey_sent       0/1 — đã xin HS cho lần hết hạn này chưa
 ctx->pqc_timed_key[32]    bản sao CURRENT lúc start clock
 ```
@@ -2105,30 +2103,15 @@ ctx->pqc_timed_key[32]    bản sao CURRENT lúc start clock
 
 - CURRENT zero → xóa clock, `rekey_sent`, wipe `pqc_timed_key`.
 - CURRENT **trùng** `pqc_timed_key` → no-op (cùng key đang đếm).
-- CURRENT **khác** `pqc_timed_key` → **reset clock = 0** (key mới vừa nạp, chưa encrypt → chưa đếm). `rekey_sent=0`.
+- CURRENT **khác** `pqc_timed_key` → **start clock = now** (key mới vừa nạp RAM). `rekey_sent=0`. Copy CURRENT → `pqc_timed_key`.
 
-Như vậy HS key mới **không** thừa kế thời gian còn lại của key cũ. 30 ngày tính từ lần encrypt đầu của **key mới**.
+Như vậy HS key mới **không** thừa kế thời gian còn lại của key cũ. 30 ngày tính từ lúc **key mới nằm RAM**, kể cả khi chưa có traffic.
 
-#### 19.6.3 Start clock trên hot path encrypt
+`fwd_crypto_pqc_key_lifetime_tick`: nếu CURRENT nonzero mà `pqc_key_in_use_ms==0` (key cũ trước khi đổi rule, hoặc load lệch path), start clock tại tick đó rồi skip expire.
 
-`pqc_l2_option.c`: sau `crypto_pqc_encrypt_payload` thành công (TCP/ICMP/OSPF `l2_do_encrypt`, UDP full/split, ARP enc), gọi `l2_note_key_used(ctx)` → `fwd_crypto_note_pqc_key_used`.
+#### 19.6.3 Dataplane encrypt không đụng clock
 
-`fwd_crypto_note_pqc_key_used`:
-
-```
-nếu !pqc_from_handshake → return
-nếu snapshot ctx đã có pqc_key_in_use_ms != 0 → return
-lock policy_crypto_lock
-  tìm master bằng wire, nhưng bắt buộc master.policy_id == snapshot.policy_id
-  bắt buộc snapshot CURRENT == master CURRENT // chặn worker cũ sau rekey
-  copy CURRENT → master.pqc_timed_key
-  master.pqc_key_in_use_ms = monotonic_ms()
-  bump policy_crypto_generation
-unlock
-log "[NE-PQC] Policy %d session key is in RAM and in use; lifetime clock started."
-```
-
-Hàm start clock **không xóa PREV**. Xóa PREV thuộc protocol xác nhận peer tại §19.6.5–19.6.6.
+Encrypt/decrypt (`pqc_l2_option.c`) **không** start hay reset lifetime. Hàm start clock **không xóa PREV**. Xóa PREV thuộc protocol xác nhận peer tại §19.6.5–19.6.6.
 
 #### 19.6.4 Tick hết hạn — từng policy, không cả profile
 
@@ -2138,6 +2121,7 @@ TX thread slot 0, khoảng mỗi 1024 vòng (`tx_maint_tick & 1023`), `dp_maint_
 lock
 với mỗi active policy PQC handshake-ready:
   started = ctx->pqc_key_in_use_ms
+  nếu started==0 và CURRENT nonzero → start clock = now, skip expire
   nếu started==0 hoặc (now - started) < 30 ngày → skip
   nếu ctx->pqc_rekey_sent đã 1 → skip
   ctx->pqc_rekey_sent = 1
@@ -2177,7 +2161,7 @@ initiator nhận COMMIT:
   PREV = CURRENT cũ; CURRENT = NEXT
 ```
 
-Decrypt thử `CURRENT → NEXT → PREV`. Vì vậy responder chuyển trước vẫn đọc được gói cũ từ initiator bằng PREV, còn initiator chưa nhận COMMIT vẫn đọc được gói mới bằng NEXT. Khi CURRENT đổi, lifetime reset về 0; lần encrypt đầu bằng key mới bắt đầu đủ 30 ngày mới.
+Decrypt thử `CURRENT → NEXT → PREV`. Vì vậy responder chuyển trước vẫn đọc được gói cũ từ initiator bằng PREV, còn initiator chưa nhận COMMIT vẫn đọc được gói mới bằng NEXT. Khi CURRENT đổi, lifetime start đủ 30 ngày mới ngay lúc key nạp RAM.
 
 #### 19.6.6 Keepalive = liveness, không phải lifetime
 
@@ -2207,7 +2191,7 @@ Logic in:
 | Không tìm policy trên daemon | `POLICY-NOT-FOUND` |
 | `action==BYPASS`, hoặc `crypto_mode != PQC` | `NO-ENCRYPT` |
 | Policy PQC nhưng chưa có CURRENT / ctx chưa ready / không `pqc_from_handshake` | `no session key` |
-| Có CURRENT, `ctx->pqc_key_in_use_ms==0` | `unused (timer not started)` |
+| Có CURRENT, `ctx->pqc_key_in_use_ms==0` (hiếm; tick sẽ start) | `unused (timer not started)` |
 | Đã quá 30 ngày (đang xin key mới) | `expired (requesting new key)` |
 | Còn hạn | `29 days 12 hours 42 minutes` (singular/plural tiếng Anh) |
 
@@ -2219,28 +2203,27 @@ Không dump cả profile. Một lệnh = một policy.
 
 ```
 HS lần đầu HELLO/RESP
-  → CURRENT nạp RAM, key_ready=1, clock=0          "unused"
-  → gói LAN encrypt thành công
-  → clock = now                                    "-tk" ra remaining ~30 days
+  → CURRENT nạp RAM, key_ready=1, clock = now     "-tk" ra remaining ~30 days
+  → gói LAN encrypt (nếu có) không đụng clock
   → 30 ngày sau, TX tick
   → sig_pqc_request_new_session                    key cũ vẫn encrypt
   → initiator HELLO / responder POKE
   → RESP → cả hai stage NEXT=mới, CURRENT=cũ vẫn chạy
   → READY → responder promote, gửi COMMIT
   → initiator promote khi nhận COMMIT
-  → clock reset 0; encrypt đầu bằng key mới → clock start đủ 30 ngày
+  → clock start đủ 30 ngày ngay lúc CURRENT mới nạp RAM
   → keepalive hai phía xác nhận CURRENT mới
   → grace 90 giây → wipe PREV
 ```
 
-Policy 75 encrypt hôm nay, policy 80 encrypt tuần sau → hết hạn lệch đúng khoảng đó. Cùng rule 30 ngày, khác wall-clock.
+Policy 75 handshake hôm nay, policy 80 handshake tuần sau → hết hạn lệch đúng khoảng đó. Cùng rule 30 ngày, khác wall-clock. Traffic idle không kéo dài lifetime.
 
 #### 19.6.9 File / symbol cần nhớ
 
 | Symbol | File |
 |--------|------|
 | `NE_PQC_KEY_LIFETIME_MS` | `crypto_runtime.c` |
-| `fwd_crypto_note_pqc_key_used` | `crypto_runtime.c`; caller `pqc_l2_option.c` |
+| `ne_pqc_on_key_material` | `crypto_runtime.c`; caller HS publish / rebuild / sync |
 | `fwd_crypto_pqc_key_lifetime_tick` | `crypto_runtime.c`; caller `dp_maint_tick` (`forwarder.c` TX slot 0) |
 | `fwd_crypto_format_pqc_key_times` | `crypto_runtime.c` |
 | `sig_pqc_request_new_session` | `pqc_handshake.c` |

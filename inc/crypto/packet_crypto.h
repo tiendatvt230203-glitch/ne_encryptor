@@ -29,7 +29,8 @@ struct packet_crypto_ctx {
      * 0 = static/master-derived keys (e.g. ARP default) — never HS-refresh. */
     bool pqc_from_handshake;
     /* NE-owned lifetime state. It follows the stable DB policy context across
-     * hot reloads instead of being attached to a reusable 8-bit wire id. */
+     * hot reloads instead of being attached to a reusable 8-bit wire id.
+     * pqc_key_in_use_ms is CLOCK_MONOTONIC ms when CURRENT was stored in RAM. */
     uint64_t pqc_key_in_use_ms;
     uint8_t pqc_timed_key[AES_MAX_KEY_SIZE];
     bool pqc_rekey_sent;
