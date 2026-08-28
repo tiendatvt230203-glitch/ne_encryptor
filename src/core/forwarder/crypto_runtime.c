@@ -352,8 +352,7 @@ void fwd_crypto_snapshot_active_to_prev(void)
 }
 static int crypto_policy_is_encrypt(const struct crypto_policy *cp)
 {
-    return cp && cp->action == POLICY_ACTION_ENCRYPT_L2 &&
-        cp->crypto_mode == CRYPTO_MODE_PQC;
+    return cp && cp->action == POLICY_ACTION_ENCRYPT_L2;
 }
 
 static void crypto_runtime_reset_indexes(void)

@@ -129,16 +129,14 @@ CREATE TABLE ne_policies (
 id SERIAL PRIMARY KEY,
 profile_id INT REFERENCES ne_profiles(id) ON DELETE SET NULL,
 priority INT NOT NULL,
-action VARCHAR(10) NOT NULL CHECK (action IN ('L2', 'L3', 'L4', 'bypass')),
+action VARCHAR(10) NOT NULL CHECK (action IN ('L2', 'bypass')),
 proto VARCHAR(10) CHECK (proto IN ('tcp', 'udp', 'icmp', 'ospf' , 'tcp/udp') OR proto IS NULL),
 src_ip TEXT[],
 dst_ip TEXT[],
 src_port TEXT[],
 dst_port TEXT[],
 invert_src_ip BOOLEAN NOT NULL DEFAULT FALSE,
-invert_dst_ip BOOLEAN NOT NULL DEFAULT FALSE,
-method VARCHAR(30) CHECK (method IN ('aes-gcm-128','aes-gcm-256','aes-ctr-128','aes-ctr-256','pqc-gcm') OR method IS NULL),
-encryption_key TEXT
+invert_dst_ip BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- ------------------------------------------------------------

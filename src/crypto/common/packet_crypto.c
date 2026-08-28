@@ -15,7 +15,7 @@ static int key_nonzero(const uint8_t *key, size_t len)
     return 0;
 }
 
-/* Same 32-byte slot fill ARP used with aes_bits=256 (HMAC-SHA256, epoch 0). */
+/* Same 32-byte slot fill used by the static ARP L2-PQC context. */
 static void fill_static_slots(const uint8_t master[AES_MAX_KEY_SIZE],
                               uint8_t slots[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE])
 {

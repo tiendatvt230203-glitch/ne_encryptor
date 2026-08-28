@@ -145,8 +145,7 @@ static int pick_profile_policy(struct forwarder *fwd, int local_idx, int flow_ok
         : NULL;
     if (!c)
         return -1;
-    if (c->action != POLICY_ACTION_BYPASS &&
-        (c->action != POLICY_ACTION_ENCRYPT_L2 || c->crypto_mode != CRYPTO_MODE_PQC))
+    if (c->action != POLICY_ACTION_BYPASS && c->action != POLICY_ACTION_ENCRYPT_L2)
         return -1;
     *profile_idx = 0;
     *cp = c;

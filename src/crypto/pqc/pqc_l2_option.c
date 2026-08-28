@@ -292,16 +292,13 @@ static struct opt_table *opt_table(int profile_slot, int worker_idx, int create)
     return t;
 }
 
-static int opt_policy_match(const struct app_config *cfg, int action, int mode,
-                            uint8_t wire_id)
+static int opt_policy_match(const struct app_config *cfg, int action, uint8_t wire_id)
 {
     if (!cfg)
         return 0;
     for (int i = 0; i < cfg->policy_count && i < MAX_CRYPTO_POLICIES; i++) {
         const struct crypto_policy *cp = &cfg->policies[i];
         if (!cp || cp->action != action)
-            continue;
-        if (cp->crypto_mode != mode)
             continue;
         if ((uint8_t)cp->id == wire_id)
             return 1;
@@ -892,7 +889,7 @@ static int l2_udp_is_fragment(const struct app_config *cfg, const uint8_t *pkt_d
         return 0;
     if (crypto_eth_l2_read_policy_id(pkt_data, pkt_len, &wire_pol) != 0)
         return 0;
-    if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L2, CRYPTO_MODE_PQC, wire_pol))
+    if (!opt_policy_match(cfg, POLICY_ACTION_ENCRYPT_L2, wire_pol))
         return 0;
     /* The authenticated kind/32-bit sequence are inside ciphertext. These
      * legacy outputs are detection-only and intentionally carry no metadata. */

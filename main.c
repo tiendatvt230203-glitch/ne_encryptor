@@ -331,10 +331,7 @@ static int policy_fields_equal(const struct crypto_policy *a,
            a->src_net == b->src_net &&
            a->src_mask == b->src_mask &&
            a->dst_net == b->dst_net &&
-           a->dst_mask == b->dst_mask &&
-           a->crypto_mode == b->crypto_mode &&
-           a->aes_bits == b->aes_bits &&
-           memcmp(a->key, b->key, AES_KEY_LEN) == 0;
+           a->dst_mask == b->dst_mask;
 }
 
 static const struct crypto_policy *policy_by_db_id(const struct app_config *cfg,
@@ -406,7 +403,6 @@ static int wan_db_equal(const struct wan_config *a, const struct wan_config *b)
 {
     return strcmp(a->ifname, b->ifname) == 0 &&
            a->dst_ip == b->dst_ip &&
-           a->window_size == b->window_size &&
            a->dataplane == b->dataplane;
 }
 
@@ -487,9 +483,6 @@ static int config_db_unchanged(const struct app_config *old,
         old->profile_count != new->profile_count ||
         old->crypto_enabled != new->crypto_enabled ||
         old->fake_ethertype_ipv4 != new->fake_ethertype_ipv4 ||
-        old->crypto_mode != new->crypto_mode ||
-        old->aes_bits != new->aes_bits ||
-        memcmp(old->crypto_key, new->crypto_key, AES_KEY_LEN) != 0 ||
         strcmp(old->bpf_file, new->bpf_file) != 0 ||
         strcmp(old->bpf_wan_file, new->bpf_wan_file) != 0)
         return 0;

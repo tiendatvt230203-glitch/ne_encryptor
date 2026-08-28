@@ -2107,8 +2107,7 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
         for (int i = 0; i < p->policy_count; i++) {
             int pol_idx = p->policy_indices[i];
             if (pol_idx >= 0 && pol_idx < cfg->policy_count) {
-                if (cfg->policies[pol_idx].action == POLICY_ACTION_ENCRYPT_L2 &&
-                    cfg->policies[pol_idx].crypto_mode == CRYPTO_MODE_PQC) {
+                if (cfg->policies[pol_idx].action == POLICY_ACTION_ENCRYPT_L2) {
                     has_pqc_policy = true;
                     break;
                 }
