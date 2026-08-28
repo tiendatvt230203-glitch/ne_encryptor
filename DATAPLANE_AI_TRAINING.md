@@ -2,9 +2,9 @@
 
 Mô tả **cách hệ thống đang chạy**: forward gói, gộp kênh WAN, mã hóa L2 PQC, chia đa core. Không gồm Postgres / schema / reload DB / vault (`src/db/*`).
 
-UDP cắt/rã ráp: **§16**, rã ráp chi tiết để tối ưu **§16.8**. Gộp kênh per-packet: **§7**, **§18**. Vì sao 2 WAN OOO còn 1 WAN ổn: **§17**. Lớp mã hóa: **§19**. AF_XDP / UMEM: **§20**. i40e + 5.15→6.8: **§20.0**. **1500 và 9000 cùng chạy**, mode **drv + `XDP_COPY`**: **§20.0a**.
+UDP cắt/rã ráp: **§16**, join mảnh **§16.8**, buffer giảm OOO sau join **§16.9**. Gộp kênh per-packet: **§7**, **§18**. Chặn chiều OUT (LAN→WAN) và IN (WAN→LAN): **§8.1–8.2**. Vì sao 2 WAN OOO còn 1 WAN ổn: **§17**. Lớp mã hóa: **§19**. AF_XDP / UMEM: **§20**. i40e + 5.15→6.8: **§20.0**. **1500 và 9000 cùng chạy**, mode **drv + `XDP_COPY`**: **§20.0a**.
 
-**Bài đo 1 LAN + 1 WAN (2026-08-27):** UDP 10 stream ~100s → **8.38 Gbit/s**, loss **0.16%**, OOO **45 / 71.3M**. Cùng L2 PQC, cùng cắt UDP ×2; chỉ khác một path. 2 WAN per-packet thì OOO lớn — chi tiết §7.7.
+**Bài đo 1 LAN + 1 WAN (2026-08-27):** UDP 10 stream ~100s → **8.38 Gbit/s**, loss **0.16%**, OOO **45 / 71.3M**. Cùng L2 PQC, cùng cắt UDP ×2; chỉ khác một path. Bài 2 WAN OOO lớn ở §7.7 đo **trước** buffer §16.9 (WRR không đổi).
 
 ---
 
@@ -19,7 +19,7 @@ Máy có N NIC LAN (phía client) và M NIC WAN (phía đường truyền). Gói
 3. **Encrypt** → mã hóa L2 PQC trên crypto core, ghi marker + worker_idx lên wire, gộp kênh per-packet ra WAN.
 4. **ARP** → bridge LAN↔WAN, mã hóa key tĩnh, **không** đi bypass, **không** vào WRR data.
 
-Chiều ngược: WAN RX đọc marker / worker_idx → đúng crypto core giải mã / ráp fragment → MAC FDB → TX LAN.
+Chiều ngược: WAN RX đọc marker / worker_idx → đúng crypto core giải mã / ráp fragment → **UDP thì buffer seq** (§16.9) → MAC FDB → TX LAN. Bonding WAN vẫn per-packet; reorder không dính WAN.
 
 Cách thiết kế hiện tại:
 
@@ -40,9 +40,13 @@ Cách thiết kế hiện tại:
 | `src/core/forwarder/forwarder.c` | Spawn thread, RX/TX/crypto loop |
 | `src/core/forwarder/wan_scheduler.c` | Pool WAN, WRR per-packet, drain/join/failover gate |
 | `src/core/forwarder/crypto_runtime.c` | Ctx mã hóa per policy, sync key PQC, frag GC |
-| `src/core/dataplane/local_egress.c` | LAN→WAN: policy, pick WAN, encrypt/bypass/ARP |
-| `src/core/dataplane/wan_ingress.c` | WAN→LAN: decrypt, reasm, FDB |
-| `src/core/dataplane/crypto_route.c` | Sticky flow → crypto worker + TX slot |
+| `src/core/dataplane/local_egress.c` | LAN→WAN: **cổng OUT** policy, pick WAN, encrypt/bypass/ARP |
+| `src/core/dataplane/wan_ingress.c` | WAN→LAN: decrypt, **cổng IN**, join UDP, reorder, FDB |
+| `src/db/config.c` | `config_select_crypto_policy` (OUT) + bảng đảo `config_policy_in_ok` (IN) |
+| `inc/core/dataplane/udp_reorder.h` | Key 4-tuple, ops emit/drop, stats |
+| `src/core/dataplane/udp_reorder.c` | Buffer seq UDP sau join (giảm OOO 2 WAN) |
+| `tests/test_udp_reorder.c` | In-order / hold / skip-gap / dup / wrap / epoch |
+| `src/core/dataplane/crypto_route.c` | Sticky flow → crypto worker + TX slot; `dp_udp_next_tx_seq` |
 | `src/core/dataplane/idle.c` | Adaptive idle + eventfd wake |
 | `src/core/dataplane/arp_bridge.c` | ARP encrypt/bridge, không bị weight=0 chặn |
 | `src/core/dataplane/packet_util.c` | `dp_parse_flow`, `dp_ring_push` |
@@ -50,14 +54,14 @@ Cách thiết kế hiện tại:
 | `src/core/flow/mac_learn.c` | FDB MAC cho WAN→LAN unicast |
 | `src/core/iface/xdp_interface.c` | UMEM, AF_XDP RX/TX, ring MPSC |
 | `bpf/lan.c` | XDP LAN: ARP+IPv4 → AF_XDP |
-| `bpf/wan.c` | XDP WAN: ARP / NE-ARP / IPv4 TCP/UDP/ICMP/OSPF → AF_XDP; CFM PASS kernel |
+| `bpf/wan.c` | XDP WAN: ARP / 0x1048 / **0x104B** / IPv4; map 0x104A+0x104B; CFM PASS |
 | `src/crypto/common/packet_crypto.c` | 3 key slot, diversify PQC |
-| `src/crypto/common/crypto_option_router.c` | Dispatch encrypt/decrypt/split |
-| `src/crypto/common/eth_parse.c` | Marker, policy_id, worker_idx, MSS clamp |
-| `src/crypto/pqc/pqc_l2_option.c` | L2 PQC encrypt/decrypt/frag, ghi worker_idx |
-| `src/crypto/pqc/pqc_handshake.c` | Handshake + rotate key 30 ngày |
+| `src/crypto/common/crypto_option_router.c` | Dispatch encrypt/decrypt/split; TLS UDP epoch/seq/datagram_id |
+| `src/crypto/common/eth_parse.c` | Marker 0x104A/0x104B, policy_id, worker_idx, MSS clamp |
+| `src/crypto/pqc/pqc_l2_option.c` | L2 PQC; UDP 0x104B + shim; join `opt_table` |
+| `src/crypto/pqc/pqc_handshake.c` | Handshake + rotate key 1 tháng |
 | `src/crypto/options/bypass.c` | No-op crypto ops |
-| `inc/crypto/eth_parse.h` | Wire layout 0x104A / 0x1048 |
+| `inc/crypto/eth_parse.h` | `NE_L2_FAKE_ETHERTYPE` 0x104A, `_UDP` 0x104B, ARP 0x1048 |
 | `inc/core/dataplane/dp_idle.h` | Wake ID encoding |
 
 Tài liệu này không gồm `src/db/*`, Postgres, vault. `config_reload` chỉ xuất hiện khi gọi `fwd_wan_*` / `fwd_crypto_*`.
@@ -364,11 +368,11 @@ for wi in wans:
 
 Thứ tự emit lên 2 NIC ≠ thứ tự datagram trong flow. WAN0 và WAN1 khác delay/jitter → phía nhận: gói k+1 (WAN1) tới trước gói k (WAN0) → iperf Out-of-order. Loss thấp vì cả hai vẫn tới.
 
-UDP split: 2 mảnh **cùng** WAN (đúng). Datagram kế WRR sang WAN kia. Hold-gap reasm (A chờ frag1 trên WAN0, B đã xong trên WAN1) nhân OOO. §16.
+UDP split: 2 mảnh **cùng** WAN (đúng). Datagram kế WRR sang WAN kia. Join-pending rồi **reorder 2ms** (§16.9). WRR không đổi.
 
-**Nhân ×2 (lý do per-packet 2 WAN nổ, 1 WAN vẫn ổn):** iperf UDP `-l 1470` luôn `need_split` → **mỗi datagram gốc = 2 frame wire + 2 AES-GCM encrypt + 2 AES-GCM decrypt + 1 lần join bảng**. WRR chỉ chạy **một lần / datagram gốc**, nhưng trên wire và trên crypto core lưu lượng đã ×2. 1 WAN: hai mảnh đi **cùng** `mid_to_wan[0][slot]`, TX tuần tự frag0→frag1→datagram kế → OOO ~0 (bài D §7.7). 2 WAN: datagram N (2 frame) WAN0, N+1 (2 frame) WAN1 → 4 frame, 2 queue, 2 delay, hold-gap → OOO cực lớn. Chi tiết nhân và từng bước: **§18**.
+**Nhân ×2 (lý do per-packet 2 WAN nặng, 1 WAN vẫn ổn):** iperf UDP `-l 1470` luôn `need_split` → **mỗi datagram gốc = 2 frame wire + 2 AES-GCM encrypt + 2 AES-GCM decrypt + 1 lần join bảng**. WRR một lần / datagram gốc; trên dây ×2. 1 WAN: TX tuần tự → OOO ~0 (bài D). 2 WAN: N và N+1 khác NIC → join xong lệch seq; buffer giữ future seq. Chi tiết: **§16.9**, **§18**.
 
-Không stamp sequence bonding lên wire. Phía nhận **không** reorder buffer. Iperf đếm OOO trên payload UDP gốc.
+UDP 0x104B mang `epoch+seq+datagram_id` trong GCM. Phía nhận reorder per 5-tuple trên crypto worker. Iperf OOO đo payload sau LAN TX.
 
 ### 7.6 Per-packet OFF = path cũ (window/sticky)
 
@@ -386,7 +390,7 @@ User: **tắt per-packet thì reorder cải thiện mạnh** — đúng, không 
 | nhiều stream | ~1.19–1.20 Gb/s | 0.078–0.11% | 1.5M–1.9M / ~10.2M (~15–19%) |
 | stream nặng hơn | ~1.19 Gb/s | 0.31–0.35% | 5.5M–5.7M / ~10.2M (**~54%**) |
 
-Loss **ổn** (sub-percent). OOO **không chấp nhận**. Càng đầy tải / nhiều stream, tỉ lệ OOO càng lớn (stripe 2 path + reasm hold-gap + nhân ×2 split/crypto).
+Loss **ổn** (sub-percent). OOO **không chấp nhận** trên bài đo **trước** §16.9 (stripe 2 path + join-pending + ×2 split). Sau reorder: cùng WRR, hold 2ms / skip-gap — số OOO 2 WAN cần đo lại; bài D (1 WAN) gần passthrough.
 
 **B — 1 LAN + 1 WAN bão hòa / test cũ:** từng ghi “loss nhiều” khi dồn hết UDP (kể cả 2 wire/datagram sau split) vào một `mid_to_wan` và `fwd_wan_has_tx_room` drop. Đó là case **overrun một NIC**, không phải định nghĩa “1 WAN luôn kém”. Baseline vàng hiện tại là **D**.
 
@@ -445,6 +449,177 @@ Dataplane **hardcode** `CRYPTO_OPT_L2_PQC`. Policy L3/L4 trong config/HS không 
 
 `fwd_wan_has_tx_room`: `ne_ring_count(mid_to_wan[dp][tx_slot]) + BATCH < cap`. Hết chỗ → drop (không xếp hàng vô hạn).
 
+Không khớp policy / parse 5-tuple fail / LAN không thuộc profile → **drop** (`ne_dp_stats_local_drop`). Không “PASS kernel”, không forward ngầm. Chi tiết khớp và chiều ngược: **§8.1–8.2**.
+
+---
+
+### 8.1 Chặn chiều OUT — LAN → WAN
+
+Policy viết theo **chiều máy khách trên LAN**: `src` = IP/port phía LAN, `dst` = IP/port phía đường/WAN. Không conntrack, không cột “IN/OUT” riêng trong DB — một `crypto_policy` dùng cho OUT đúng chiều; IN thì **đảo** (§8.2).
+
+File: `local_egress.c` `pick_profile_policy` + `config_select_crypto_policy` (`src/db/config.c`). Live một profile (`profiles[0]`).
+
+#### Ai bị xét, ai không
+
+| Gói LAN RX | Việc |
+|------------|------|
+| ARP | Không match 5-tuple. `arp_bridge_from_local`. Policy bypass **không** áp cho ARP. |
+| IPv4 parse được (`dp_parse_flow`) | Match policy. Fail → drop. |
+| Không IPv4 / parse fail (`flow_ok=0`) | `c = NULL` → drop. Không encrypt, không bypass. |
+| `local_idx` không nằm `profile.local_indices[]` | drop |
+| Profile `enabled=0` | drop |
+
+`dp_parse_flow`: chỉ IPv4. TCP/UDP lấy port; ICMP/OSPF port = 0.
+
+XDP `lan.c` chỉ đưa ARP + IPv4 vào AF_XDP. Frame khác không vào userspace.
+
+#### Thuật toán match OUT
+
+`config_select_crypto_policy(cfg, 0, src_ip, dst_ip, src_port, dst_port, proto)`:
+
+Duyệt `profile.policy_indices[]`. Rule khớp `crypto_policy_match_packet` thì giữ **một** winner:
+
+- `priority` **nhỏ hơn** thắng (số thấp = ưu tiên cao).
+- Cùng priority → `id` (wire policy_id) nhỏ hơn thắng.
+
+Không first-match. Không action DENY — không khớp **bất kỳ** rule → `NULL` → drop.
+
+`crypto_policy_match_packet` từng field (AND):
+
+1. **Proto**
+   - `POLICY_PROTO_ANY` (0) → mọi proto parse được.
+   - `POLICY_PROTO_TCP_UDP` (254) → chỉ 6 hoặc 17.
+   - Khác → `ip->protocol` phải đúng (1 ICMP, 89 OSPF, …).
+2. **IP src / dst** — `cidr_match_with_negate`:
+   - `src_any` / `dst_any` → field đó luôn đúng.
+   - Không any: `(ip & mask) == (net & mask)`. `*_negate` → đảo kết quả (CIDR “trừ”).
+3. **Port** (mặc định bật; `CRYPTO_POLICY_MATCH_IP_ONLY=0`)
+   - `src_port_from/to < 0` hoặc `dst_* < 0` → field đó any.
+   - Không thì port nằm `[from, to]`.
+   - ICMP/OSPF: port 0. Rule port cụ thể (vd 53) **không** khớp ICMP.
+
+`action` **không** tham gia match. Match xong mới rẽ:
+
+```
+cp == NULL                         → drop (chặn OUT)
+cp->action == BYPASS               → push_to_wan, không AES
+cp encrypt + crypto_enabled        → encrypt L2 PQC (live luôn L2)
+cp encrypt + !crypto_enabled       → drop
+!fwd_crypto_policy_ready(cp)       → drop (HS/key chưa sẵn)
+```
+
+#### `needs_mid` vs chỗ drop
+
+`dataplane_local_needs_mid` (CPU 0, trước đẩy crypto):
+
+- ARP → 1 (crypto worker).
+- `!crypto_enabled` → 0 (ở lại CPU 0).
+- `pick_profile_policy` fail → **0** — rồi `dataplane_process_local` trên CPU 0 **cũng** fail pick → drop. Gói không khớp **không** vào core 3–8.
+- Bypass → 0 — xử lý CPU 0.
+- Encrypt → 1 — `local_to_mid[W]`; crypto worker gọi `dataplane_process_local` **lần nữa** (pick lại cùng 5-tuple).
+
+Drop OUT: `ne_dp_stats_local_drop`, `ne_frame_free`. Phía client = Lost (không ra WAN).
+
+#### Ví dụ OUT
+
+Rule: src `10.0.0.0/24`, dst `8.8.8.8/32`, UDP, dport 53, encrypt.
+
+- `10.0.0.5:50000 → 8.8.8.8:53` UDP → encrypt, ra WAN.
+- `10.0.0.5:50000 → 1.1.1.1:53` UDP → **drop** (dst không khớp).
+- `10.0.0.5 → 8.8.8.8` ICMP → **drop** (proto).
+- Hai rule, priority 10 bypass `10.0.0.0/8` any và priority 5 encrypt UDP/53: UDP/53 lấy encrypt (5 < 10).
+
+---
+
+### 8.2 Chặn chiều IN — WAN → LAN
+
+Chiều này **không** chạy `config_select_crypto_policy` đúng chiều gói. Sau decrypt, 5-tuple vẫn như lúc LAN TX: return `8.8.8.8:53 → 10.0.0.5:50000` trong khi policy OUT viết `src=10/24 dst=8.8.8.8 dport=53`. Khớp IN = **đảo src↔dst, sport↔dport** lúc dựng bảng.
+
+Hai nhánh: **đã mã hóa** vs **bypass plaintext**. ARP IN: `arp_bridge_from_wan`, không 5-tuple policy.
+
+Stats: không khớp IN encrypted → `wan_policy_drop` + `wan_drop`. Nhánh khác (sai marker, bypass không khớp, FDB miss) → `wan_drop` thường.
+
+#### A. Gói mã hóa (0x104A / 0x104B / marker)
+
+Thứ tự trong `dataplane_process_wan`:
+
+1. `decrypt_wan` — `policy_id` trên wire phải có ctx; `fwd_policy_by_wire_id` **bỏ** `action==BYPASS`. Decrypt fail → drop. UDP mảnh pending → free, chưa xét IN.
+2. `wan_profile_pi` đọc `policy_id` (snapshot header trước decrypt) → profile 0 nếu wire_id thuộc profile. Không map → drop (**không** đếm `wan_policy_drop`).
+3. **Cổng 5-tuple IN** — chỉ khi `profile.policy_in_any == 0`:
+   - Parse 5-tuple **plaintext sau decrypt**.
+   - `wan_policy_in_ok` → `config_policy_in_ok`.
+   - Fail → `policy_drop`.
+4. `policy_in_any == 1` → **bỏ qua** bước 3.
+5. UDP tagged → reorder §16.9; khác → FDB `forward_wan_to_local`.
+
+Decrypt **xong rồi mới** cổng IN: AES đã chạy; gói lệch policy tốn CPU rồi mới drop.
+
+`policy_in_any` (`config_refresh_policy_in_any` lúc load/reload):
+
+- Có **một** rule catch-all: `src_any && dst_any && proto ANY && port src/dst any` → `policy_in_any=1`, log `[CRYPTO-GUARD] WAN IN 5-tuple gate OFF (catch-all any/any)`.
+- Không catch-all → `ON`, dựng bảng compact `s_pol_in[0][]`.
+
+Bảng `pol_in_fill` — **đảo lúc compile**, field trên entry theo **gói sau decrypt**:
+
+| Entry IN (`pol_in_match`) | Lấy từ policy OUT |
+|---------------------------|-------------------|
+| packet **src** IP | policy **dst** (mask/net; `dst_any` → mask 0; `dst_negate` → `POL_IN_SRC_NEG`) |
+| packet **dst** IP | policy **src** (`src_negate` → `POL_IN_DST_NEG`) |
+| packet **sport** | policy **dst port** range |
+| packet **dport** | policy **src port** range |
+| proto | giữ nguyên |
+
+`config_policy_in_ok`: duyệt **mọi** entry (mọi policy của profile, encrypt **và** bypass). Proto → IP (+negate) → port. **Một** rule đảo khớp → cho qua. Không khớp rule nào → chặn.
+
+Không chọn lại winner theo priority. Không đòi inner 5-tuple thuộc **đúng** `policy_id` trên wire — cổng là allowlist đảo, OR. Wire_id chỉ chọn key decrypt / profile.
+
+Ví dụ cùng rule OUT `10.0.0.0/24 → 8.8.8.8:53` UDP:
+
+- Inner `8.8.8.8:53 → 10.0.0.5:50000` UDP → IN **ok** (return).
+- Inner `8.8.8.8:53 → 10.0.0.5:50000` TCP → **chặn** (proto).
+- Inner `1.1.1.1:53 → 10.0.0.5:50000` UDP → **chặn** (src không phải dst-policy).
+- Inner `10.0.0.5:50000 → 8.8.8.8:53` (cùng chiều OUT trên WAN) → **chặn** trừ khi có rule khác phủ (cổng IN không khớp chiều OUT).
+
+Không stateful: không nhớ “đã thấy SYN OUT”. Hai chiều độc lập. Ai decrypt được (đúng key + wire_id) rồi 5-tuple giống return của **một** rule đều qua cổng.
+
+#### B. Gói bypass plaintext (IPv4, không marker L2)
+
+`wan_l2_plain_ipv4` bắt buộc. Không IPv4 → drop.
+
+`wan_profile_pi_bypass`:
+
+```
+cp = config_select_crypto_policy(cfg, 0,
+        dst_ip, src_ip,      // đảo IP
+        dst_port, src_port,  // đảo port
+        proto)
+nếu !cp || cp->action != BYPASS → -1 → drop
+```
+
+Đảo **tham số** rồi dùng **cùng** hàm OUT (priority + id). Khác cổng encrypted:
+
+- Phải thắng select **và** `action == BYPASS`. Rule encrypt không mở cửa IPv4 trần trên WAN.
+- Không dùng bảng `s_pol_in`. Fail → `wan_drop` (không `wan_policy_drop`).
+- Không decrypt. Không reorder §16.9.
+
+Cùng ví dụ: plaintext `8.8.8.8:53 → 10.0.0.5:50000` chỉ qua nếu có **bypass** rule OUT `10/24 → 8.8.8.8:53`. Chỉ có rule encrypt → plaintext IN **drop** (return phải là 0x104A/0x104B).
+
+#### C. Sau khi cổng IN mở
+
+`forward_wan_to_local`: chỉ unicast (`dmac` bit 0 = 0). Broadcast/multicast data → drop. FDB `mac_lookup`; miss thì `mac_fwd_local_for_wan_dp`. LAN đích phải thuộc profile. Miss → drop, không flood data.
+
+#### Tóm tắt hai chiều
+
+| | OUT LAN→WAN | IN encrypted | IN bypass |
+|--|-------------|--------------|-----------|
+| Hàm | `config_select_crypto_policy` đúng 5-tuple | decrypt → `config_policy_in_ok` bảng đảo | `select` **đảo** 5-tuple, bắt `BYPASS` |
+| Không khớp | `local_drop` | `wan_policy_drop` | `wan_drop` |
+| Nhiều rule | một winner: priority rồi id | OR mọi rule đảo; catch-all → tắt cổng | một winner, phải bypass |
+| Catch-all any/any | khớp mọi 5-tuple OUT | `policy_in_any=1` bỏ so 5-tuple | như OUT (bypass thắng thì plaintext qua) |
+| ARP | bridge, không policy | bridge | không |
+
+`[CRYPTO-GUARD] ... WAN IN 5-tuple gate ON/OFF` lúc refresh policy: OFF = có any/any, IN encrypted không lọc 5-tuple (vẫn cần decrypt đúng key).
+
 ---
 
 ## 9. Mã hóa L2 PQC
@@ -470,7 +645,7 @@ Overhead ~30B → TCP MSS clamp trước encrypt.
 
 `packet_crypto_ctx`: 3 slot PREV/CURRENT/NEXT. Data policy `pqc_from_handshake=true`. ARP key tĩnh, không HS-refresh.
 
-Handshake (`pqc_handshake.c`): `KEY_ROTATION_INTERVAL_MS = 30 ngày`. Timeout rotate 15s rồi give up. L3 interval riêng `L3_KEY_ROTATION_INTERVAL_MS` (~50 phút) — dataplane live là L2.
+Handshake (`pqc_handshake.c`): **trao key** chỉ khi DB có `pqc_exchange_tunnels` → UDP `:7090` trên IP tunnel, `KEY_ROTATION_INTERVAL_MS` = **1 tháng**. Không tunnel thì **không** handshake. Đang chạy key A; hết 1 tháng mới thử HS. Có key B mới promote: A → PREV, B → CURRENT. **Mã hóa gói dataplane vẫn L2 PQC** (0x104A/0x104B) — HS chỉ giao key, không mã hóa payload IPv4.
 
 Hot path: worker giữ snapshot ctx; `packet_crypto_update_keys` diversify qua `sig_pqc_diversify_key(profile_id, policy_id)`. Tránh `g_key_mutex` mỗi gói (crypto_runtime copy-on-generation).
 
@@ -478,21 +653,23 @@ Không key / HS chưa ready → drop (không encrypt bằng key rác).
 
 ### 9.3 Fragment UDP
 
-TCP không cắt (MSS clamp). UDP sát MTU thì cắt 2 frame rồi ráp ở máy nhận. Offset, hàm, return code, hold-gap: **§16**.
+TCP không cắt (MSS clamp). UDP sát MTU thì cắt 2 frame, ráp, rồi buffer seq: **§16** / **§16.9**.
 
 ### 9.4 WAN → LAN decrypt — `dataplane_process_wan`
 
 ```
 ARP marker / ARP → arp_bridge_from_wan
 encrypted?
-  wan_try_l2_pqc_frag  (pending 1=đợi, 2=held UMEM)
-  decrypt_l2 (CRYPTO_OPT_L2_PQC)
-  bind TX: dp_flow_pick_tx_slot(pkt, worker_hint)
-plain bypass IPv4 → policy match chiều ngược
+  wan_try_l2_pqc_udp  (pending 1=đợi mảnh; fail tagged = drop)
+  decrypt_l2 (TCP/ICMP 0x104A)
+  !policy_in_any? wan_policy_in_ok  (§8.2) else skip
+  UDP take_rx_meta → dp_udp_reorder_submit  (§16.9)
+  else bind TX: dp_flow_pick_tx_slot
+plain bypass IPv4 → wan_profile_pi_bypass (5-tuple đảo, bắt BYPASS)  (§8.2)
 mac_lookup → mid_to_local[li][tx_slot]
 ```
 
-Decrypt xong mới pick TX slot (5-tuple plaintext). Worker hint = core đang chạy (đã khớp wire).
+Decrypt xong mới pick TX slot (5-tuple plaintext), trừ UDP đi qua emit của reorder (cũng bind slot lúc emit). Cổng 5-tuple IN sau decrypt: **§8.2**.
 
 ---
 
@@ -505,9 +682,11 @@ Policy `POLICY_ACTION_BYPASS`:
 - Vẫn `fwd_wan_pick_for_local` (gộp kênh per-packet).
 - TX slot = `dp_pick_tx_slot` (hash), không crypto route table.
 
-`crypto_enabled=0`: tương tự, mọi IPv4 non-ARP đi RX→TX.
+`crypto_enabled=0`: `needs_mid` = 0 với IPv4 non-ARP; `process_local` vẫn pick policy — chỉ **bypass khớp** mới `push_to_wan`, rule encrypt → drop. Không phải “mọi IPv4 đi RX→TX”.
 
 ARP **không** bypass dù policy bypass.
+
+Chiều WAN plaintext bypass: 5-tuple **đảo** + bắt `action==BYPASS` — **§8.2 B**.
 
 ---
 
@@ -515,7 +694,7 @@ ARP **không** bypass dù policy bypass.
 
 `bpf/lan.c`: ARP hoặc IPv4 → `xsks_map[rx_queue_index]`. Frame > 1514 (hoặc VLAN 1518) **DROP** — trần cứng PATH_MTU 1500, chặn jumbo trước AF_XDP. Khác PASS kernel.
 
-`bpf/wan.c`: CFM `0x8902` **PASS** (AF_PACKET failover). ARP, `0x1048`, IPv4 ICMP/TCP/UDP/OSPF → XSK. EtherType fake data `0x104A` qua `wan_config_map`. WAN **không** drop theo độ dài.
+`bpf/wan.c`: CFM `0x8902` **PASS**. ARP, `0x1048`, **`0x104B` (UDP L2 PQC)**, IPv4 ICMP/TCP/UDP/OSPF → XSK. `wan_config_map[0]=0x104A` (TCP/ICMP…), `[1]=0x104B`. WAN **không** drop theo độ dài.
 
 Attach: `bpf_xdp_attach(..., XDP_FLAGS_DRV_MODE)` (`profile_xdp.c`). Load: `SEC("xdp")`, **không** `xdp.frags` / `BPF_F_XDP_HAS_FRAGS`.
 
@@ -566,11 +745,15 @@ Sau khi per-packet: 1 connect phải thấy **cả 2 WAN TX**. Crypto vẫn 1 co
 | `CRYPTO_OPT_FRAG_MTU_DEFAULT` | 1500 | |
 | `OPT_FRAG_TABLE_SIZE` | 4096 | |
 | `OPT_FRAG_TIMEOUT_NS` | 200ms | |
-| `KEY_ROTATION_INTERVAL_MS` | 30 ngày | L2 HS |
+| `KEY_ROTATION_INTERVAL_MS` | 1 tháng | HS UDP 7090 trên VPN tunnel |
 | `PACKET_CRYPTO_NONCE_BYTES` | 12 | |
-| `NE_L2_FAKE_ETHERTYPE` | 0x104A | data |
+| `NE_L2_FAKE_ETHERTYPE` | 0x104A | TCP/ICMP/OSPF L2 PQC |
+| `NE_L2_FAKE_ETHERTYPE_UDP` | 0x104B | mọi UDP L2 PQC (cắt và không cắt) |
 | `NE_L2_FAKE_ETHERTYPE_ARP` | 0x1048 | ARP enc |
-| `WAN_L2_FRAG_MAGIC` | 0x5B | UDP frag only |
+| UDP marker | `5B 55 44 01` | `0x5B 'U' 'D' v1` — plaintext sau nonce |
+| `OPT_FRAG_META_LEN` | 47 | overhead UDP wire (marker 4 + shim 13 + tag 16 + …) |
+| `UDP_REORDER_WINDOW` | 256 | seq slot / flow |
+| `UDP_REORDER_HOLD` | 2 ms default | `NE_UDP_REORDER_US` 100–20000 |
 | `NE_DP_IDLE_HOT_NS` | 5µs | |
 | `NE_DP_IDLE_COLD_NS` | 25µs | |
 
@@ -603,7 +786,12 @@ Bài iperf UDP ~100s:
 - **1 LAN+1 WAN (không gộp kênh):** 8.38 Gbit/s, loss 0.16%, OOO 45/71.3M — split+crypto ×2 vẫn chạy, **cực ổn**. §7.7 D.
 - **2 WAN per-packet:** loss 0.02–0.35% (ổn), OOO cực cao (15–54% @ 1.2G). Loss thấp + OOO cao = gói tới đủ, sai thứ tự.
 
-Hai nguồn OOO khi bonding: (1) WRR per-packet 2 WAN lệch delay §7, (2) hold-gap rã ráp UDP **nhân** vì mỗi datagram đã là 2 mảnh. Luồng từng bước: §18.
+Hai tầng trên máy nhận, **không** dính sticky WAN:
+
+1. **Join mảnh** (`opt_table`, 200ms) — ráp frag0+frag1 **một** datagram. Hold-gap nội bộ: mảnh lẻ chưa TX LAN.
+2. **Reorder datagram** (`udp_reorder.c`, hold 2ms default) — sau join (và UDP FULL không cắt), sắp lại theo `epoch+seq` per 5-tuple. Đây là chỗ giảm OOO 2 WAN.
+
+WRR per-packet vẫn rải datagram liên tiếp sang 2 NIC. Reorder ngồi **sau** decrypt/join, trên **cùng** crypto worker sticky của flow. Luồng từng bước: §18.
 
 ---
 
@@ -624,10 +812,13 @@ Live encrypt luôn `CRYPTO_OPT_L2_PQC`. `crypto_proto_classify(ip_proto)`:
 ```
 opt_id = CRYPTO_OPT_L2_PQC
 pclass = crypto_proto_classify(proto)
+if UDP:
+    dp_udp_next_tx_seq(pkt) → crypto_option_udp_set_tx_seq(seq)
+    // TLS: epoch process-wide, datagram_id worker-local clock
 if crypto_option_need_split(opt_id, pclass, job.len):   // chỉ UDP ops trả 1
     split_tail_take → crypto_option_split → push_split_to_wan
     return 1   // đã TX 2 frame, caller không push_to_wan nữa
-crypto_option_encrypt(...)  // UDP vừa MTU, hoặc TCP/ICMP/OSPF
+crypto_option_encrypt(...)  // UDP vừa MTU (vẫn 0x104B+shim FULL), hoặc TCP/ICMP/OSPF
 return 0                    // caller push_to_wan 1 frame
 ```
 
@@ -641,47 +832,53 @@ Worker TLS: `crypto_option_bind_worker_idx(w)` lúc `crypto_worker_thread` start
 
 ### 16.1 Wire layout (không VLAN; et_off = 12, eth header 14B)
 
-Offset từ đầu frame. `et_off = crypto_eth_l2_prefix_len` = 12 (thường) hoặc 16 (VLAN). Dưới đây **không VLAN**.
+Offset từ đầu frame. `et_off = crypto_eth_l2_prefix_len` = 12 (thường) hoặc 16 (VLAN). Dưới đây **không VLAN**. `crypto_eth_l2_has_marker` nhận **cả** `0x104A` và `0x104B`.
 
-**A. Gói nguyên (TCP / UDP vừa / ICMP) — `l2_do_encrypt`**
+**A. TCP / ICMP / OSPF — `l2_do_encrypt` (không UDP)**
 
 ```
  0..5    dst MAC
  6..11   src MAC
-12..13   EtherType = 0x104A     (thay 0x0800)
+12..13   EtherType = 0x104A
 14       policy_id  = ctx->wire_id
 15       worker_idx = crypto_option_worker_idx()
 16..27   nonce 12B
-28..     ciphertext(IPv4 cả header+payload) || GCM tag 16B
+28..     ciphertext(IPv4) || GCM tag 16B
 ```
 
-`enc_start = 14+1+1+12 = 28`. Overhead 30B = 1+1+12+16 (`crypto_option_wire_overhead`).
+`enc_start = 14+1+1+12 = 28`. Overhead 30B (`crypto_option_wire_overhead`). Không marker `5B 55 44 01`, không shim. Decrypt `l2_do_decrypt` → 0x0800.
 
-Plaintext IPv4 (từ offset 14 gốc) được `memmove` tới 28 rồi AES-GCM. Decrypt `l2_do_decrypt`: đọc nonce, decrypt tại enc_start, `l2_restore_plain_packet` ghi lại 0x0800, trượt IPv4 về offset 14.
+**B. Mọi UDP L2 PQC — EtherType `0x104B` + marker plaintext + shim trong GCM**
 
-**B. Mảnh UDP — `l2_encrypt_fragment0_inplace` / `_single`**
+Cả UDP vừa MTU (`L2_UDP_KIND_FULL`) lẫn hai mảnh (`FRAG0`/`FRAG1`) dùng **cùng** khung. File: `pqc_l2_option.c`. Marker 4B **ngoài** GCM (nhận diện không cần decrypt). Shim 13B **trong** GCM (không giả mạo kind/seq).
 
 ```
- 0..5    dst MAC (copy gói gốc)
+ 0..5    dst MAC
  6..11   src MAC
-12..13   0x104A
+12..13   EtherType = 0x104B     (NE_L2_FAKE_ETHERTYPE_UDP)
 14       policy_id
-15       worker_idx          ← CÙNG worker với mảnh kia
-16..27   nonce 12B           ← KHÁC nhau từng mảnh (GCM riêng)
-28       magic = 0x5B
-29..30   pkt_id big-endian   ← CÙNG id hai mảnh
-31       frag_index          0 = nửa đầu, 1 = nửa đuôi
-32       reserved = 0
-33..     ciphertext(plain mảnh) || GCM tag 16B
+15       worker_idx             ← CÙNG worker hai mảnh
+16..27   nonce 12B              ← khác nhau từng frame (GCM riêng)
+28..31   marker plaintext       {0x5B, 'U', 'D', 0x01}
+32..     ciphertext:
+           shim 13B:
+             [0]  version<<4 | kind     kind: 0=FRAG0, 1=FRAG1, 2=FULL
+             [1..4]  epoch u32 BE       process-wide, random lúc first use
+             [5..8]  seq u32 BE         per-flow dataplane (bond seq)
+             [9..12] datagram_id u32 BE worker-local clock / datagram
+           || payload (IPv4 FULL/FRAG0, hoặc app-tail FRAG1)
+         || GCM tag 16B
 ```
 
-`enc_off = 14+1+1+12+1+4 = 33`. `OPT_FRAG_META_LEN = 35` ≈ 1+1+12+1+4+16 (magic+tag+GCM; dùng trong `need_split` so với MTU).
+`enc_start = magic_off + 4 = 32`. `OPT_FRAG_META_LEN = 47` = policy+core+nonce (14 thay ethertype area) + marker 4 + shim 13 + tag 16, dùng trong `need_split` vs MTU.
 
-`l2_frag_magic_off` = `l2_enc_start_off` = offset 28 = chỗ 0x5B (cùng chỗ ciphertext bắt đầu ở gói **không** cắt). Vì vậy TCP/UDP vừa: byte 28 là CT; trùng 0x5B là false positive — RX restore scratch rồi `decrypt_l2`, **không drop**.
+Hai mảnh cùng datagram: cùng `epoch`, cùng `seq`, cùng `datagram_id`, khác `kind` và nonce. UDP không cắt: `kind=FULL`, vẫn 0x104B + marker + shim — **không** còn layout A cho UDP.
 
-`opt_write_frag_tag(buf, pkt_id, frag_index)`: `buf[0]=id>>8, buf[1]=id&0xFF, buf[2]=frag_index, buf[3]=0`. Tag nằm ngay sau magic (offset 29).
+Nhận diện RX: `wan_l2_is_udp_tagged` = `crypto_eth_l2_has_marker` **và** `memcmp` 4B marker. Không còn false-positive 1 byte `0x5B` trong CT gói TCP. Tagged UDP mà decrypt/reasm fail → `wan_try_l2_pqc_udp` return **-1 drop** (không restore-scratch rồi `decrypt_l2`).
 
-**C. ARP** ethertype 0x1048, payload ARP 28B, không 0x5B, không split. Path `arp_bridge`, không `encrypt_to_wan`.
+**C. ARP** ethertype 0x1048, không marker UDP, không split. Path `arp_bridge`.
+
+BPF WAN (`bpf/wan.c`): hardcode redirect `0x104B`; `wan_config_map[0]=0x104A`, `[1]=0x104B` (`profile_xdp.c` `update_wan_fake_ethertype`).
 
 ---
 
@@ -689,14 +886,14 @@ Plaintext IPv4 (từ offset 14 gốc) được `memmove` tới 28 rồi AES-GCM.
 
 ```
 l2_udp_need_split(pkt_len):
-    return (pkt_len + 35) > crypto_option_get_mtu();  // default 1500
+    return (pkt_len + 47) > crypto_option_get_mtu();  // default 1500
 ```
 
 `pkt_len` = độ dài **Ethernet plaintext LAN** (UMEM), không phải `-l` iperf.
 
-Iperf `-u -l 1470`: `14+20+8+1470 = 1512`. `1512+35 = 1547 > 1500` → **mọi datagram lớn đều 2 wire frames**.
+Iperf `-u -l 1470`: `14+20+8+1470 = 1512`. `1512+47 = 1559 > 1500` → **mọi datagram lớn đều 2 wire frames**.
 
-UDP nhỏ (`pkt_len+35 ≤ 1500`): `need_split=0` → `l2_udp_encrypt` = `l2_do_encrypt` (layout A, không 0x5B, không table reasm).
+UDP nhỏ (`pkt_len+47 ≤ 1500`): `need_split=0` → `l2_udp_encrypt` = `l2_do_encrypt_udp` (layout B, `kind=FULL`). Vẫn có seq trên dây; máy nhận vẫn `crypto_option_udp_set_rx_meta` → vào reorder. **Không** vào `opt_table`.
 
 ---
 
@@ -708,29 +905,29 @@ Ký hiệu (không VLAN): `l3_off=14`, `ip_hdr_len` = IHL*4 (thường 20), UDP 
 
 ```
 frag_mtu       = crypto_option_get_mtu()          // 1500
-frag_overhead  = l3_off + 35                      // 14+35=49
-max_plain0     = frag_mtu - frag_overhead         // 1451
+frag_overhead  = l3_off + 47                      // 14+47=61
+max_plain0     = frag_mtu - frag_overhead         // 1439
 fixed_plain0   = ip_hdr_len + 8                   // 28
-half1          = max_plain0 - fixed_plain0        // 1423 byte app trên frag0
+half1          = max_plain0 - fixed_plain0        // 1411 byte app trên frag0
 nếu half1 >= app_len: half1 = app_len - 1         // luôn ≥1 byte cho frag1
 half2          = app_len - half1
-pkt_id         = crypto_option_next_pkt_id()      // u16, atomic GLOBAL mọi worker
+crypto_option_udp_tx_meta → epoch, seq, datagram_id
 frag0_plain    = IP || UDP-hdr || app[0..half1)
 frag1_plain    = app[half1..end)                  // KHÔNG IP, KHÔNG UDP
 ```
 
-Thứ tự encrypt trong `l2_split` (quan trọng: **frag1 trước**, rồi đè frag0 in-place lên buffer gốc):
+`seq` = `dp_udp_next_tx_seq` trên `g_route_table[].udp_tx_seq[direction]` (atomic per 5-tuple chuẩn hoá, 2 chiều độc lập). `datagram_id` = TLS `g_udp_tx_datagram_clock++` trên worker encrypt (khác seq: id ráp mảnh, seq sắp datagram). `epoch` = atomic process-wide, random lần đầu (`crypto_option_udp_epoch`).
 
-1. `l2_encrypt_fragment_single(..., frag1_plain, half2, pkt_id, frag_index=1, out=tail_buf)`
-2. `l2_encrypt_fragment0_inplace(..., frag0_plain_len, pkt_id, frag_index=0, in-place pkt_data)`
+Thứ tự encrypt trong `l2_split` (**frag1 trước**, rồi đè frag0 in-place):
 
-Hai nonce độc lập. Cùng `wire_id`, cùng `worker_idx`, cùng `pkt_id`.
+1. `l2_encrypt_fragment_single(..., kind=FRAG1, epoch, seq, datagram_id, out=tail_buf)`
+2. `l2_encrypt_fragment0_inplace(..., kind=FRAG0, cùng epoch/seq/datagram_id, in-place)`
 
-Frag1 **không** tự thành IPv4. Phía nhận: frag0 cho IP+UDP+half1, frag1 chỉ half2; `opt_emit_join` ghép.
+Hai nonce độc lập. Cùng `wire_id`, `worker_idx`, `epoch`, `seq`, `datagram_id`.
 
-`pkt_id` wrap 65536. ~100k datagram split/s @ 1.2G → wrap ~0.65s. Table 4096+probe 8 phải chịu wrap (§16.7 bảng).
+Frag1 **không** tự thành IPv4. Join lấy L3 từ frag0. `opt_table` keyed `(epoch, datagram_id)` + khớp `bond_seq`; hash `datagram_id ^ (epoch * 0x9e3779b9) % 4096`, probe 8.
 
-Ví dụ 1512B plaintext, half1=1423, app=1470 → half2=47B. Frag0 plaintext 20+8+1423=1451B; frag1 plaintext 47B.
+Ví dụ 1512B plaintext, half1=1411, app=1470 → half2=59B. Frag0 inner 20+8+1411=1439B.
 
 ---
 
@@ -772,40 +969,37 @@ Hai mảnh **không** pick WAN lần 2: lệch path thì không join được (t
 
 ---
 
-### 16.5 RX — nhận diện, decrypt mảnh, bảng, join, mã trả về
+### 16.5 RX — nhận diện, decrypt, join, rồi reorder
 
-Chi tiết từng hàm / từng byte / chi phí copy để tối ưu ráp: **§16.8**. Tóm tắt dưới đây.
+Chi tiết join: **§16.8**. Reorder sau join: **§16.9**.
 
-**Nhận diện mảnh** `wan_l2_is_udp_frag` / `l2_udp_is_fragment` (trước decrypt):
+**Nhận diện UDP tagged** `wan_l2_is_udp_tagged` (trước decrypt):
 
-- Có marker 0x104A
-- Byte magic-off == 0x5B
-- `frag_index <= 1` (byte magic+3)
-- reserved == 0 (byte magic+4)
-- `l2_udp_is_fragment` thêm: `opt_policy_match` policy L2+PQC theo `policy_id` trên wire
+- `crypto_eth_l2_has_marker` (0x104A **hoặc** 0x104B)
+- `memcmp` 4B `{0x5B,'U','D',0x01}` ngay sau nonce
+- đủ chỗ shim 13 + tag 16
 
-False 0x5B trong CT gói nguyên: `wan_try_l2_pqc_frag` gọi `reassemble_l2` fail → restore `scratch` → return 0 → `decrypt_l2` thường.
+`l2_udp_is_fragment` cùng marker; `*pkt_id=0`, `*frag_index=0` — API cũ detection-only, seq nằm trong CT. Tagged UDP decrypt/reasm fail → drop, không fallback `decrypt_l2` vì trùng 1 byte 0x5B.
 
 **Worker:** `dp_crypto_pick_wan_worker` đọc byte 15. Đẩy `wan_to_mid[wi]`. Bảng `g_tables[profile_slot][wi]` — sai worker = hai nửa không gặp nhau → timeout 200ms = loss.
 
 **`l2_udp_reasm`** (trong `crypto_option_reassemble(..., CRYPTO_PROTO_UDP, ...)`):
 
 ```
-nd = l2_decrypt_fragment(ctx, pkt, *len, &pkt_id, &frag_index)
-     // AES-GCM; memmove plaintext về l3_off (14)
-     // frag0: inner = IP||UDP||half1
-     // frag1: inner = half2 thuần
-*len = nd
-rr = l2_reassemble(opt_table(slot, worker), pkt, *len, pkt_id, frag_index, out, out_len)
-return rr
+nd = l2_do_decrypt_udp → epoch, seq, datagram_id, kind
+kind == FULL:
+    set_rx_meta(epoch, seq); IPv4 plaintext; return 1   // không opt_table
+kind FRAG0/FRAG1:
+    l2_reassemble(opt_table(slot, worker, create=1), epoch, datagram_id, seq, kind)
+    join xong → set_rx_meta(epoch, seq)
 ```
 
 `l2_reassemble`:
 
-- `inner = pkt + wire_eth` (`wire_eth` = et_off+2 = 14), `inner_len = len - 14`
-- `idx = opt_pick_slot(ft, pkt_id, now)`
-- `frag_index==0`: inner phải IPv4 hợp lệ; `opt_store_first` copy **eth 14B** + inner vào `entry->first`
-- `frag_index==1`: `opt_store_second` copy inner vào `entry->second` (không eth)
+- `inner = pkt + wire_eth`, `inner_len = len - 14`
+- `idx = opt_pick_slot(ft, epoch, datagram_id, now)`
+- `kind==FRAG0`: inner IPv4; `opt_store_first` copy eth + inner
+- `kind==FRAG1`: `opt_store_second` copy inner (không eth)
 - `opt_emit_join` nếu `got_first && got_second`
 
 `opt_emit_join`:
@@ -830,53 +1024,55 @@ Không sửa IP tot_len / UDP length / checksum lúc join — ghép byte đúng 
 
 `crypto_l2_pqc_reasm_held()` **luôn 0** (copy vào `first[1600]/second[1600]`, không giữ UMEM). `pending==2` chết. `pending==1` = đợi.
 
-**`wan_try_l2_pqc_frag`:** không phải frag → 0. Là frag + reasm ok → **1**. Reasm fail → restore scratch, return **0** (cho `decrypt_l2`).
+**`wan_try_l2_pqc_udp`:** không tagged → 0. Tagged + reasm ok → **1**. Tagged + reasm fail → **-1** (`decrypt_wan` drop).
 
 **`decrypt_wan` rồi `dataplane_process_wan`:**
 
 ```
-l2_fast = wan_try_l2_pqc_frag(...)
+l2_fast = wan_try_l2_pqc_udp(...)
 l2_fast==1 && pending==1 → decrypt_wan return 1 → ne_frame_free(job); return
-                          // KHÔNG forward_wan_to_local — hold-gap
-l2_fast==1 && pending==0 → job.len = datagram đã join; return 0 → TX LAN
-l2_fast==0               → decrypt_l2 (gói nguyên)
+                          // chưa vào reorder — join hold-gap
+l2_fast==1 && pending==0 → datagram FULL hoặc đã join; return 0
+l2_fast==0               → decrypt_l2 (TCP/ICMP 0x104A)
+l2_fast<0                → drop
+
+decrypt 0 + take_rx_meta ok + inner UDP → dp_udp_reorder_submit (§16.9)
+decrypt 0 + không UDP meta             → forward_wan_to_local
 ```
 
-Hold-gap (cơ chế OOO **không** cần 2 WAN, nhưng bài D cho thấy trên 1 WAN gần như không xảy ra — 45/71.3M):
+Join-pending (bảng mảnh, chưa reorder):
 
 ```
-t0  A-frag0  store, free frame, không TX LAN
-t1  B nguyên (hoặc B đã join)  TX LAN ngay
-t2  A-frag1  join A, TX LAN sau B
-→ iperf: B trước A = out-of-order; A không lost
+t0  A-frag0  store, free frame, không TX LAN, chưa submit reorder
+t1  B join xong  → reorder_submit(seq=B)
+t2  A-frag1  join A → reorder_submit(seq=A)
 ```
 
-Trên 1 WAN, A.frag0 và A.frag1 kề nhau trên cùng NIC/TX ring → t1 hiếm khi cắt giữa hai mảnh của A. Trên 2 WAN, B đi WAN kia, join xong trong lúc A còn pending → t1 thường xuyên. Nhân ×2 split là hệ số; WRR 2 path là điều kiện.
+Nếu `seq(A) < seq(B)`: B `delta>0` được **hold** trong cửa sổ 256 / 2ms; A tới `delta==0` → emit A rồi flush B. Trước đây t1 TX LAN ngay = OOO. 1 WAN bài D: hai mảnh kề nhau, A join trước B, reorder passthrough (~45/71.3M). 2 WAN: t1 thường xuyên — đúng chỗ reorder ngồi.
 
 ---
 
-### 16.5b Bảng reasm (chi tiết struct + slot)
+### 16.5b Bảng reasm (join mảnh — không phải reorder)
 
 ```
-g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS]   // calloc lần đầu opt_table()
+g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS]   // calloc khi create=1
 struct opt_entry {
-    uint16_t pkt_id;
-    uint8_t  first[1600], second[1600];
+    uint32_t epoch, datagram_id, bond_seq;
     uint32_t first_len, second_len;
-    uint8_t  eth_hdr[18], eth_len;
     uint64_t timestamp_ns;
-    uint8_t  got_first, got_second;
+    uint8_t  eth_hdr[18], eth_len, got_first, got_second;
+    uint8_t  first[1600], second[1600];
 };
-struct opt_table { entries[4096]; }   // OPT_FRAG_TABLE_SIZE
+struct opt_table { gc_cursor; entries[4096]; }
 ```
 
-`opt_pick_slot(pkt_id)`: `base = pkt_id % 4096`, probe **8** ô. Thứ tự: ô cùng `pkt_id` còn sống → ô trống (GC tại chỗ nếu age > 200ms) → occupied **già nhất** trong 8 (**evict**). Evict nửa đang chờ = mảnh kia timeout = **loss**.
+`opt_pick_slot(epoch, datagram_id)`: `base = (datagram_id ^ epoch*0x9e3779b9) % 4096`, probe **8**. Ô cùng cặp còn sống → trống (GC age > 200ms) → occupied già nhất (**evict** = loss nửa kia).
 
-`opt_prepare_entry`: nếu `pkt_id` khác hoặc entry cũ quá 200ms → `memset` entry.
+`opt_prepare_entry`: epoch/datagram_id/`bond_seq` khác hoặc quá 200ms → `opt_clear_entry` (chỉ metadata, không memset 3248B).
 
-`OPT_FRAG_TIMEOUT_NS = 200ms`. GC full table: `l2_udp_frag_gc` mỗi 2048 vòng `crypto_worker_thread` (`fwd_crypto_frag_gc_worker_tick`).
+`opt_time_ns`: `CLOCK_MONOTONIC_COARSE`. GC slice **256** ô / tick 2048 vòng crypto. `opt_table(..., create=0)` trên path GC — không calloc worker chưa UDP cắt.
 
-1600B đủ nửa MTU; `first_len+second_len+eth > NE_FRAME(2048)` → join fail, clear, -1.
+1600B đủ nửa MTU; `first_len+second_len+eth > NE_FRAME(2048)` → join fail.
 
 ---
 
@@ -887,144 +1083,101 @@ struct opt_table { entries[4096]; }   // OPT_FRAG_TABLE_SIZE
 | `l2_udp_need_split` | không cắt | cắt | (không) |
 | `encrypt_to_wan` | 1 frame, caller push | đã push 2 mảnh | drop |
 | `l2_udp_reasm` / `l2_reassemble` | đợi mảnh kia | đã join | lỗi decrypt/store |
-| `wan_try_l2_pqc_frag` | không frag / fail→thử decrypt_l2 | đã xử lý frag | (hiếm, decrypt_wan -1) |
-| `decrypt_wan` | xong, forward | pending, free frame | drop |
-| `dataplane_process_wan` dec==1 | — | free, không TX LAN | — |
+| `wan_try_l2_pqc_udp` | không tagged | đã xử lý UDP tagged | decrypt/reasm fail → drop |
+| `decrypt_wan` | xong | pending, free frame | drop |
+| `dataplane_process_wan` | TCP/bypass TX LAN | UDP tagged → reorder | — |
 
-### 16.6 Hai nguồn OOO
+### 16.6 Hai tầng OOO (join vs reorder)
 
-| Nguồn | Cơ chế | Iperf |
-|-------|--------|--------|
-| Per-packet 2 WAN (§7) | Datagram N → WAN0, N+1 → WAN1, delay khác; không có reorder buffer | OOO 15–54% @ 1.2G, loss vẫn ~0.1% |
-| UDP split ×2 + crypto ×2 | 1 datagram = 2 frame + 2 AES TX + 2 AES RX | 1 WAN gần vô hại (bài D). 2 WAN nhân hold-gap và 2 queue |
-| UDP reasm hold-gap | Frag0 giữ A, B đi trước, frag1 mới ra A | Nổ khi A và B khác WAN; 1 WAN gần 0 |
-| 1 LAN+1 WAN đúng tải (bài D) | `n==1`, cùng ring, TX tuần tự | **8.38G, loss 0.16%, OOO 45/71.3M** |
-| 1 LAN+1 WAN overrun (bài B cũ) | `fwd_wan_has_tx_room` drop | Loss cao — bão hòa NIC |
-| Tắt per-packet | Sticky/window 1 WAN/flow | OOO giảm vì hết stripe |
-| TX slot sticky | 1 flow 1 TX consumer trên **một** ring | Không giữ thứ tự giữa 2 ring 2 NIC |
-| 2 mảnh cùng WAN+slot | push 0 rồi 1 | Code hiện tại làm vậy |
+| Nguồn | Cơ chế | Hiện tại |
+|-------|--------|----------|
+| Per-packet 2 WAN (§7) | Datagram N WAN0, N+1 WAN1 | Vẫn stripe; **sau join** buffer seq §16.9 |
+| UDP split ×2 + crypto ×2 | 1 datagram = 2 frame + 2 AES | 1 WAN gần vô hại (bài D). 2 WAN nhân join-pending |
+| Join hold-gap | Frag0 giữ A trong `opt_table`, B join trước | A chưa vào reorder; B `delta>0` → **hold B** tới A hoặc timeout 2ms |
+| Reorder late/dup | `delta<0` hoặc slot cùng seq | drop (`late_or_duplicate`) |
+| Reorder skip-gap | hold hết, seq thiếu | nhảy `next_seq`, `gap_skipped`; gói trễ sau đó drop |
+| 1 LAN+1 WAN bài D | `n==1`, TX tuần tự | **8.38G, loss 0.16%, OOO 45/71.3M** — reorder gần passthrough |
+| 1 LAN+1 WAN overrun | `fwd_wan_has_tx_room` drop | Loss — bão hòa NIC |
+| Tắt per-packet | Sticky 1 WAN/flow | OOO giảm vì hết stripe — **không** làm vậy |
+| TX slot sticky | 1 flow 1 TX consumer / ring | Không giữ thứ tự giữa 2 NIC |
+| 2 mảnh cùng WAN+slot | push 0 rồi 1 | Không đổi |
 
-Bài D: OOO ~0 trong khi split vẫn bật → join không phải nguồn OOO hàng loạt; nguồn chính là 2 path × 2 mảnh.
+Reorder **không** pick WAN, **không** đổi WRR. Tắt: `NE_UDP_REORDER=0`. Bài D: join không phải nguồn OOO hàng loạt; 2 path × 2 mảnh là điều kiện reorder phải gánh.
 
 ### 16.7 Cách hai mảnh đang gắn với nhau
 
 Hành vi hiện tại:
 
-1. Hai mảnh cùng `pkt_id` cùng `worker_idx` trên wire → cùng crypto core RX.
-2. Hai mảnh cùng `wan_dp` và cùng `tx_slot` lúc TX.
-3. TCP MSS clamp, không split.
-4. Reasm table per `(profile_slot, worker)`.
-5. Frag1 không có IP/UDP header — join lấy L3 từ frag0.
+1. Cùng `worker_idx` trên wire → cùng crypto core.
+2. Cùng `wan_dp` + `tx_slot` lúc TX.
+3. Cùng `epoch` + `datagram_id` + `bond_seq` (shim GCM).
+4. TCP không split (MSS clamp).
+5. Reasm table per `(profile_slot, worker)`.
+6. Frag1 không IP/UDP — L3 từ frag0.
 
-Hệ quả: WRR từng *mảnh* sẽ làm hai nửa không gặp nhau. Timeout 200ms GC mảnh mồ côi; tăng timeout không sắp lại thứ tự vì B đã emit. Jumbo / payload nhỏ hơn ngưỡng `1500-35` thì `need_split=0`, hết hold-gap. UDP không có seq IP; phía nhận hiện emit ngay khi join, không buffer theo thứ tự datagram gốc.
+WRR từng *mảnh* làm hai nửa không gặp nhau. Timeout join 200ms ≠ cửa sổ reorder 2ms. Jumbo / `pkt_len+47 ≤ MTU` thì hết join; UDP FULL vẫn có seq → vẫn reorder (lệch delay 2 WAN một frame).
 
 ---
 
-## 16.8 Rã ráp UDP — chi tiết để tối ưu
+## 16.8 Rã ráp UDP — join mảnh (opt_table)
 
-Đây là ráp **datagram UDP đã cắt trên dataplane**, không phải ráp handshake PQC.
+Đây là ráp **hai mảnh một datagram**, không phải handshake PQC, **không** phải buffer seq datagram (§16.9).
 
 | Đây | Không phải đây |
 |-----|----------------|
-| `src/crypto/pqc/pqc_l2_option.c` — `l2_udp_reasm` / `l2_reassemble` / `opt_*` | `pqc_l2_handshake.c` `g_reassemble_list` (keying, list, không nằm hot path gói) |
-| Gọi từ `wan_ingress.c`: `wan_try_l2_pqc_frag` → `reassemble_l2` → `decrypt_wan` → `dataplane_process_wan` | TCP / ICMP / OSPF / ARP — `need_split=0`, `reasm` TCP không cắt |
-| TX cắt: `local_egress.c` `encrypt_to_wan` / `push_split_to_wan` / `l2_split` | `l2_do_encrypt` gói nguyên (UDP nhỏ hoặc TCP) |
+| `src/crypto/pqc/pqc_l2_option.c` — `l2_udp_reasm` / `l2_reassemble` / `opt_*` | Handshake PQC (`pqc_handshake.c` UDP :7090) |
+| `wan_ingress.c`: `wan_try_l2_pqc_udp` → `reassemble_l2` → `decrypt_wan` | TCP / ICMP / OSPF / ARP |
+| TX cắt: `local_egress.c` `encrypt_to_wan` / `push_split_to_wan` / `l2_split` | `l2_do_encrypt` TCP; UDP nhỏ = `l2_do_encrypt_udp` FULL |
+| Sau join: `crypto_option_udp_set_rx_meta` → §16.9 | emit LAN ngay (cũ) |
 
 Hằng số live:
 
 | Tên | Giá trị | Ý |
 |-----|---------|---|
 | `OPT_FRAG_TABLE_SIZE` | 4096 | số ô / bảng |
-| probe | 8 (hardcode trong `opt_pick_slot`) | cửa sổ linear từ `pkt_id % 4096` |
-| `OPT_FRAG_TIMEOUT_NS` | 200 ms | GC mảnh mồ côi; không phải reorder window |
-| `OPT_FRAG_META_LEN` | 35 | overhead **mảnh** trên dây (so MTU) |
-| `crypto_option_wire_overhead(L2_PQC)` | 30 | overhead **gói nguyên** (không magic/tag) |
-| MTU | 1500 (`CRYPTO_OPT_FRAG_MTU_DEFAULT`) | `crypto_option_get_mtu()` |
-| `NE_FRAME` | 2048 | trần join / UMEM frame |
+| probe | 8 | cửa sổ từ hash `(datagram_id ^ epoch*0x9e3779b9) % 4096` |
+| `OPT_FRAG_TIMEOUT_NS` | 200 ms | GC mảnh mồ côi; **không** phải reorder hold |
+| `OPT_FRAG_META_LEN` | 47 | overhead UDP trên dây (so MTU) |
+| `L2_UDP_MARKER_SIZE` | 4 | `{0x5B,'U','D',0x01}` plaintext |
+| `L2_UDP_SHIM_SIZE` | 13 | kind+epoch+seq+datagram_id **trong GCM** |
+| `crypto_option_wire_overhead(L2_PQC)` | 30 | TCP/ICMP gói nguyên (không marker/shim) |
+| MTU | 1500 default | `crypto_option_get_mtu()` |
+| `NE_FRAME` | 2048 | trần join / UMEM |
 | `first[]`/`second[]` | 1600 | trần inner mỗi nửa |
-| `ETH_L2_HDR_MAX` | 18 | 14 thường, 18 VLAN |
-| `AES_GCM_TAG_SIZE` | 16 | đuôi mỗi mảnh |
-| `PACKET_CRYPTO_NONCE_BYTES` | 12 | nonce trên header, ngoài GCM |
-| `NE_CRYPTO_WORKERS` | 6 (CPU 3–8) | một bảng / worker |
-| `MAX_PROFILES` | 32 mảng; live slot 0 | `g_tables[slot][W]` |
-| GC tick | 2048 vòng `crypto_worker_thread` | full scan 4096 ô |
+| GC tick | 2048 vòng crypto | slice **256** ô, `create=0` không calloc |
 
-Một connect TCP/UDP = một crypto worker (sticky). WAN **không** sticky. Hai mảnh một datagram cùng worker, cùng WAN, cùng TX slot.
+Một connect = một crypto worker. WAN không sticky. Hai mảnh cùng worker, cùng WAN, cùng TX slot, cùng `(epoch, datagram_id, seq)`.
 
 ---
 
 ### 16.8.1 Cặp mảnh trên dây (đầu vào của ráp)
 
-`l2_udp_need_split`: `(pkt_len + 35) > mtu`. `pkt_len` = **cả frame Ethernet** (14B + IP + UDP + app). Đúng **2** mảnh, không 3+. Cắt **app UDP**; IP header và UDP header nguyên trên frag0.
+`l2_udp_need_split`: `(pkt_len + 47) > mtu`. Đúng **2** mảnh. Cắt **app UDP**; IP+UDP hdr trên frag0.
 
-So sánh 35 vs 30: gói nguyên (`l2_do_encrypt`) phình `+30` (policy+core+nonce 14B thay ethertype area, + tag 16). Mảnh phình `+35` vì thêm magic 1 + tag 4. `need_split` dùng 35 → một số frame mà encrypt nguyên vẫn ≤1500 vẫn bị cắt. iperf `-l 1470` thì frame LAN 1512, cắt chắc.
+So sánh 47 vs 30: TCP `+30`. UDP luôn marker+shim nên `+47` kể cả FULL. `need_split` dùng 47. iperf `-l 1470` frame LAN 1512, cắt chắc.
 
-Công thức `l2_split` (không VLAN, `l3_off=14`, IHL=20, UDP hdr=8):
+Công thức `l2_split` (không VLAN):
 
 ```
-frag_overhead = l3_off + 35 = 49
-max_plain0    = 1500 - 49 = 1451     // trần inner frag0
-fixed_plain0  = 20 + 8 = 28          // IP + UDP hdr, không cắt
-half1         = 1451 - 28 = 1423     // app trên frag0
-nếu half1 >= app_len: half1 = app_len - 1   // luôn để ≥1 byte cho frag1
+frag_overhead = l3_off + 47 = 61
+max_plain0    = 1500 - 61 = 1439
+fixed_plain0  = 20 + 8 = 28
+half1         = 1439 - 28 = 1411
+nếu half1 >= app_len: half1 = app_len - 1
 half2         = app_len - half1
 ```
 
-iperf `-l 1470`: `half1=1423`, `half2=47`.
+iperf `-l 1470`: `half1=1411`, `half2=59`.
 
-```
-frag0 plaintext = IPv4 (20) || UDP hdr (8) || app[0 .. 1423)     // 1451 B
-frag1 plaintext = app[1423 .. 1470)                              // 47 B, không IP, không UDP
-```
+IP `tot_len` / UDP `length` trên frag0 **vẫn gốc**. Join không sửa checksum.
 
-IP `tot_len` và UDP `length` trên frag0 **vẫn là giá trị gốc** (app 1470B). Join ghép `first||second` thì độ dài khớp datagram cũ; **không** tính lại checksum. Checksum UDP/IP gốc vẫn đúng vì payload sau join = payload lúc cắt.
+`seq` = `dp_udp_next_tx_seq` (atomic per flow+direction trên `g_route_table`). `datagram_id` = TLS clock worker. `epoch` = process-wide. Không còn `g_opt_pkt_id` u16.
 
-`pkt_id` = `crypto_option_next_pkt_id()`: `atomic_fetch_add(&g_opt_pkt_id, 1) & 0xFFFF` trong `crypto_option_router.c`. **Một counter cả process**, mọi worker, mọi flow, LAN và (nếu có) chiều kia. Wrap 65536. Không gắn 5-tuple.
+Layout dây: **§16.1 B**. `enc_start=32` (không VLAN). GCM phủ shim+payload. Marker 4B ngoài GCM.
 
-#### Layout mảnh trên dây (không VLAN)
+VLAN: `et_off=16`, offset +4. `ETH_L2_HDR_MAX=18`.
 
-`et_off = 12`. Byte:
-
-```
- 0–5    dst MAC
- 6–11   src MAC
-12–13   EtherType = 0x104A
-14      policy_id          (plaintext)
-15      worker_idx         (plaintext)  ← WAN RX hash vào wan_to_mid[W]
-16–27   nonce 12B          (plaintext, input GCM)
-28      magic 0x5B         (plaintext)
-29–30   pkt_id big-endian  (plaintext)
-31      frag_index 0|1     (plaintext)   opt_write_frag_tag buf[2]
-32      reserved 0         (plaintext)   buf[3]
-33…     ciphertext inner || GCM tag 16B
-```
-
-`enc_off = 33`. GCM phủ từ 33 đến hết frame. Tag, magic, `pkt_id` **không** nằm trong CT.
-
-VLAN 802.1Q: `et_off=16`, mọi offset +4. Magic 32, `enc_off=37`. `ETH_L2_HDR_MAX=18` đủ copy eth (MAC+VLAN+et). Live iperf thường không VLAN.
-
-Độ dài wire gần đúng (không VLAN):
-
-| Mảnh | công thức | iperf 1470 |
-|------|-----------|------------|
-| frag0 | 33 + 1451 + 16 = 1500 | đúng MTU |
-| frag1 | 33 + 47 + 16 = 96 | nhỏ |
-
-#### Thứ tự encrypt / TX / mất mảnh
-
-`l2_split`: encrypt **frag1 trước** vào buffer `tail` UMEM (`l2_encrypt_fragment_single`), rồi frag0 **in-place** lên frame gốc (`l2_encrypt_fragment0_inplace`). Hai nonce độc lập. Cùng `policy_id`, `worker_idx`, `pkt_id`.
-
-`encrypt_to_wan`: `need_split` → `split_tail_take` (cache 32 frame/worker) → `crypto_option_split` → `push_split_to_wan`.
-
-`push_split_to_wan` (`local_egress.c`):
-
-1. Nếu `ne_ring_count(tx)+2 > cap` → free tail, return -1 (caller drop **cả** job gốc — chưa push mảnh nào).
-2. `ne_ring_try_push(tx, job)` frag0. Fail → free tail, return -1.
-3. `ne_ring_try_push(tx, tail)` frag1. Fail → **free chỉ tail**, return **0** (thành công phía caller). Frag0 đã nằm ring. Máy nhận treo frag0 ≤200ms rồi GC = **loss**. Không rollback frag0.
-
-Hai mảnh cùng `wan_dp`, cùng TX slot (`dp_out_ring_idx()`). Không WRR từng mảnh.
-
----
+`l2_split`: encrypt frag1 trước (`L2_UDP_KIND_FRAG1`), rồi frag0 in-place (`FRAG0`). `push_split_to_wan` không đổi: 2 chỗ trống; frag1 fail sau frag0 queued = orphan 200ms = loss.
 
 ### 16.8.2 Gói đi vào worker nào
 
@@ -1034,48 +1187,40 @@ Sai worker (byte 15 ≠ thread đang chạy): hai nửa không chung bảng, 200
 
 `profile_slot` = `fwd_crypto_profile_slot_for_id(fwd_crypto_profile_id_for_wire_id(policy_id))`. Live một profile → slot 0. `opt_table` clamp slot/worker về 0 nếu out of range.
 
-`opt_table` lần đầu `calloc(1, sizeof(opt_table))` (~13 MB). **Cả `l2_udp_frag_gc` cũng gọi `opt_table`**, nên tick GC 2048 vòng cấp bảng ngay cả khi worker chưa từng nhận UDP cắt. 6 worker × slot 0 ≈ **80 MB** sau vài giây chạy, không cần có split.
+`opt_table` lần đầu `calloc` khi **`create=1`** (reasm UDP cắt). Path GC gọi `opt_table(..., create=0)` — worker chưa từng UDP cắt **không** calloc ~13 MB.
 
 ---
 
-### 16.8.3 Nhận diện mảnh — trước AES
+### 16.8.3 Nhận diện UDP tagged — trước AES
 
-`wan_l2_is_udp_frag` (`wan_ingress.c`), **không decrypt**:
+`wan_l2_is_udp_tagged` (`wan_ingress.c`), **không decrypt**:
 
-1. EtherType 0x104A (`crypto_eth_l2_has_marker`)
-2. `mark_off = crypto_eth_l2_frag_magic_off(..., 12)` = core_id_off + 1 + 12 = **28** không VLAN, **32** VLAN
-3. `pkt[mark_off] == 0x5B`
-4. `frag_index = pkt[mark_off+3] <= 1`  (byte 31: `frag_index` trong tag)
-5. `reserved = pkt[mark_off+4] == 0`    (byte 32)
+1. `crypto_eth_l2_has_marker` — 0x104A **hoặc** 0x104B
+2. `mark_off = crypto_eth_l2_frag_magic_off(..., 12)` = **28** không VLAN, **32** VLAN
+3. `memcmp` 4B `{0x5B,'U','D',0x01}`
+4. đủ `marker + shim 13 + tag 16`
 
-Tag sau magic: `[id_hi][id_lo][frag_index][reserved]` = `opt_write_frag_tag`.
+`kind`/`seq` **không** đọc trước decrypt. `l2_udp_is_fragment` cùng marker; output `pkt_id`/`frag_index` luôn 0.
 
-`l2_udp_is_fragment` thêm: đọc `policy_id`, `opt_policy_match(ENCRYPT_L2 + MODE_PQC + wire_id)`. Nhánh nhanh `wan_try_l2_pqc_frag` **không** gọi cái này — chỉ `wan_l2_is_udp_frag` rồi `fwd_policy_by_wire_id` / `fwd_crypto_ctx_for_wire_id`. `l2_udp_is_fragment` dùng ở fallback `decrypt_wan` (`crypto_option_is_fragment`).
-
-Gói **không cắt**: offset 28 là ciphertext. Trùng 0x5B + reserved 0 + frag_index≤1 → false positive. `wan_try_l2_pqc_frag` đã `memcpy` scratch cả frame; `reassemble_l2` decrypt/store fail → restore scratch → return 0 → `decrypt_l2` (GCM gói nguyên, ops TCP).
+Nhánh nhanh `wan_try_l2_pqc_udp` không gọi `l2_udp_is_fragment`. Fail tagged → **-1 drop**, không restore-scratch + `decrypt_l2`. TCP 0x104A không có marker 4B → không vào nhánh này.
 
 ---
 
-### 16.8.4 Decrypt một mảnh — `l2_decrypt_fragment`
+### 16.8.4 Decrypt UDP — `l2_do_decrypt_udp`
 
-In-place trên UMEM frame hiện tại:
+In-place:
 
-1. `l2_frag_magic_off`; fail nếu không 0x5B.
-2. `opt_read_frag_tag` tại magic+1 → `pkt_id`, `frag_index` (còn plaintext).
-3. `enc_off = magic+1+4` (=33 không VLAN). `crypto_pqc_decrypt_payload` từ `enc_off` đến hết (CT + tag 16).
-4. `memmove(packet + l3_off, packet + enc_off, dec_len)` với `l3_off = prefix_len+2` (=14).
-5. Return `l3_off + dec_len`. EtherType **vẫn 0x104A**.
+1. Marker match; `enc_start = magic+4` (=32 không VLAN).
+2. GCM decrypt từ enc_start (shim + payload + tag).
+3. Parse shim: version nibble, kind, epoch BE, seq BE, datagram_id BE.
+4. `memmove` payload về `l3_off`. EtherType ghi 0x0800 khi FULL / lúc join.
 
-Sau bước này:
-
-| Mảnh | Buffer từ offset 14 |
+| kind | Buffer từ offset 14 |
 |------|---------------------|
-| 0 | IPv4 \|\| UDP \|\| half1 |
-| 1 | half2 thuần (byte đầu **không** phải 0x45 trừ trùng ngẫu nhiên) |
+| FULL / FRAG0 | IPv4 \|\| UDP \|\| … |
+| FRAG1 | half2 thuần |
 
-Key `KEY_SLOT_CURRENT`. Nonce copy từ offset 16. AAD `HARDCODED_AAD` 8 byte `"TEST_AAD"` nhưng `aad_len=12` trong `crypto_pqc_sess_load`. `CipherInit` mỗi gói (`crypto_pqc_tls_cipher` giữ `SCryptCipherCtx` per-thread).
-
-Decrypt fail (tag sai, key 0, len ngắn) → `l2_udp_reasm` -1 → `reassemble_l2` -1 → restore scratch.
+Decrypt fail → `l2_udp_reasm` -1 → `wan_try_l2_pqc_udp` -1 → drop.
 
 ---
 
@@ -1084,24 +1229,20 @@ Decrypt fail (tag sai, key 0, len ngắn) → `l2_udp_reasm` -1 → `reassemble_
 ```
 g_tables[MAX_PROFILES][NE_CRYPTO_WORKERS]   // con trỏ; calloc trong opt_table()
 
-struct opt_entry {                 // sizeof = 3248 (x86_64)
-    uint16_t pkt_id;               // off 0
-    uint8_t  first[1600];          // off 2     inner frag0
-    uint32_t first_len;            // off 1604
-    uint8_t  second[1600];         // off 1608  inner frag1
-    uint32_t second_len;           // off 3208
-    uint8_t  eth_hdr[18];          // off 3212  MAC + 0x104A (+VLAN)
-    uint8_t  eth_len;              // off 3230
-    uint64_t timestamp_ns;         // off 3232  CLOCK_MONOTONIC lúc store
-    uint8_t  got_first;            // off 3240
-    uint8_t  got_second;           // off 3241
-    /* pad 6 → 3248 */
+struct opt_entry {                 // ~3248 B, payload arrays vẫn 1600
+    uint32_t epoch, datagram_id, bond_seq;  // đầu struct — probe cùng cache line hơn pkt_id cũ
+    uint32_t first_len, second_len;
+    uint64_t timestamp_ns;         // CLOCK_MONOTONIC_COARSE
+    uint8_t  eth_hdr[18], eth_len, got_first, got_second;
+    uint8_t  first[1600], second[1600];
 };
 
-struct opt_table { entries[4096]; }   // 4096 × 3248 = 13 303 808 B ≈ 12.7 MiB
+struct opt_table { gc_cursor; entries[4096]; }
 ```
 
-`opt_pick_slot` đọc `got_first`/`got_second`/`timestamp_ns`/`pkt_id` — ba field này nằm **hai đầu** struct (0 và 3232–3241). Probe 8 ô occupied = 8 lần nhảy ~3.2 KB. `opt_clear_entry` = `memset` **cả 3248 B**, kể cả khi chỉ cần hạ flag.
+`opt_clear_entry` chỉ hạ metadata (không memset 3248B mỗi join). Probe vẫn đọc got_* + timestamp; payload array vẫn lớn — miss khi copy inner.
+
+Pending: `dec==1` → `ne_frame_free`. Join xong **không** TX LAN ngay: `set_rx_meta` → `dataplane_process_wan` → §16.9.
 
 **Copy-based:** không giữ frame UMEM. `crypto_l2_pqc_bind_pair` / `reasm_set_addr` no-op. `crypto_l2_pqc_reasm_held()` **luôn 0**. `crypto_l2_pqc_reasm_out_addr()` **luôn 0**. `reassemble_l2` gọi `crypto_l2_pqc_reasm_set_addr(addr)` rồi bỏ qua. Join ghi đè `out_buf = pkt` (cùng UMEM mảnh vừa decrypt).
 
@@ -1113,38 +1254,19 @@ Pending: `dataplane_process_wan` `dec==1` → `ne_frame_free(job.addr)`. Dữ li
 
 ### 16.8.6 Chọn ô — `opt_pick_slot` rồi `opt_prepare_entry`
 
-Mỗi `l2_reassemble`: `now = opt_time_ns()` = `clock_gettime(CLOCK_MONOTONIC)` (mỗi mảnh, kể cả khi đôi đã đủ).
+Mỗi `l2_reassemble`: `now = opt_time_ns()` = `CLOCK_MONOTONIC_COARSE`.
 
 ```
-base = pkt_id % 4096          // uint16 % 4096 = 12 bit thấp
-probe 8: idx = (base + i) % 4096, i = 0..7
-
-với mỗi ô:
-  occupied = got_first || got_second     // pkt_id bẩn sau memset? got=0 → trống
-  nếu occupied && (now - ts) > 200ms → memset 3248B, occupied=0
-  trống → nhớ empty_idx đầu tiên, continue
-  occupied && e->pkt_id == pkt_id → return idx   // ưu tiên đôi đang chờ
-  occupied khác id → theo dõi ô già nhất trong 8
-
-return empty_idx, else oldest (EVICT), else base
+base = (datagram_id ^ epoch * 0x9e3779b9) % 4096
+probe 8
+occupied && age > 200ms → opt_clear_entry (metadata only)
+cùng epoch+datagram_id → return idx
+trống → empty; occupied khác → oldest → evict
+opt_prepare_entry: epoch/id/bond_seq khác hoặc quá hạn → clear metadata
+gán epoch, datagram_id, bond_seq; timestamp = now
 ```
 
-Cùng `pkt_id` luôn cùng cửa sổ 8 (hash = id % 4096). Không chain, không tombstone.
-
-Evict: `pick_slot` trả ô occupied **id khác**, chưa xóa. `opt_store_*` → `opt_prepare_entry`:
-
-```
-nếu entry->pkt_id != pkt_id
-   hoặc (đã có dữ liệu và age > 200ms)
-   → memset cả entry
-gán pkt_id, timestamp_ns = now     // timestamp luôn refresh, kể cả khi thêm nửa thứ hai
-```
-
-Evict = mất nửa cũ. Mảnh kia của nửa cũ tới sau: `pick_slot` có thể cho ô mới, vẫn thiếu đôi → 200ms GC = loss.
-
-Frag1 có thêm check trước `opt_store_second`: nếu cùng `pkt_id` và age > 200ms thì clear. `pick_slot` đã GC ô quá hạn trong cửa sổ 8, nên nhánh này gần như chết với cùng id trong cùng cửa sổ.
-
-Không lock. Hai thread không đụng một `g_tables[][W]`.
+Cùng cặp luôn cùng cửa sổ 8. `bond_seq` phải khớp khi thêm nửa thứ hai. Evict = loss nửa cũ. Không lock.
 
 ---
 
@@ -1186,7 +1308,7 @@ memcpy out, eth_hdr, eth_len          // 14B, nguồn = bảng không phải pkt
 memcpy out+14, first, first_len
 memcpy out+14+first, second, second_len
 crypto_eth_set_ipv4_et(out, eth_len-2)   // ghi 0x0800 tại offset 12
-memset entry (3248 B)
+opt_clear_entry (metadata)
 return 1, *out_len = 14+first+second
 ```
 
@@ -1206,23 +1328,21 @@ Ký hiệu: A cắt thành A0, A1. Crypto worker W. Không VLAN.
 
 1. WAN RX → `wan_to_mid[W]` (byte 15).
 2. `dataplane_process_wan`: `wan_l2_is_frag` → snapshot `wire_buf` **64B** (policy_id). Frame đầy đủ vẫn trong UMEM.
-3. `decrypt_wan` → `wan_try_l2_pqc_frag`:
-   - `memcpy(scratch, pkt, orig_len)` cả frame wire (~1500B) — **mọi** mảnh, kể cả ráp thành công.
-   - `reassemble_l2`: `crypto_option_reassemble(L2_PQC, UDP, slot, W, ctx, pkt, len, pkt, &blen)`.
-4. `l2_udp_reasm`: AES-GCM A0 → memmove inner về 14 → `l2_reassemble`.
-5. `opt_pick_slot` ô trống, `opt_store_first` memcpy 14+1451, `opt_emit_join` return 0.
-6. `reassemble_l2`: `pending = held()?2:1` → **1**. return 0.
-7. `wan_try_l2_pqc_frag` return 1. `decrypt_wan` return 1.
-8. `ne_frame_free(A0)`. Không FDB, không TX LAN. A nằm bảng.
+3. `decrypt_wan` → `wan_try_l2_pqc_udp` (không scratch full-frame vì marker 4B unambiguous):
+   - `reassemble_l2`: `crypto_option_reassemble(L2_PQC, UDP, ...)`.
+4. `l2_udp_reasm`: AES-GCM → parse shim → `l2_reassemble`.
+5. `opt_pick_slot` ô trống, `opt_store_first`, `opt_emit_join` return 0.
+6. `pending=1`. `wan_try_l2_pqc_udp` return 1. `decrypt_wan` return 1.
+7. `ne_frame_free(A0)`. A nằm bảng. Chưa reorder.
 
 **A1 tới**
 
-1–4 như trên, decrypt inner 47B.
-5. `opt_pick_slot` tìm cùng `pkt_id`, `opt_store_second` memcpy 47, `opt_emit_join` memcpy 14+1451+47 ra UMEM A1, memset entry, return 1.
-6. `pending=0`, `job.len=1512`, `decrypt_wan` return 0.
-7. `out_addr` 0, không đổi frame. FDB, `forward_wan_to_local` datagram A.
+1–4 decrypt inner half2.
+5. `opt_pick_slot` cùng epoch+datagram_id, `opt_store_second`, join, `set_rx_meta(epoch, seq)`.
+6. `decrypt_wan` return 0.
+7. `dataplane_process_wan`: `take_rx_meta` → `dp_udp_reorder_submit` (§16.9) — **không** `forward_wan_to_local` trực tiếp.
 
-Giữa bước 8 của A0 và bước 7 của A1, worker có thể ráp xong B và TX LAN B → hold-gap OOO.
+Giữa A0 pending và A1 join, worker có thể join B trước → B vào reorder trước A; buffer seq giữ B nếu `seq(A)` nhỏ hơn.
 
 **A1 tới trước A0:** store second, pending free A1; A0 tới join trên frame A0. Cùng đúng.
 
@@ -1234,65 +1354,49 @@ Giữa bước 8 của A0 và bước 7 của A1, worker có thể ráp xong B v
 
 `reassemble_l2`: rr=1 → `*len=blen`, pending không set (0). rr=0 → pending 1. rr khác → -1.
 
-`wan_try_l2_pqc_frag`: không phải frag → 0. reasm ok → **1**. reasm -1 → restore scratch, pending=0, return **0**.
+`wan_try_l2_pqc_udp`: không tagged → 0. reasm ok → **1**. reasm -1 → **-1** (`decrypt_wan` drop). Không restore-scratch.
 
 `decrypt_wan` khi `l2_fast==1`:
 
 | pending | return | `dataplane_process_wan` |
 |---------|--------|-------------------------|
-| 2 | 2 | không xảy ra (`held=0`); comment cũ “giữ UMEM” |
-| 1 | 1 | `ne_frame_free`; **không** TX LAN |
-| 0 | 0 | join xong; policy_in; TX LAN |
+| 2 | 2 | không xảy ra (`held=0`) |
+| 1 | 1 | `ne_frame_free`; chưa reorder |
+| 0 | 0 | FULL hoặc join xong → `take_rx_meta` → §16.9 |
 
-Nhánh chậm `l2_fast==0`: `decrypt_l2` dùng ops **TCP** (`l2_do_decrypt` gói nguyên, không đọc 0x5B). Fail + `is_fragment` → `reassemble_l2` lần nữa (AES lần hai nếu lần một đã fail — thường drop). False 0x5B: lần reasm đã fail, restore, `decrypt_l2` thành công.
-
-`dec==2`: `dataplane_process_wan` `return` **không** free — nhánh chết. Nếu `held` bao giờ trả 1, frame leak.
+`l2_fast==0`: TCP/ICMP `decrypt_l2`. Tagged UDP không đi nhánh này.
 
 ---
 
-### 16.8.11 Hold-gap (OOO do ráp, không do loss)
+### 16.8.11 Hold-gap join vs reorder
 
-Mảnh thứ nhất: store, free UMEM, không TX LAN. Mảnh thứ hai: join, TX LAN ngay. **Không** so sánh seq với datagram khác cùng 5-tuple. UDP không có IP ID dùng cho thứ tự.
+Mảnh thứ nhất: store, free UMEM, **không** `set_rx_meta`. Mảnh thứ hai: join, `set_rx_meta(seq)`, **reorder** — không TX LAN ngay.
 
 ```
 t0  A0  store A, free frame
-t1  B đủ 2 mảnh (hoặc B không cắt)  TX LAN B
-t2  A1  join A, TX LAN A
-→ iperf: B trước A = OOO; A không lost
+t1  B join  → reorder_submit(B)
+t2  A1  join A → reorder_submit(A)
 ```
 
-1 WAN bài D: A0 và A1 kề trên một NIC/TX ring → t1 hiếm (45 OOO / 71.3M). 2 WAN: B trên path nhanh join trong lúc A pending mảnh path chậm → t1 thường xuyên. Tăng `OPT_FRAG_TIMEOUT_NS` không sắp lại thứ tự: B đã emit ở t1.
-
-Ráp **không** tạo OOO giữa hai mảnh của A (chúng không TX riêng). OOO là giữa datagram A và B.
+Nếu seq(A) < seq(B): B hold tới A hoặc hết 2ms (`gap_skipped`). Tăng `OPT_FRAG_TIMEOUT_NS` (200ms) không phải cửa sổ reorder. Ráp không TX từng mảnh của A; OOO giữa A và B là việc của §16.9.
 
 ---
 
-### 16.8.12 `pkt_id` wrap, occupancy, evict
+### 16.8.12 Occupancy, evict (không còn wrap u16 global)
 
-Wrap 16-bit, global mọi worker:
+Key 32-bit `(epoch, datagram_id)` + `bond_seq`. Hash mix epoch. Wrap datagram_id worker-local u32 — không còn wrap 0.65s của pkt_id 16-bit.
 
-| Tốc độ datagram cắt | Wrap | vs timeout 200ms |
-|---------------------|------|------------------|
-| 100k/s (~1.2G `-l 1470`) | ~0.65 s | 200ms ≪ wrap, ít trùng id còn sống |
-| 1M/s | ~65 ms | wrap < timeout → id mới đụng entry cũ cùng id |
-
-Hai worker cắt độc lập vẫn `fetch_add` chung → wrap nhanh hơn tổng PPS cắt.
-
-Pending đồng thời ≈ (thời gian A0→A1) × datagram/s trên **một worker**. 1 WAN: A0/A1 kề, pending ~1–vài ô. 2 WAN skew 2ms × 100k dps / 6 worker ≈ ~33 ô/worker nếu tải đều — probe 8 **không** phải 4096; 8 ô cửa sổ mới là trần va chạm. Hash 12 bit; 33 pending rải 4096, P(cùng cửa sổ 8) thấp. Skew lớn + nhiều flow dồn một worker (sticky) → đầy 8 → evict = loss.
-
-`pkt_id % 4096` bỏ 4 bit cao. Id cách 4096 map cùng base.
+Pending ≈ skew A0→A1 × dps / worker. Probe 8 vẫn trần va chạm cửa sổ. Sticky nhiều flow một worker + skew lớn → evict = loss nửa.
 
 ---
 
 ### 16.8.13 GC định kỳ
 
-`crypto_worker_thread`: `++gc_tick >= 2048` kể cả vòng idle → `fwd_crypto_frag_gc_worker_tick(w)`:
+Cùng tick 2048: `fwd_crypto_frag_gc_worker_tick` **và** `dataplane_udp_reorder_gc`.
 
-1. `clock_gettime` lần nữa.
-2. Worker 0: `flow_table_gc_slice` (bảng WAN/flow cũ, **không** phải reasm).
-3. Mọi worker: `crypto_option_frag_gc_all(0, w)` → `l2_udp_frag_gc` → `opt_table` (calloc nếu null) → `opt_frag_gc_table`: for i in 0..4095, nếu occupied && age>200ms → `memset` 3248B.
+Frag: `opt_table(..., 0)` — không calloc. `opt_frag_gc_table` slice **256** ô, `opt_clear_entry` metadata. Probe 8 vẫn GC tại chỗ.
 
-GC trong `opt_pick_slot` chỉ 8 ô đang probe. Full scan bắt ô không ai đụng (mảnh mồ côi đứng yên). 2048 vòng idle trên crypto core vẫn scan 13 MB.
+Reorder GC: slice 16 flow / tick — §16.9.
 
 ---
 
@@ -1302,33 +1406,30 @@ Một datagram cắt = 2 mảnh RX. iperf 1470, không VLAN, ráp thành công, 
 
 | Bước | A0 | A1 (join) |
 |------|----|-----------|
-| scratch copy wire | ~1500 | ~96 |
-| AES-GCM decrypt | 1451+16 | 47+16 |
-| memmove inner về 14 | 1451 | 47 |
-| clock_gettime | 1 | 1 |
-| probe 8 × đọc flag cuối struct | 8 | 8 |
-| memcpy vào bảng | 14+1451 | 47 |
-| memcpy join ra UMEM | — | 14+1451+47 |
-| memset entry 3248 | — (pending) | 3248 |
-| ne_frame_free | có | không |
-| snapshot wire_buf | 64 | 64 |
+| scratch copy wire | không (marker 4B) | không |
+| AES-GCM decrypt | shim+inner+16 | shim+half2+16 |
+| memmove inner về 14 | inner | half2 |
+| clock_gettime COARSE | 1 | 1 |
+| probe 8 | 8 | 8 |
+| memcpy vào bảng | eth+first | second |
+| memcpy join ra UMEM | — | eth+first+second |
+| opt_clear_entry | — (pending) | metadata |
+| ne_frame_free | có | không (frame join → reorder) |
 
 TX (chiều gửi, không phải ráp nhưng tạo input ráp): 2 AES encrypt, 1 `split_tail_take`, 2 `ne_ring_try_push`, alloc batch 32 khi cache cạn.
 
-False 0x5B: scratch copy + decrypt frag fail + restore + `decrypt_l2` (scratch lần nữa trong `decrypt_l2`).
+False 0x5B 1-byte trên TCP: không vào path UDP (thiếu marker 4B). Tagged fail = drop.
 
 ---
 
-### 16.8.15 Việc ráp **không** làm
+### 16.8.15 Việc **join** không làm (reorder làm ở §16.9)
 
-- Không reorder datagram theo 5-tuple / UDP seq / IP ID.
 - Không giữ UMEM (`held=0`).
 - Không sửa L3/L4 lúc join.
-- Không lock, không atomic trên `opt_entry`.
-- Không WRR lại hai mảnh; không đổi WAN lúc TX.
-- Không ráp TCP (MSS clamp 1500/30 → không `need_split`).
-- Không dùng `pqc_l2_handshake.c` list.
-- Timeout 200ms = GC orphan, không phải buffer sắp thứ tự.
+- Không lock trên `opt_entry`.
+- Không WRR lại hai mảnh.
+- Không ráp TCP.
+- Timeout 200ms = GC orphan join, **không** phải hold reorder.
 
 ---
 
@@ -1338,29 +1439,154 @@ Hành vi hiện tại, từng khâu — đổi khâu nào thì hệ quả đi th
 
 | Khâu | Việc đang làm | Hệ quả gắn với ráp |
 |------|----------------|-------------------|
-| Copy `first[1600]`/`second[1600]` | Không giữ UMEM | 2 memcpy/mảnh + join; pending không chiếm FQ; `memset` 3248B/join |
-| Flag/timestamp ở cuối struct 3248B | Probe đọc cuối ô | 8 cache miss / pick |
-| `held`/`out_addr` = 0 | API giữ frame không gắn | Join in-place frame mảnh sau; nhánh `dec==2` chết |
-| Scratch full frame trước mọi reasm | Rollback false 0x5B | Copy ~1500B cả khi ráp đúng |
-| `pkt_id` u16 global `fetch_add` | Không per-flow, không per-worker | Wrap theo tổng PPS cắt |
-| Probe 8 + evict oldest + `prepare_entry` clear | Không chain | Đầy cửa sổ 8 → loss nửa |
-| Timeout 200ms | GC orphan | Không phải reorder; tăng timeout không giảm OOO hold-gap |
-| Emit ngay khi `got_first && got_second` | Không seq datagram | Hold-gap với datagram khác |
-| `clock_gettime` / mảnh | ts từng store | |
-| GC `opt_table()` | calloc bảng trên tick | 13 MB/worker dù chưa có UDP cắt |
-| Full scan 4096 / 2048 vòng | kể cả idle | |
-| 2 mảnh cùng WAN+slot, TX 0 rồi 1 | | Ráp đúng; OOO 2 WAN do datagram khác path |
-| `need_split` +35 vs encrypt nguyên +30 | Cắt sớm hơn | Nhiều datagram vào bảng hơn mức “vượt MTU sau encrypt nguyên” |
-| `push_split` fail mảnh 1 sau mảnh 0 queued | không rollback | orphan 200ms = loss |
-| Jumbo / `pkt_len+35 ≤ 1500` | không vào bảng | hết ráp; một GCM |
+| Copy `first[]`/`second[]` | Không giữ UMEM | 2 memcpy/mảnh + join |
+| `held`/`out_addr` = 0 | API giữ frame không gắn | `dec==2` chết |
+| Key `(epoch, datagram_id, bond_seq)` | Không u16 global | Wrap u32 / worker |
+| Probe 8 + evict oldest | Không chain | Đầy cửa sổ 8 → loss nửa |
+| Timeout 200ms | GC orphan join | Không phải cửa sổ §16.9 |
+| Join xong `set_rx_meta` | Đưa seq cho reorder | Không TX LAN tại chỗ này |
+| `opt_clear_entry` metadata | Không memset 3248B | |
+| GC slice 256, `create=0` | Không calloc idle | |
+| 2 mảnh cùng WAN+slot | TX 0 rồi 1 | Ráp đúng |
+| `need_split` +47 | Cắt khi `pkt+47>mtu` | FULL UDP vẫn 0x104B+shim |
+| `push_split` fail mảnh 1 | không rollback | orphan 200ms = loss |
+| Jumbo / `pkt+47 ≤ mtu` | không vào bảng | FULL vẫn vào reorder |
 
-Bài D (1 WAN, 8.38G, OOO 45/71.3M): bảng + join không phải nguồn OOO hàng loạt. 2 WAN: hold-gap × WRR per-packet mới nổ. Tối ưu copy/probe/GC là CPU/latency; tối ưu OOO bonding là emit-policy hoặc hết cắt, không phải tăng timeout.
+Bài D: join không phải nguồn OOO hàng loạt. 2 WAN: lệch path sau join là việc **§16.9**, không tăng timeout 200ms.
+
+---
+
+## 16.9 Buffer giảm OOO UDP sau join
+
+Bonding vẫn **per-packet WRR** (§7). Đây không phải sticky WAN. Buffer nằm trên **crypto worker** sticky của flow, **sau** decrypt/join, **trước** FDB/`mid_to_local`.
+
+File: `inc/core/dataplane/udp_reorder.h`, `src/core/dataplane/udp_reorder.c`. Hook: `dataplane_process_wan` (`wan_ingress.c`). Seq TX: `dp_udp_next_tx_seq` (`crypto_route.c`) + TLS `crypto_option_udp_set_tx_seq` / `tx_meta` / `set_rx_meta` / `take_rx_meta` (`crypto_option_router.c`). Test: `tests/test_udp_reorder.c`. Stats: `[DP-STATS] udp_reorder ...` (`stats.c`). Init: `dataplane_udp_reorder_configure()` lúc spawn crypto. Exit worker: `dataplane_udp_reorder_reset`. Cùng tick 2048 với frag GC: `dataplane_udp_reorder_gc`.
+
+### 16.9.1 Ai vào buffer
+
+Chỉ khi **cả** các điều kiện:
+
+1. Frame vừa decrypt thành công (`dec==0`), đã policy_in / MSS clamp.
+2. `crypto_option_udp_take_rx_meta(&epoch, &seq)==0` — FULL hoặc vừa join (cùng `seq` hai mảnh).
+3. Inner IPv4 UDP parse được 5-tuple (`dp_parse_flow`).
+
+TCP, ARP, bypass, UDP meta fail → `forward_wan_to_local` như cũ. `take_rx_meta` **consume** TLS (một lần / datagram).
+
+`NE_UDP_REORDER=0`: `dp_udp_reorder_submit` emit ngay (`item_emit`), không hold.
+
+### 16.9.2 Seq trên dây — ba số khác nhau
+
+| Số | Nguồn | Việc |
+|----|--------|------|
+| `seq` (bond seq, u32) | `g_route_table[flow].udp_tx_seq[dir]` atomic `fetch_add` | Thứ tự datagram **một chiều** 5-tuple chuẩn hoá. Reorder so sánh cái này. |
+| `datagram_id` | TLS `g_udp_tx_datagram_clock++` trên worker encrypt | Key **join** hai mảnh. Không dùng reorder. |
+| `epoch` | atomic process-wide, random lần đầu (≠0) | Đổi epoch → `flow_reset` drop held cũ. |
+
+Chiều: `dp_route_key_parse_direction` chuẩn hoá IP/port; `dir` 0 hoặc 1. Hai chiều cùng 4-tuple có **hai** bộ đếm seq độc lập. `set_tx_seq` gán seq **và** cấp datagram_id mới mỗi datagram (kể cả FULL).
+
+Fallback: route set đầy → TLS `tls_udp_seq_fallback[256][4]` worker-local, không lock. Seq vẫn tăng.
+
+Hai mảnh một datagram: `l2_split` đọc `tx_meta` **một lần** — cùng seq. Reorder chỉ thấy datagram **sau** join.
+
+### 16.9.3 Cấu trúc per crypto worker (không lock)
+
+```
+UDP_REORDER_SETS = 128, WAYS = 4  → 512 flow / worker
+WINDOW = 256 seq slot / flow
+HELD_CAP = 8192 frame / worker
+START_BACKTRACK = 32   // flow mới: next_seq = first_seq - min(seq, 32)
+FLOW_IDLE = 60s        // GC xóa flow không held
+DEFAULT_HOLD = 2ms     // NE_UDP_REORDER_US clamp 100–20000 µs
+GC_SLICE = 16 flow / tick
+```
+
+`g_flows[W][512]`, `g_slots[W][512][256]` — mỗi slot giữ `ne_packet` (UMEM addr) + profile_pi + ingress_wan_dp.
+
+Hash 4-tuple (src/dst IP/port **không** chuẩn hoá — chiều RX LAN của máy nhận). Lookup: set 4-way, victim stamp LRU-ish; evict đếm `evicted`, `flow_drop_slots`.
+
+Epoch khác trên cùng key → `flow_reset` (drop held epoch cũ — test: seq held epoch cũ bị drop).
+
+### 16.9.4 `dp_udp_reorder_submit` — delta
+
+`seq_delta = (int32_t)(seq - next_seq)` (wrap u32).
+
+Trước so sánh: nếu đang có gap (`held && gap_since_ns`) và `now - gap_since >= hold_ns` → `flow_skip_gap`.
+
+| delta | Việc |
+|-------|------|
+| `< 0` | late / đã qua `next_seq` → **drop** (`late_or_duplicate`), `ne_frame_free` |
+| `== 0` | emit ngay (`udp_reorder_emit` → bind TX slot + `forward_wan_to_local`), `next_seq++`, `flow_flush_contiguous` (slot `next_seq % 256` khớp seq) |
+| `> 0` | future: `flow_make_window_room` nếu `delta >= 256`; nếu `held_by_worker >= 8192` skip-gap rồi vẫn đầy → drop `overflow`; store `g_slots[W][flow][seq % 256]`; nếu slot occupied cùng seq → drop dup; occupied seq khác → drop item cũ (`overflow`), ghi đè |
+
+Store lần đầu gap: `gap_since_ns = now`. `held++`. Stat `held`, `high_water`.
+
+`flow_skip_gap`: tìm seq held nhỏ nhất `delta>=0`, nhảy `next_seq` tới đó, cộng `gap_skipped` bằng số seq bỏ, rồi flush contiguous. Datagram thiếu **mất** với iperf (loss); gói tới muộn sau skip → late drop.
+
+`flow_make_window_room`: khi seq quá xa cửa sổ, skip_gap vòng cho tới khi `delta < 256`, hoặc gán `next_seq = seq - 255`.
+
+### 16.9.5 Emit / drop ops
+
+`udp_reorder_emit` (`wan_ingress.c`): `dp_out_ring_bind(dp_flow_pick_tx_slot(...))` rồi `forward_wan_to_local`. Fail emit → drop (free UMEM). `was_held` → stat `released`.
+
+`udp_reorder_drop`: `ne_dp_stats_wan_drop` + `ne_frame_free`. Submit **luôn** lấy ownership item.
+
+### 16.9.6 GC
+
+`dp_udp_reorder_gc`: 16 flow từ `gc_cursor`. Held + gap timeout → skip_gap. Không held + idle 60s → memset flow.
+
+Clock: `CLOCK_MONOTONIC_COARSE` (`dp_udp_reorder_now_ns`).
+
+### 16.9.7 Walk 2 WAN (ý đồ giảm OOO)
+
+```
+N.frag0 WAN0  → opt_table pending
+N+1 cả hai WAN1 → join N+1, reorder_submit(seq=N+1)
+                delta>0, hold N+1 trong window (không TX LAN)
+N.frag1 WAN0  → join N, reorder_submit(seq=N)
+                delta==0, emit N, flush N+1
+→ LAN: N rồi N+1  (iperf in-order)
+```
+
+Nếu N mất (mảnh không tới trong 2ms): skip_gap emit N+1, `gap_skipped`. N tới muộn → late drop. Hold 2ms ≪ join timeout 200ms: không chờ mảnh mồ côi 200ms trên LAN path.
+
+1 WAN bài D: join gần in-order, delta==0 hầu hết, hold ~0, OOO 45/71.3M gần như trước.
+
+### 16.9.8 Env và stats
+
+| Env | Ý |
+|-----|---|
+| `NE_UDP_REORDER=0` | tắt buffer, emit ngay |
+| `NE_UDP_REORDER_US` | hold µs, clamp 100–20000; default 2000 |
+
+`[DP-STATS] udp_reorder held= released= late_dup= gap_skip= overflow= evicted= held_high_water=`
+
+`held` đếm lần store (không phải depth hiện tại). `released` lần emit từ slot. `high_water` max `g_held_by_worker`.
+
+### 16.9.9 Việc buffer **không** làm
+
+- Không đổi WRR / không sticky WAN / không pick WAN lần 2.
+- Không ráp mảnh (vẫn `opt_table` 200ms).
+- Không TCP (không `set_rx_meta`).
+- Không lock cross-worker: 1 flow 1 crypto core nên 1 bảng.
+- Không chờ vô hạn: 2ms rồi skip-gap.
+- Window 256: burst OOO lớn hơn cửa sổ → skip/overflow.
+
+### 16.9.10 Test (`tests/test_udp_reorder.c`)
+
+Ops giả: emit ghi seq, drop đếm. Worker_idx=0.
+
+- Submit 0,2,1 → emit 0,1,2 (hold 2 tới khi 1).
+- Submit 1 rồi 0 → emit 0 rồi 1.
+- 0,2 rồi 3 sau 3ms (quá hold) → skip gap, emit 0,2,3 (mất 1).
+- Dup seq 0 → 1 emit, 1 drop.
+- Wrap `UINT32_MAX-1, MAX, 0, 1` + GC sau 3ms → emit 4 seq wrap.
+- Epoch đổi: held epoch cũ drop, seq mới emit.
 
 ---
 
 ## 17. Phân tích: vì sao 2 WAN OOO, 1 WAN thì không
 
-Luồng từng bước: **§18**. Dưới đây là hệ số trên đường đi hiện tại — chưa có reorder buffer, chưa jumbo.
+Luồng từng bước: **§18**. Hệ số: WRR 2 path × split ×2. **Đã có** buffer seq UDP sau join (§16.9, hold 2ms). Chưa jumbo. Bài D đo **trước** reorder; số OOO 2 WAN cũ (15–54%) là baseline không buffer.
 
 ### 17.1 Đối chứng bài D
 
@@ -1368,7 +1594,7 @@ Bài D: **cùng** L2 PQC, **cùng** `need_split`, **cùng** 2 AES encrypt + 2 AE
 
 Không phải AES làm hỏng thứ tự, không phải bảng reasm hỏng, không phải TX slot sticky hỏng, không phải “1 connect 1 crypto core” hỏng.
 
-Là `g_pkt_wrr_seq` rải datagram liên tiếp sang 2 NIC trong khi mỗi datagram đã nhân ×2 frame + ×2 crypto. Hai queue độc lập + hold-gap (A chờ frag1 WAN0, B đã join trên WAN1) + TX drain xen kẽ 2 WAN + không reorder buffer → iperf OOO.
+Là `g_pkt_wrr_seq` rải datagram liên tiếp sang 2 NIC trong khi mỗi datagram đã nhân ×2 frame + ×2 crypto. Hai queue độc lập + join-pending (A chờ frag1 WAN0, B đã join trên WAN1) — **trước §16.9** B TX LAN ngay. Sau §16.9 B hold tới A (hoặc 2ms skip-gap). 1 WAN bài D gần in-order sẵn nên buffer gần passthrough.
 
 Công thức nhân (iperf `-l 1470`, MTU 1500):
 
@@ -1379,8 +1605,9 @@ Công thức nhân (iperf `-l 1470`, MTU 1500):
   → 2 lần TX WAN  (cùng wan_dp, cùng tx_slot)
   → 2 lần RX WAN  (lệch delay nếu 2 datagram khác WAN)
   → 2 AES-GCM decrypt
-  → 1 join (hoặc hold-gap 200ms nếu thiếu mảnh)
-  → 1 datagram ra LAN
+  → 1 join
+  → take_rx_meta → reorder_submit (§16.9)
+  → 1 datagram ra LAN (in-order hoặc skip-gap 2ms)
 
 71.3M datagram bài D  →  ~142.6M frame wire  →  ~142.6M enc + ~142.6M dec
 ```
@@ -1395,16 +1622,16 @@ Công thức nhân (iperf `-l 1470`, MTU 1500):
 
 - Không gắn flow — stripe theo nhịp **xong encrypt**, không theo seq UDP.
 - Không gắn delay WAN — weight 50/50 kể cả khi một đường chậm hơn.
-- Header 0x104A không có seq bonding — máy nhận emit ngay khi join.
+- UDP 0x104B + shim GCM: `seq` per-flow; máy nhận reorder sau join (§16.9).
 - `fwd_wan_has_tx_room` fail thì drop, không thử WAN kia.
 - `tx_thread` drain `for wi in wans` — burst WAN0 rồi WAN1.
-- Split: pick một lần / datagram (hai mảnh cùng WAN); datagram k và k+1 có thể khác WAN → hold-gap.
+- Split: pick một lần / datagram (hai mảnh cùng WAN); datagram k và k+1 có thể khác WAN → join-pending rồi reorder.
 - Crypto worker pop `wan_to_mid` trước `local_to_mid` — chiều về xen chiều đi trên cùng core.
 
 Chỗ hệ số nằm:
 
-- **Split ×2** (`need_split` khi `pkt_len+35 > 1500`): mỗi datagram 2 AES + 2 frame + 1 join. Jumbo / payload nhỏ thì hết hold-gap; OOO còn lại chỉ lệch delay 2 WAN.
-- **Không reorder sau join:** UDP không có seq trên wire sau khi ráp; B ra LAN trước A nếu A còn pending mảnh.
+- **Split ×2** (`need_split` khi `pkt_len+47 > 1500`): mỗi datagram 2 AES + 2 frame + 1 join. Jumbo / payload nhỏ thì hết join; UDP FULL vẫn 0x104B+seq → reorder chỉ lệch delay 2 WAN (1 frame).
+- **Reorder sau join (§16.9):** hold 2ms / skip-gap; late drop. Tắt `NE_UDP_REORDER=0` = hành vi cũ emit ngay.
 - **Counter global:** 6 worker + nhiều stream cùng `fetch_add` làm lịch stripe một flow không đều.
 - **Ring đầy:** drop; 2 WAN chia hàng nên loss thấp hơn 1 WAN overrun, đổi lại OOO.
 - **TX xen 2 NIC:** thứ tự emit ≠ thứ tự datagram.
@@ -1449,9 +1676,10 @@ CPU 3–8  crypto_worker_thread[W]
        !fwd_wan_has_tx_room(wan_dp)?  DROP cả job (chưa encrypt)
        TCP? clamp MSS (UDP bỏ qua)
        encrypt_to_wan(..., wan_dp):
+         UDP: dp_udp_next_tx_seq → set_tx_seq
          need_split?  YES
          split_tail_take → frame UMEM thứ 2
-         crypto_option_split → AES frag1 rồi AES frag0 in-place
+         crypto_option_split → AES frag1 rồi AES frag0 (cùng epoch/seq/datagram_id)
          push_split_to_wan(frag0, frag1, wan_dp)  // CÙNG wan_dp, CÙNG S
          return 1  → caller KHÔNG push_to_wan lần nữa
      │
@@ -1467,7 +1695,7 @@ CPU 1/2/9/10  tx_thread[S]
      → sendto / XDP TX lên NIC wan_dp
      │
      ▼
-[dây WAN 0 hoặc WAN 1]  2 frame 0x104A + magic 0x5B, cùng pkt_id, frag 0 rồi 1
+[dây WAN 0 hoặc WAN 1]  2 frame 0x104B + marker 5BUD01 + shim (cùng epoch/seq/datagram_id, kind 0 rồi 1)
      │
      ▼
 Máy nhận  CPU 11  wan_rx_thread
@@ -1476,12 +1704,14 @@ Máy nhận  CPU 11  wan_rx_thread
      ▼
 crypto_worker_thread[W]  (máy nhận)
      dataplane_process_wan
-     decrypt_wan → wan_try_l2_pqc_frag
-       AES decrypt mảnh
-       l2_reassemble bảng g_tables[profile][W]
-       mảnh 1/2: pending → free frame, KHÔNG TX LAN   (hold-gap)
-       đủ 2 mảnh: join → 1 Ethernet IPv4 UDP gốc
-     forward_wan_to_local → mid_to_local[li][S']
+     decrypt_wan → wan_try_l2_pqc_udp
+       AES decrypt + parse shim
+       FULL: set_rx_meta, không opt_table
+       FRAG: l2_reassemble g_tables[profile][W]
+       mảnh 1/2: pending → free frame, chưa reorder
+       đủ 2 mảnh: join → set_rx_meta
+     take_rx_meta → dp_udp_reorder_submit   // hold 2ms / emit in-order
+       emit → forward_wan_to_local → mid_to_local[li][S']
      │
      ▼
 tx_thread  TX LAN → client iperf
@@ -1571,33 +1801,30 @@ for wi = 0 .. wan_count-1:
 - Burst WAN0 có thể phun nhiều datagram chẵn trước khi WAN1 được drain → phía dây: chùm WAN0 rồi chùm WAN1, hoặc ngược lại tùy độ đầy ring.
 - 1 WAN (`wan_count==1`): vòng `for wi` chỉ một NIC → thứ tự ring = thứ tự encrypt = thứ tự datagram (frag0 rồi frag1 từng cặp) → bài D OOO ~0.
 
-### 18.6 Máy nhận — decrypt ×2, hold-gap, không reorder
+### 18.6 Máy nhận — decrypt ×2, join, rồi reorder
 
-WAN RX **không** pick WAN. `dp_crypto_pick_wan_worker` đọc byte 15 → đúng core W (bảng reasm per worker).
+WAN RX **không** pick WAN. `dp_crypto_pick_wan_worker` đọc byte 15 → đúng core W.
 
 `decrypt_wan`:
 
-- `wan_try_l2_pqc_frag` nếu magic 0x5B: AES mảnh + `l2_reassemble`.
-- `pending==1` (dec return 1): free frame ingress, **không** `forward_wan_to_local` — datagram chưa ra LAN.
-- `pending==2` (held): tương tự, frame giữ trong table (hiện copy-based, `reasm_held` thường 0 — xem §16).
-- Join xong (dec 0): một IPv4 UDP → `forward_wan_to_local` ngay. **Không** so sánh seq với datagram trước.
-
-Hold-gap 2 WAN:
+- `wan_try_l2_pqc_udp` nếu marker 4B: AES + `l2_udp_reasm` (FULL hoặc join).
+- `pending==1`: free frame ingress, chưa reorder.
+- Join/FULL (`dec==0`): `take_rx_meta` → `dp_udp_reorder_submit` (§16.9).
 
 ```
-t0  WAN0 RX  N.frag0   → store first, pending, không TX LAN
+t0  WAN0 RX  N.frag0   → store first, pending
 t1  WAN1 RX  N+1.frag0 → store
-t2  WAN1 RX  N+1.frag1 → join N+1 → TX LAN   // iperf thấy N+1 trước
-t3  WAN0 RX  N.frag1   → join N → TX LAN     // OOO
+t2  WAN1 RX  N+1.frag1 → join N+1 → reorder hold (seq N+1)
+t3  WAN0 RX  N.frag1   → join N → emit N, flush N+1
 ```
 
-1 WAN bài D: N.frag0, N.frag1 thường kề nhau trên cùng NIC → join N trước N+1 → 45 OOO / 71.3M.
+Trước §16.9 bước t2 TX LAN N+1 = OOO. 1 WAN bài D: N rồi N+1 gần in-order, hold gần 0.
 
-`crypto_worker` pop `wan_to_mid` **trước** `local_to_mid`: chiều về được ưu tiên decrypt. Không khôi phục thứ tự cross-WAN.
+`crypto_worker` pop `wan_to_mid` trước `local_to_mid`. Reorder per-worker, không lock.
 
 ### 18.7 Bypass và TCP trên cùng per-packet
 
-Bypass: RX LAN **không** vào crypto 3–8. `dataplane_process_local` trên CPU 0 vẫn `fwd_wan_pick_for_local` + `push_to_wan` — **cùng** `g_pkt_wrr_seq`. 1 datagram = 1 frame, không ×2. OOO 2 WAN lúc đó chỉ lệch path, không hold-gap.
+Bypass: RX LAN **không** vào crypto 3–8. `dataplane_process_local` trên CPU 0 vẫn `fwd_wan_pick_for_local` + `push_to_wan` — **cùng** `g_pkt_wrr_seq`. 1 datagram = 1 frame, không ×2, **không** shim seq → không vào §16.9. OOO 2 WAN lúc đó chỉ lệch delay path.
 
 TCP: MSS clamp 1500/30 → không split. Vẫn per-packet WRR mỗi segment. TCP stack tự SACK/reorder; iperf TCP không in “datagrams out-of-order”. Một thời kỳ sticky WAN từng đưa cả TCP lên một NIC.
 
@@ -1608,7 +1835,7 @@ TCP: MSS clamp 1500/30 → không split. Vẫn per-packet WRR mỗi segment. TCP
 3. Hàm pick live không đọc 5-tuple (tham số `(void)`).
 4. `g_pkt_wrr_seq` tăng mỗi datagram khi `n>=2`, mọi flow/worker dùng chung.
 5. Crypto worker + TX slot sticky theo flow — không phải gộp kênh.
-6. Không có seq bonding trên 0x104A — máy nhận không sắp lại sau 2 path.
+6. UDP 0x104B shim `seq` + buffer §16.9 trên crypto worker — **không** sticky WAN.
 7. TCP clamp / ARP 0x1048 / `worker_idx` byte 15 độc lập với WRR WAN.
 
 ---
@@ -1626,7 +1853,7 @@ Lớp DB (`src/db/*`, `schema.sql`) vẫn parse action L3/L4 và method `aes-ctr
 | **A. Encrypt option** | `CRYPTO_OPT_L2_PQC` / `CRYPTO_OPT_BYPASS` | `encrypt_to_wan` hardcode L2 PQC. Bypass = không gọi option encrypt. Không có `options/l3*.c` / `l4*.c` |
 | **B. AES-GCM primitive** | `trf_encrypt_payload_gcm` / decrypt trong `traffic_crypto.c` | Live. Mọi payload L2 PQC (TCP/UDP/ICMP/OSPF/ARP) GCM 256 + tag 16B + nonce 12B. Khác `CRYPTO_MODE_GCM` trên policy |
 | **C. Policy struct + DB** | `ENCRYPT_L3/L4`, `CRYPTO_MODE_CTR/GCM`, `ne_parse_method`, `cp->aes_bits`, `cp->key[]` | Load DB parse rồi coerce L2+PQC. Core encrypt không đọc mode/key. Parser/schema không thuộc dataplane |
-| **D. Handshake L2 vs L3** | `pqc_handshake.c`: `is_bridge_mode` → Ethernet 0x88B5/0x88B6; `is_tunnel` → UDP `:7090` `[PQC-HS-L3]` | Bridge = HS L2. HS L3 là trao key kiểu tunnel, không mã hóa payload L3 |
+| **D. Handshake VPN tunnel** | `pqc_handshake.c`: UDP `:7090` trên IP `pqc_exchange_tunnels` `[PQC-HS-L3]`. Không tunnel → không HS | HS chỉ trao key. Encrypt dataplane vẫn L2 PQC 0x104A/0x104B |
 
 Tóm tắt live encrypt LAN→WAN:
 
@@ -1746,11 +1973,11 @@ Router `CALL_OPS` → `pqc_l2_option.c`:
 - UDP: `l2_udp_need_split` / `l2_split` / `l2_udp_encrypt`.
 - ARP: `arp_bridge` gọi `crypto_option_encrypt(L2_PQC, ARP)` → `l2_do_encrypt_arp` ethertype **0x1048**, payload ARP 28B.
 
-**WAN decrypt** `decrypt_wan` → `wan_try_l2_pqc_frag` (UDP 0x5B) hoặc `decrypt_l2` → `crypto_option_decrypt(L2_PQC, TCP)` (gói nguyên dùng ops TCP; UDP nguyên `l2_udp_decrypt` = `l2_do_decrypt`).
+**WAN decrypt** `decrypt_wan` → `wan_try_l2_pqc_udp` (0x104B + marker 4B) hoặc `decrypt_l2` (TCP/ICMP 0x104A). UDP FULL: `l2_udp_decrypt` / `l2_do_decrypt_udp` + `set_rx_meta`.
+
+TLS option: `crypto_option_bind_worker_idx` / `g_worker_idx` — ghi byte 15. UDP: `g_udp_epoch`, TLS `g_udp_tx_seq` / `datagram_id` / `g_udp_rx_*`. `g_opt_frag_mtu` — `need_split`.
 
 **Bypass live:** `dataplane_local_needs_mid` false → RX CPU 0 `dataplane_process_local` → `push_to_wan`. **Không** `crypto_opt_bypass_encrypt`. File `bypass.c` chỉ no-op ops cho registry.
-
-TLS option: `crypto_option_bind_worker_idx` / `g_worker_idx` — ghi byte 15. `g_opt_pkt_id` atomic — `pkt_id` fragment. `g_opt_frag_mtu` — `need_split`.
 
 `crypto_option_wire_overhead(L2_PQC)=30` (1+1+12+16). MSS clamp TCP dùng số này.
 
@@ -1764,20 +1991,16 @@ Key dataplane **không** nằm `cp->key`. Nằm `policy_key_binding_t` (`pqc_han
 |-------------|------|
 | `encrypt_key` / `decrypt_key` / `keys[3]` | master sau ML-KEM; diversify per policy |
 | `key_ready` | 0 → ctx all-zero → L2 encrypt **fail** (đúng) |
-| `is_tunnel` | 1 → nhánh UDP 7090 `[PQC-HS-L3]` |
-| `wan_ifname`, `peer_ip` | L2 bridge: ifname set, peer 0.0.0.0 → `is_bridge_mode` |
-| `role_mode` | DYNAMIC so MAC (L2) hoặc IP (L3 tunnel) |
-| `hs_cache[]` | **chỉ L3 tunnel** idempotent HELLO |
+| `is_tunnel` | bắt buộc 1: HS UDP 7090 trên VPN tunnel; không tunnel → không bind |
+| `wan_ifname`, `peer_ip` | tên interface tunnel + IP peer tunnel; `wan_ifname` để ioctl IP local khi DYNAMIC |
+| `role_mode` | DYNAMIC so IP trên tunnel |
+| `hs_cache[]` | idempotent HELLO trên tunnel |
 
-`struct pqc_hs_msg`: magic `PQCH`, HELLO/RESP/KEEPALIVE/POKE. Payload KEM + ML-DSA. **Cùng format** trên L2 frame (sau `pqc_l2_hdr`+frag) và trên UDP 7090.
+`struct pqc_hs_msg`: magic `PQCH`, HELLO/RESP/KEEPALIVE/POKE. Payload KEM + ML-DSA. Chỉ đi UDP `:7090` trên IP tunnel.
 
-`struct pqc_l2_hdr` / `pqc_frag_hdr` / `pqc_l2_peer` / `pqc_l2_reassemble` — **transport** handshake, ethertype **0x88B5/0x88B6**, không phải 0x104A traffic.
-
-Hàm bind: `sig_pqc_bind_policy`, `sig_pqc_diversify_key`, `sig_pqc_load_and_bind_policy` (DB). Worker: `is_bridge_mode` → `pqc_l2_*`; else `pqc_hs_send_l3_*`, `L3_KEY_ROTATION_INTERVAL_MS` (~50 phút). L2 rotate: `KEY_ROTATION_INTERVAL_MS` = 30 ngày.
+Hàm bind: `sig_pqc_bind_policy`, `sig_pqc_diversify_key`, `sig_pqc_load_and_bind_policy` (DB). Không có `pqc_exchange_tunnels` → không handshake, log ERROR. Rotate `KEY_ROTATION_INTERVAL_MS` = 1 tháng, log per policy. Key ra vẫn dùng encrypt **L2 PQC** trên dataplane.
 
 `trf_kem_*`, `trf_dsa_*`, `trf_derive_session_keys`, `trf_calculate_hmac` — KEM/DSA/HMAC của handshake, không phải AES-CTR dataplane.
-
-`is_tunnel` bật nhánh UDP 7090, cache HELLO, `L3_KEY_ROTATION_INTERVAL_MS` ~50 phút. Bridge (`is_bridge_mode`) dùng raw Ethernet 0x88B5/0x88B6 và `KEY_ROTATION_INTERVAL_MS` = 30 ngày.
 
 ---
 
@@ -1807,7 +2030,7 @@ POLICY_ACTION_ENCRYPT_L3 / L4   // sau coerce: action!=BYPASS → L2 PQC
 
 WAN pick live: `flow_table_pick_wan_per_packet` + `g_pkt_wrr_seq`. `flow_table_get_wan` / `get_wan_profile` / window/drain không có caller dataplane; `fwd_crypto_flow_table*` vẫn alloc table và GC.
 
-File `*.orig` (`forwarder.c`, `crypto_route`, `flow_table`) không compile. `inc/crypto/pqc_*.h` phần lớn là stub `#include` bản `src/crypto/pqc/include/`. Comment `eth_parse.h` ghi 0x88B5 là marker IP — thực tế 0x88B5 là HS discovery; traffic là 0x104A.
+File `*.orig` (`forwarder.c`, `crypto_route`, `flow_table`) không compile. `inc/crypto/pqc_*.h` phần lớn là stub `#include` bản `src/crypto/pqc/include/`. Marker encrypt: 0x104A/0x104B (`crypto_eth_l2_has_marker`).
 
 `bypass.c`: năm export (`tcp/udp/icmp/ospf/other`) trỏ cùng `bypass_ops`. Dataplane bypass không gọi các hàm này — policy BYPASS đi RX thread.
 
@@ -1817,7 +2040,7 @@ File `*.orig` (`forwarder.c`, `crypto_route`, `flow_table`) không compile. `inc
 
 ### 19.5 File crypto dataplane
 
-Mã hóa traffic: `pqc_l2_option.c`. Dispatch: `crypto_option_router.c`, `crypto_option_registry.c`. Wire: `eth_parse.c`. Key slot: `packet_crypto.c`. AEAD: `crypto_pqc_layer.h` → `trf_*_gcm`. Handshake: `pqc_handshake.c`, `pqc_l2_handshake.c`. Dataplane: `local_egress.c`, `wan_ingress.c`, `arp_bridge.c`, `crypto_runtime.c`. Bypass registry: `bypass.c` + `opt_no_frag_ops.c`.
+Mã hóa traffic: `pqc_l2_option.c`. Dispatch: `crypto_option_router.c`, `crypto_option_registry.c`. Wire: `eth_parse.c`. Key slot: `packet_crypto.c`. AEAD: `crypto_pqc_layer.h` → `trf_*_gcm`. Handshake: `pqc_handshake.c` (UDP :7090 trên tunnel). Dataplane: `local_egress.c`, `wan_ingress.c`, `arp_bridge.c`, `crypto_runtime.c`. Bypass registry: `bypass.c` + `opt_no_frag_ops.c`.
 
 Không có `src/crypto/options/l3*.c`, `l4*.c`, `ctr*.c`.
 
@@ -1970,7 +2193,7 @@ Hai NIC khác MTU (LAN 1500, WAN 9000, hoặc ngược): **cùng** drv+COPY, **c
 
 Encrypt vẫn L2 PQC + COPY không liên quan. Khác nhau ở **độ dài frame** và **có cắt UDP không**:
 
-- Ra WAN MTU 1500: `need_split` như hiện tại (`pkt_len+35 > 1500`).
+- Ra WAN MTU 1500: `need_split` (`pkt_len+47 > 1500`). UDP không cắt vẫn 0x104B+shim FULL.
 - Ra WAN MTU 9000: datagram UDP lớn có thể **một** GCM, không vào bảng reasm.
 - Bonding per-packet: datagram N → WAN0 (1500) vẫn cắt; N+1 → WAN1 (9000) không cắt — cùng flow, cùng worker. `resolve_runtime_frag_mtu` **min toàn cục 1500** hiện tại ép mọi WAN như 1500; song song 1500/9000 cần MTU **theo WAN đích** (hoặc min các WAN đang mang gói đó), không chọn một số 1500 *hoặc* 9000 cho cả process.
 

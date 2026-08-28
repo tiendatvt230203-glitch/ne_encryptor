@@ -35,8 +35,7 @@
 #define PQC_HS_CACHE_SLOTS 4
 #define MAX_IDENTITY_REGISTRY 100
 #define MAX_POLICY_BINDINGS 128
-#define MAX_L2_DISPATCHERS 16
-#define PQC_USE_DYNAMIC_ROLE  1 // 1 = Dynamic (compare IP/MAC), 0 = Static (DB configured)
+#define PQC_USE_DYNAMIC_ROLE  1 // 1 = Dynamic (compare tunnel IP), 0 = Static (DB configured)
 
 typedef enum {
     PQC_ROLE_RESPONDER = 0,
@@ -61,8 +60,7 @@ typedef struct {
     uint8_t src_mac[6];
 } pqc_rx_pkt_info_t;
 
-/* L3 responder state for idempotent HELLO handling.  L2 keeps its existing
- * handshake flow and does not use this cache. */
+/* Tunnel responder state for idempotent HELLO handling. */
 typedef struct {
     uint8_t *response;
     uint32_t session_id;
@@ -134,12 +132,6 @@ typedef struct {
     bool is_tunnel;
     volatile bool thread_exit_sig;
 } policy_key_binding_t;
-
-typedef struct {
-    char ifname[64];
-    pthread_t thread;
-    bool running;
-} l2_dispatcher_t;
 
 #pragma pack(push, 1)
 struct pqc_hs_msg {
@@ -227,5 +219,8 @@ void sig_pqc_prepare_reload(void);
 void sig_pqc_finalize_reload(void);
 
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
+
+struct app_config;
+void pqc_handshake_start_all_profiles(struct app_config *cfg);
 
 #endif
