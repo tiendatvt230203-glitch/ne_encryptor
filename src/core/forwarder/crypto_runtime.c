@@ -95,6 +95,45 @@ static struct flow_table profile_flow_tables[MAX_PROFILES];
 static int profile_flow_table_ready[MAX_PROFILES];
 static int profile_flow_profile_id[MAX_PROFILES];
 
+#define NE_PQC_KEY_LIFETIME_MS (30ULL * 24ULL * 60ULL * 60ULL * 1000ULL)
+
+static int ne_key_nonzero(const uint8_t *key, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (key[i])
+            return 1;
+    }
+    return 0;
+}
+
+static void ne_wipe_key(uint8_t *key, size_t len)
+{
+    volatile uint8_t *p = key;
+
+    while (len--)
+        *p++ = 0;
+}
+
+/* policy_crypto_lock must be held. Clock starts only after NE encrypts. */
+static void ne_pqc_on_key_material(struct packet_crypto_ctx *ctx)
+{
+    if (!ctx || !ctx->pqc_from_handshake)
+        return;
+    if (!ne_key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ)) {
+        ctx->pqc_key_in_use_ms = 0;
+        ctx->pqc_rekey_sent = false;
+        ne_wipe_key(ctx->pqc_timed_key, PQC_TRAFFIC_KEY_SZ);
+        return;
+    }
+    if (memcmp(ctx->keys[KEY_SLOT_CURRENT], ctx->pqc_timed_key,
+               PQC_TRAFFIC_KEY_SZ) == 0)
+        return;
+
+    ctx->pqc_key_in_use_ms = 0;
+    ctx->pqc_rekey_sent = false;
+    ne_wipe_key(ctx->pqc_timed_key, PQC_TRAFFIC_KEY_SZ);
+}
+
 int fwd_crypto_profile_slot_for_id(int profile_id)
 {
     if (profile_flow_table_ready[0] && profile_flow_profile_id[0] == profile_id)
@@ -187,6 +226,195 @@ void fwd_crypto_maybe_expire_prev_grace(void)
         prev_grace_active = 0;
 }
 
+void fwd_crypto_note_pqc_key_used(struct packet_crypto_ctx *ctx)
+{
+    uint8_t wire;
+    uint64_t now;
+    int i;
+    struct packet_crypto_ctx *master;
+
+    if (!ctx || !ctx->pqc_from_handshake)
+        return;
+    wire = ctx->wire_id;
+    if (ctx->pqc_key_in_use_ms != 0)
+        return;
+    if (!ne_key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
+        return;
+
+    now = monotonic_ms();
+    pthread_mutex_lock(&policy_crypto_lock);
+    i = policy_index_by_wire_id[wire];
+    master = (i >= 0 && i < active_policy_count && policy_crypto_ready[i])
+        ? &policy_crypto_ctx[i] : NULL;
+    /* A packet may finish on an old worker snapshot while a rekey/reload is
+     * being published. Never let that stale packet start the new key's clock. */
+    if (!master || master->policy_id != ctx->policy_id ||
+        master->pqc_key_in_use_ms != 0 ||
+        memcmp(master->keys[KEY_SLOT_CURRENT], ctx->keys[KEY_SLOT_CURRENT],
+               PQC_TRAFFIC_KEY_SZ) != 0 ||
+        !ne_key_nonzero(master->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ)) {
+        pthread_mutex_unlock(&policy_crypto_lock);
+        return;
+    }
+
+    memcpy(master->pqc_timed_key, master->keys[KEY_SLOT_CURRENT],
+           PQC_TRAFFIC_KEY_SZ);
+    master->pqc_key_in_use_ms = now;
+    master->pqc_rekey_sent = false;
+    atomic_fetch_add_explicit(&policy_crypto_generation, 1u, memory_order_release);
+
+    fprintf(stderr,
+            "[NE-PQC] Policy %d session key is in RAM and in use; lifetime clock started.\n",
+            master->policy_id);
+    pthread_mutex_unlock(&policy_crypto_lock);
+}
+
+void fwd_crypto_discard_pqc_prev_key(int policy_id)
+{
+    int discarded = 0;
+
+    pthread_mutex_lock(&policy_crypto_lock);
+    for (int i = 0; i < active_policy_count; i++) {
+        if (!policy_crypto_ready[i] ||
+            policy_crypto_ctx[i].policy_id != policy_id)
+            continue;
+        if (ne_key_nonzero(policy_crypto_ctx[i].keys[KEY_SLOT_PREV],
+                           PQC_TRAFFIC_KEY_SZ)) {
+            ne_wipe_key(policy_crypto_ctx[i].keys[KEY_SLOT_PREV],
+                        PQC_TRAFFIC_KEY_SZ);
+            atomic_fetch_add_explicit(&policy_crypto_generation, 1u,
+                                      memory_order_release);
+            discarded = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&policy_crypto_lock);
+
+    if (discarded)
+        sig_pqc_discard_prev_key(policy_id);
+}
+
+void fwd_crypto_pqc_key_lifetime_tick(void)
+{
+    uint64_t now = monotonic_ms();
+    int request_ids[MAX_CRYPTO_POLICIES];
+    uint64_t request_started[MAX_CRYPTO_POLICIES];
+    int nreq = 0;
+
+    pthread_mutex_lock(&policy_crypto_lock);
+    for (int i = 0; i < active_policy_count; i++) {
+        uint64_t started;
+
+        if (!policy_crypto_ready[i] ||
+            policy_crypto_ctx[i].crypto_mode != CRYPTO_MODE_PQC ||
+            !policy_crypto_ctx[i].pqc_from_handshake)
+            continue;
+        started = policy_crypto_ctx[i].pqc_key_in_use_ms;
+        if (started == 0 || now < started ||
+            now - started < NE_PQC_KEY_LIFETIME_MS)
+            continue;
+        if (policy_crypto_ctx[i].pqc_rekey_sent)
+            continue;
+        policy_crypto_ctx[i].pqc_rekey_sent = true;
+        request_ids[nreq++] = policy_crypto_ctx[i].policy_id;
+        request_started[nreq - 1] = started;
+        fprintf(stderr,
+                "[NE-PQC] Policy %d session key lifetime expired; requesting PQC handshake for a new key.\n",
+                policy_crypto_ctx[i].policy_id);
+    }
+    pthread_mutex_unlock(&policy_crypto_lock);
+
+    for (int k = 0; k < nreq; k++) {
+        if (sig_pqc_request_new_session(request_ids[k]) == 0)
+            continue;
+        /* Binding may be transiently unavailable during reload/handshake.
+         * Re-arm only if this is still the same expired key generation. */
+        pthread_mutex_lock(&policy_crypto_lock);
+        for (int i = 0; i < active_policy_count; i++) {
+            if (policy_crypto_ready[i] &&
+                policy_crypto_ctx[i].policy_id == request_ids[k] &&
+                policy_crypto_ctx[i].pqc_key_in_use_ms == request_started[k]) {
+                policy_crypto_ctx[i].pqc_rekey_sent = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&policy_crypto_lock);
+    }
+}
+
+int fwd_crypto_format_pqc_key_times(char *out, size_t out_max, int policy_id)
+{
+    uint64_t now;
+    int found = -1;
+    uint64_t started;
+    uint64_t rem_ms;
+    uint64_t days;
+    uint64_t hours;
+    uint64_t mins;
+
+    if (!out || out_max == 0)
+        return -1;
+    out[0] = '\0';
+    if (policy_id <= 0) {
+        snprintf(out, out_max, "NO-ENCRYPT\n");
+        return 0;
+    }
+
+    pthread_mutex_lock(&policy_crypto_lock);
+    for (int i = 0; i < active_policy_count; i++) {
+        if (active_policies[i].db_id == policy_id ||
+            policy_crypto_ctx[i].policy_id == policy_id) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0) {
+        pthread_mutex_unlock(&policy_crypto_lock);
+        snprintf(out, out_max, "POLICY-NOT-FOUND\n");
+        return 0;
+    }
+    if (active_policies[found].action == POLICY_ACTION_BYPASS ||
+        active_policies[found].crypto_mode != CRYPTO_MODE_PQC) {
+        pthread_mutex_unlock(&policy_crypto_lock);
+        snprintf(out, out_max, "NO-ENCRYPT\n");
+        return 0;
+    }
+
+    if (!policy_crypto_ready[found] ||
+        policy_crypto_ctx[found].crypto_mode != CRYPTO_MODE_PQC ||
+        !policy_crypto_ctx[found].pqc_from_handshake ||
+        !ne_key_nonzero(policy_crypto_ctx[found].keys[KEY_SLOT_CURRENT],
+                        PQC_TRAFFIC_KEY_SZ)) {
+        pthread_mutex_unlock(&policy_crypto_lock);
+        snprintf(out, out_max, "no session key\n");
+        return 0;
+    }
+    started = policy_crypto_ctx[found].pqc_key_in_use_ms;
+    pthread_mutex_unlock(&policy_crypto_lock);
+    now = monotonic_ms();
+
+    if (started == 0) {
+        snprintf(out, out_max, "unused (timer not started)\n");
+        return 0;
+    }
+    if (now >= started && now - started >= NE_PQC_KEY_LIFETIME_MS) {
+        snprintf(out, out_max, "expired (requesting new key)\n");
+        return 0;
+    }
+    rem_ms = NE_PQC_KEY_LIFETIME_MS - (now > started ? now - started : 0);
+    /* Round up to the displayed minute so a freshly started key shows the
+     * full 30 days instead of 29 days 23 hours 59 minutes. */
+    rem_ms = ((rem_ms + 59999ULL) / 60000ULL) * 60000ULL;
+    days = rem_ms / (24ULL * 60ULL * 60ULL * 1000ULL);
+    hours = (rem_ms / (60ULL * 60ULL * 1000ULL)) % 24ULL;
+    mins = (rem_ms / (60ULL * 1000ULL)) % 60ULL;
+    snprintf(out, out_max, "%llu day%s %llu hour%s %llu minute%s\n",
+             (unsigned long long)days, days == 1 ? "" : "s",
+             (unsigned long long)hours, hours == 1 ? "" : "s",
+             (unsigned long long)mins, mins == 1 ? "" : "s");
+    return 0;
+}
+
 void fwd_crypto_clear_grace(void)
 {
     prev_grace_active = 0;
@@ -228,6 +456,7 @@ void forwarder_pre_diversify_pqc_keys(int profile_id)
         if (policy_crypto_ctx[i].profile_id != profile_id)
             continue;
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+        ne_pqc_on_key_material(&policy_crypto_ctx[i]);
     }
     policy_crypto_publish_unlock();
 }
@@ -267,6 +496,7 @@ void fwd_crypto_sync_pqc_session_keys(const struct app_config *cfg)
 
             /* HS not ready (UI đổi key / re-handshake fail) → wipe stale session key now. */
             packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[ctx_i]);
+            ne_pqc_on_key_material(&policy_crypto_ctx[ctx_i]);
         }
     }
     policy_crypto_publish_unlock();
@@ -276,14 +506,14 @@ int fwd_crypto_rebuild(struct app_config *cfg)
 {
     struct packet_crypto_ctx old_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
     int old_policy_crypto_ready[MAX_CRYPTO_POLICIES];
-    int old_policy_index_by_wire_id[256];
+    struct crypto_policy old_policies[MAX_CRYPTO_POLICIES];
     int old_active_policy_count;
 
     pthread_mutex_lock(&policy_crypto_lock);
     old_active_policy_count = active_policy_count;
     memcpy(old_policy_crypto_ctx, policy_crypto_ctx, sizeof(old_policy_crypto_ctx));
     memcpy(old_policy_crypto_ready, policy_crypto_ready, sizeof(old_policy_crypto_ready));
-    memcpy(old_policy_index_by_wire_id, policy_index_by_wire_id, sizeof(old_policy_index_by_wire_id));
+    memcpy(old_policies, active_policies, sizeof(old_policies));
 
     memset(policy_crypto_ready, 0, sizeof(policy_crypto_ready));
     memset(active_policies, 0, sizeof(active_policies));
@@ -319,14 +549,24 @@ int fwd_crypto_rebuild(struct app_config *cfg)
             policy_index_by_wire_id[(uint8_t)cp->id] = i;
 
         int reused = 0;
-        if (cp->id >= 0 && cp->id <= 255) {
-            int old_i = old_policy_index_by_wire_id[(uint8_t)cp->id];
-            if (old_i >= 0 && old_i < old_active_policy_count && old_policy_crypto_ready[old_i]) {
+        {
+            int old_i = -1;
+            for (int oi = 0; oi < old_active_policy_count; oi++) {
+                if (old_policy_crypto_ready[oi] &&
+                    old_policies[oi].db_id == cp->db_id) {
+                    old_i = oi;
+                    break;
+                }
+            }
+            if (old_i >= 0) {
                 policy_crypto_ctx[i] = old_policy_crypto_ctx[old_i];
                 policy_crypto_ready[i] = 1;
                 reused = 1;
                 policy_crypto_ctx[i].pqc_from_handshake = true;
+                policy_crypto_ctx[i].wire_id = (uint8_t)cp->id;
+                policy_crypto_ctx[i].policy_id = cp->db_id;
                 packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+                ne_pqc_on_key_material(&policy_crypto_ctx[i]);
             }
         }
         if (reused)
@@ -341,6 +581,7 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         policy_crypto_ready[i] = 1;
         /* Only populate keys when handshake key_ready; else keep all-zero (block TX/RX). */
         packet_crypto_refresh_pqc_keys(&policy_crypto_ctx[i]);
+        ne_pqc_on_key_material(&policy_crypto_ctx[i]);
     }
 
     if (cfg->profile_count > 0) {

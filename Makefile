@@ -44,19 +44,26 @@ BPF_OBJ = $(LIB_DIR)/lan.o \
 
 .PHONY: all clean dirs test
 
-TEST_BINS = tests/test_wan_smooth.bin tests/test_udp_reorder.bin
+TEST_BINS = tests/test_wan_smooth.bin tests/test_udp_reorder.bin \
+	    tests/test_pqc_key_cutover.bin
 
 all: dirs $(BPF_OBJ) $(TARGET)
 
 test: $(TEST_BINS)
 	./tests/test_wan_smooth.bin
 	./tests/test_udp_reorder.bin
+	./tests/test_pqc_key_cutover.bin
 
 tests/test_wan_smooth.bin: tests/test_wan_smooth.c src/core/flow/flow_table.c
 	$(CC) $(CFLAGS) -Wextra -Werror $^ -lpthread -o $@
 
 tests/test_udp_reorder.bin: tests/test_udp_reorder.c src/core/dataplane/udp_reorder.c
 	$(CC) $(CFLAGS) -Wextra -Werror $^ -lpthread -o $@
+
+tests/test_pqc_key_cutover.bin: tests/test_pqc_key_cutover.c src/crypto/pqc/traffic_crypto.c
+	$(CC) $(CFLAGS) -Wextra -Werror -Wno-override-init \
+		-Wno-unused-parameter $^ -Wl,-rpath,'$$ORIGIN/../lib' \
+		./lib/libssl.so.3 ./lib/libcrypto.so.3 ./lib/libscrypt.so -o $@
 
 $(TARGET): $(APP_OBJ) $(DB_OBJ)
 	$(CC) -o $@ $(APP_OBJ) $(DB_OBJ) $(LDFLAGS)

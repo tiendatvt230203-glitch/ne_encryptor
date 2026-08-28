@@ -34,6 +34,7 @@ static void dp_maint_tick(struct forwarder *fwd)
     if (!fwd)
         return;
     fwd_crypto_maybe_expire_prev_grace();
+    fwd_crypto_pqc_key_lifetime_tick();
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     fwd_crypto_cleanup_stale_profile_slots(fwd->cfg);

@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <endian.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -22,14 +24,16 @@
 #include "pqc_vault.h"
 
 #define PQC_RX_PKT_MAX     10000
-#define KEY_ROTATION_INTERVAL_MS (30ULL * 24ULL * 60ULL * 60ULL * 1000ULL)
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 #define PQC_HS_REQUEST_RETRY_MS 1000
 #define PQC_HS_REQUEST_DATA_SZ ((uint16_t)sizeof(uint64_t))
 #define PQC_HS_KEEPALIVE_INTERVAL_MS 15000
-#define PQC_HS_KEEPALIVE_MISSED_LIMIT 1
+/* One missed interval used to equal the send period, so both peers timed out
+ * at the same 15s mark before the first READY keepalive arrived. */
+#define PQC_HS_KEEPALIVE_MISSED_LIMIT 3
 #define PQC_HS_KEEPALIVE_TIMEOUT_MS \
     (PQC_HS_KEEPALIVE_INTERVAL_MS * PQC_HS_KEEPALIVE_MISSED_LIMIT)
+#define PQC_HS_PREV_KEY_GRACE_MS (2ULL * PQC_HS_KEEPALIVE_TIMEOUT_MS)
 #define PQC_HS_AUTO_RETRY_INTERVAL_MS 15000
 #define PQC_HS_DISPATCHER_RETRY_MS 5000
 #define PQC_HS_WORKER_SUPERVISOR_MS 5000
@@ -64,6 +68,10 @@ __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
 }
 
+__attribute__((weak)) void fwd_crypto_discard_pqc_prev_key(int policy_id) {
+    (void)policy_id;
+}
+
 static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static identity_entry_t g_identity_registry[MAX_IDENTITY_REGISTRY];
@@ -71,8 +79,6 @@ static int g_registry_count = 0;
 
 static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
-static volatile int g_policy_key_version[MAX_POLICY_BINDINGS] = {0};
-static volatile int g_datapath_key_version[MAX_POLICY_BINDINGS] = {0};
 static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 
 /* g_dispatcher_running is the lifetime request shared by tunnel workers.
@@ -328,6 +334,18 @@ static uint8_t pqc_hs_l3_state_locked(const policy_key_binding_t *b) {
     return PQC_HS_STATE_FAILED;
 }
 
+static int pqc_hs_digest_key_locked(
+    const policy_key_binding_t *b, int slot,
+    uint8_t fingerprint[PQC_HS_KEY_FINGERPRINT_SZ]) {
+    if (!b || !fingerprint || slot < 0 || slot >= KEY_SLOT_COUNT ||
+        !b->key_slots_valid[slot])
+        return -EINVAL;
+    return trf_calculate_digest(DIGEST_TYPE_SHA256,
+                                b->keys[slot],
+                                PQC_TRAFFIC_KEY_SZ,
+                                fingerprint) == TRF_PQC_OK ? 0 : -EIO;
+}
+
 static int pqc_hs_l3_key_fingerprint_locked(
     const policy_key_binding_t *b,
     uint8_t fingerprint[PQC_HS_KEY_FINGERPRINT_SZ]) {
@@ -524,15 +542,31 @@ static uint64_t get_time_ms_hs(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+static void pqc_hs_wipe_slot_locked(policy_key_binding_t *b, int slot) {
+    volatile uint8_t *p;
+    int n;
+
+    if (!b || slot < 0 || slot >= KEY_SLOT_COUNT)
+        return;
+    p = b->keys[slot];
+    n = PQC_TRAFFIC_KEY_SZ;
+    while (n--)
+        *p++ = 0;
+    b->key_ids[slot] = 0;
+    b->key_slots_valid[slot] = false;
+}
+
 static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *derived_master, const char *role) {
     bool was_ready;
     int policy_id;
+    int profile_id;
     int promoted_key_id;
     char key_id[sizeof(b->key_id)];
 
     pthread_mutex_lock(&g_key_mutex);
     was_ready = b->key_ready;
     policy_id = b->policy_id;
+    profile_id = b->profile_id;
     strncpy(key_id, b->key_id, sizeof(key_id) - 1);
     key_id[sizeof(key_id) - 1] = '\0';
 
@@ -544,32 +578,29 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     b->key_ids[KEY_SLOT_CURRENT] = (b->key_ids[KEY_SLOT_CURRENT] + 1) & 0xFF;
     if (b->key_ids[KEY_SLOT_CURRENT] == 0) b->key_ids[KEY_SLOT_CURRENT] = 1;
     b->key_slots_valid[KEY_SLOT_CURRENT] = true;
-
-    b->key_slots_valid[KEY_SLOT_NEXT] = false;
+    pqc_hs_wipe_slot_locked(b, KEY_SLOT_NEXT);
 
     memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
     memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
 
     b->key_ready = true;
-    b->last_sent_time = get_time_ms_hs();
-    b->last_recv_time = get_time_ms_hs();
-    b->last_rotation_time = get_time_ms_hs();
+    b->rekey_requested = false;
+    b->last_sent_time = 0;
+    b->last_recv_time = 0;
     b->handshake_start_time = 0;
     b->handshake_give_up = false;
     b->rotation_start_time = 0;
     b->rotation_give_up = false;
+    b->prev_discard_after_ms = 0;
     b->giveup_logged = false;
     if (b->is_tunnel) {
         b->keepalive_enabled = true;
         b->keepalive_monitor_start_time = get_time_ms_hs();
-        b->last_keepalive_rx_time = 0;
+        b->last_keepalive_rx_time = b->keepalive_monitor_start_time;
+        b->keepalive_send_now = true;
         b->next_auto_retry_time = 0;
     }
 
-    int idx = b - g_policy_bindings;
-    if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
-        g_policy_key_version[idx]++;
-    }
     promoted_key_id = b->key_ids[KEY_SLOT_CURRENT];
     pthread_mutex_unlock(&g_key_mutex);
 
@@ -577,10 +608,111 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
                       PQC_LOG_STATUS_SUCCESS,
                       was_ready ? "Session key updated."
                                 : "Secure session established.");
-
     fprintf(stderr, "[PQC-HS] %s Handshake SUCCESS for Policy %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
             role, policy_id, promoted_key_id,
             derived_master[0], derived_master[1], derived_master[2], derived_master[3]);
+    forwarder_pre_diversify_pqc_keys(profile_id);
+}
+
+static int pqc_hs_stage_next_key(policy_key_binding_t *b,
+                                 const uint8_t derived_master[PQC_TRAFFIC_KEY_SZ],
+                                 const char *role) {
+    int profile_id;
+    int policy_id;
+
+    if (!b || !derived_master)
+        return -EINVAL;
+    pthread_mutex_lock(&g_key_mutex);
+    if (!b->key_ready || !b->key_slots_valid[KEY_SLOT_CURRENT]) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -EAGAIN;
+    }
+    memcpy(b->keys[KEY_SLOT_NEXT], derived_master, PQC_TRAFFIC_KEY_SZ);
+    b->key_ids[KEY_SLOT_NEXT] =
+        (uint8_t)((b->key_ids[KEY_SLOT_CURRENT] + 1u) & 0xffu);
+    if (b->key_ids[KEY_SLOT_NEXT] == 0)
+        b->key_ids[KEY_SLOT_NEXT] = 1;
+    b->key_slots_valid[KEY_SLOT_NEXT] = true;
+    b->prev_discard_after_ms = 0;
+    profile_id = b->profile_id;
+    policy_id = b->policy_id;
+    pthread_mutex_unlock(&g_key_mutex);
+
+    fprintf(stderr,
+            "[PQC-HS-L3] %s staged NEXT key for Policy %d; CURRENT remains active until READY/COMMIT.\n",
+            role, policy_id);
+    forwarder_pre_diversify_pqc_keys(profile_id);
+    return 0;
+}
+
+static int pqc_hs_promote_staged_key(policy_key_binding_t *b,
+                                     const char *role) {
+    uint8_t next[PQC_TRAFFIC_KEY_SZ];
+
+    if (!b)
+        return -EINVAL;
+    pthread_mutex_lock(&g_key_mutex);
+    if (!b->key_slots_valid[KEY_SLOT_NEXT]) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ENOENT;
+    }
+    memcpy(next, b->keys[KEY_SLOT_NEXT], sizeof(next));
+    pthread_mutex_unlock(&g_key_mutex);
+    handle_handshake_success(b, next, role);
+    memset(next, 0, sizeof(next));
+    return 0;
+}
+
+static int pqc_hs_send_cutover_control(
+    policy_key_binding_t *b, int sockfd,
+    const struct sockaddr_in *peeraddr, const char *my_priv,
+    uint8_t msg_type, uint32_t session_id) {
+    uint8_t buffer[PQC_HS_MSG_MAX_SZ];
+    uint8_t raw_priv[8192];
+    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+    size_t raw_priv_sz = 0;
+    int sig_sz = 0;
+    size_t msg_len;
+    ssize_t sent;
+
+    if (!b || sockfd < 0 || !peeraddr || !my_priv || session_id == 0 ||
+        (msg_type != PQC_HS_MSG_READY && msg_type != PQC_HS_MSG_COMMIT))
+        return -EINVAL;
+    memset(buffer, 0, sizeof(buffer));
+    msg->magic = PQC_HS_MAGIC;
+    msg->msg_type = msg_type;
+    msg->session_id = session_id;
+    msg->policy_id = (uint32_t)b->policy_id;
+    msg->data_len = 0;
+    msg->sig_len = 0;
+    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+    if (raw_priv_sz == 0 ||
+        pqc_hs_sign_message(raw_priv, raw_priv_sz, msg, msg->payload,
+                            &sig_sz) != TRF_PQC_OK ||
+        sig_sz <= 0 || (size_t)sig_sz > UINT16_MAX)
+        return -EKEYREJECTED;
+    msg->sig_len = (uint16_t)sig_sz;
+    msg_len = sizeof(*msg) + (size_t)sig_sz;
+    sent = sendto(sockfd, msg, msg_len, 0,
+                  (const struct sockaddr *)peeraddr, sizeof(*peeraddr));
+    return sent == (ssize_t)msg_len ? 0 : (sent < 0 ? -errno : -EIO);
+}
+
+static int pqc_hs_verify_cutover_control(
+    policy_key_binding_t *b, const struct pqc_hs_msg *msg,
+    const char *peer_pub, uint8_t expected_type, uint32_t session_id) {
+    uint8_t raw_pub[8192];
+    size_t raw_pub_sz = 0;
+
+    if (!b || !msg || !peer_pub || msg->magic != PQC_HS_MAGIC ||
+        msg->msg_type != expected_type || msg->session_id != session_id ||
+        msg->policy_id != (uint32_t)b->policy_id || msg->data_len != 0)
+        return -EINVAL;
+    trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+    if (raw_pub_sz == 0 ||
+        pqc_hs_verify_message(raw_pub, raw_pub_sz, msg) != TRF_PQC_OK)
+        return -EKEYREJECTED;
+    return 0;
 }
 
 static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
@@ -591,6 +723,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
     uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
     int response_len = 0;
     bool already_promoted = false;
+    bool requires_commit = false;
     bool promote_now = false;
     ssize_t sent;
 
@@ -611,6 +744,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
         memcpy(response, b->hs_cache[cache_slot].response, (size_t)response_len);
         memcpy(master_key, b->hs_cache[cache_slot].master_key, sizeof(master_key));
         already_promoted = b->hs_cache[cache_slot].key_promoted;
+        requires_commit = b->hs_cache[cache_slot].requires_commit;
     }
     pthread_mutex_unlock(&g_key_mutex);
 
@@ -627,7 +761,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
         return -1;
     }
 
-    if (!already_promoted) {
+    if (!requires_commit && !already_promoted) {
         pthread_mutex_lock(&g_key_mutex);
         if (b->hs_cache[cache_slot].valid &&
             b->hs_cache[cache_slot].session_id == session_id &&
@@ -643,14 +777,14 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
 
     if (promote_now) {
         handle_handshake_success(b, master_key, "Responder");
-        forwarder_pre_diversify_pqc_keys(b->profile_id);
     }
 
     fprintf(stderr,
             "[PQC-HS-L3] Responder %s RESP for Policy %d, session %u%s.\n",
             replay ? "replayed cached" : "sent new",
             b->policy_id, session_id,
-            already_promoted ? " (key unchanged)" : "");
+            already_promoted ? " (key unchanged)" :
+            (requires_commit ? " (NEXT staged; waiting READY)" : ""));
     return 0;
 }
 
@@ -674,6 +808,7 @@ static int pqc_hs_handle_l3_responder_hello(policy_key_binding_t *b,
     int response_len;
     int cached_slot = -1;
     bool session_conflict = false;
+    bool rotation = false;
     char *new_my_priv = NULL;
     char *new_peer_pub = NULL;
 
@@ -770,6 +905,13 @@ static int pqc_hs_handle_l3_responder_hello(policy_key_binding_t *b,
 
     derive_traffic_key(ss, 32, derived_master);
 
+    pthread_mutex_lock(&g_key_mutex);
+    rotation = b->key_ready;
+    pthread_mutex_unlock(&g_key_mutex);
+    if (rotation &&
+        pqc_hs_stage_next_key(b, derived_master, "Responder") != 0)
+        return -1;
+
     uint8_t *response_copy = malloc((size_t)response_len);
     if (!response_copy) return -1;
     memcpy(response_copy, response_buf, (size_t)response_len);
@@ -785,10 +927,118 @@ static int pqc_hs_handle_l3_responder_hello(policy_key_binding_t *b,
     memcpy(b->hs_cache[cached_slot].hello_hash, hello_hash, sizeof(hello_hash));
     memcpy(b->hs_cache[cached_slot].master_key, derived_master, sizeof(derived_master));
     b->hs_cache[cached_slot].valid = true;
+    b->hs_cache[cached_slot].requires_commit = rotation;
     pthread_mutex_unlock(&g_key_mutex);
 
     return pqc_hs_send_cached_response(b, cached_slot, msg->session_id,
                                        hello_hash, sockfd, peeraddr, false);
+}
+
+static int pqc_hs_handle_ready(policy_key_binding_t *b, int sockfd,
+                               const struct sockaddr_in *peeraddr,
+                               const struct pqc_hs_msg *msg,
+                               const char *my_priv, const char *peer_pub) {
+    int cache_slot = -1;
+    bool promoted = false;
+    uint32_t session_id;
+
+    if (!b || !msg)
+        return -EINVAL;
+    session_id = msg->session_id;
+    if (pqc_hs_verify_cutover_control(b, msg, peer_pub,
+                                      PQC_HS_MSG_READY, session_id) != 0) {
+        fprintf(stderr,
+                "[PQC-HS-L3] Rejected invalid READY for Policy %d, session %u.\n",
+                b->policy_id, session_id);
+        return -EKEYREJECTED;
+    }
+
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < PQC_HS_CACHE_SLOTS; i++) {
+        if (b->hs_cache[i].valid &&
+            b->hs_cache[i].requires_commit &&
+            b->hs_cache[i].session_id == session_id) {
+            cache_slot = i;
+            promoted = b->hs_cache[i].key_promoted;
+            if (!promoted &&
+                (!b->key_slots_valid[KEY_SLOT_NEXT] ||
+                 memcmp(b->keys[KEY_SLOT_NEXT], b->hs_cache[i].master_key,
+                        PQC_TRAFFIC_KEY_SZ) != 0))
+                cache_slot = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    if (cache_slot < 0)
+        return -ENOENT;
+
+    if (!promoted) {
+        if (pqc_hs_promote_staged_key(b, "Responder") != 0)
+            return -EIO;
+        pthread_mutex_lock(&g_key_mutex);
+        if (b->hs_cache[cache_slot].valid &&
+            b->hs_cache[cache_slot].session_id == session_id) {
+            b->hs_cache[cache_slot].key_promoted = true;
+            memset(b->hs_cache[cache_slot].master_key, 0,
+                   sizeof(b->hs_cache[cache_slot].master_key));
+        }
+        pthread_mutex_unlock(&g_key_mutex);
+    }
+
+    if (pqc_hs_send_cutover_control(b, sockfd, peeraddr, my_priv,
+                                    PQC_HS_MSG_COMMIT, session_id) != 0)
+        return -EIO;
+    fprintf(stderr,
+            "[PQC-HS-L3] Responder sent COMMIT for Policy %d, session %u%s.\n",
+            b->policy_id, session_id, promoted ? " (replay)" : "");
+    return 0;
+}
+
+static int pqc_hs_initiator_commit_staged(
+    policy_key_binding_t *b, int sockfd,
+    const struct sockaddr_in *peeraddr, const char *my_priv,
+    const char *peer_pub, uint32_t session_id) {
+    uint64_t next_ready_send = 0;
+
+    while (g_dispatcher_running && !b->thread_exit_sig) {
+        uint64_t now = get_time_ms_hs();
+        uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+        pqc_rx_pkt_info_t info;
+        const struct pqc_hs_msg *msg = NULL;
+        int rx_len;
+
+        if (next_ready_send == 0 || now >= next_ready_send) {
+            int rc = pqc_hs_send_cutover_control(
+                b, sockfd, peeraddr, my_priv, PQC_HS_MSG_READY, session_id);
+            if (rc != 0)
+                fprintf(stderr,
+                        "[PQC-HS-L3] Failed to send READY for Policy %d, session %u: %s.\n",
+                        b->policy_id, session_id, strerror(-rc));
+            next_ready_send = now + PQC_HS_REQUEST_RETRY_MS;
+        }
+
+        rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+        if (rx_len <= 0 ||
+            pqc_hs_validate_message(rx_buf, rx_len, &msg) != 0 ||
+            msg->msg_type != PQC_HS_MSG_COMMIT ||
+            msg->session_id != session_id)
+            continue;
+        if (pqc_hs_verify_cutover_control(b, msg, peer_pub,
+                                          PQC_HS_MSG_COMMIT,
+                                          session_id) != 0) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Rejected invalid COMMIT for Policy %d, session %u.\n",
+                    b->policy_id, session_id);
+            continue;
+        }
+        if (pqc_hs_promote_staged_key(b, "Initiator") != 0)
+            return -EIO;
+        fprintf(stderr,
+                "[PQC-HS-L3] Initiator accepted COMMIT for Policy %d, session %u. Both peers can decrypt the cutover window.\n",
+                b->policy_id, session_id);
+        return 0;
+    }
+    return -ECANCELED;
 }
 
 static void initiate_l3_key_rotation(policy_key_binding_t *b, int sockfd,
@@ -801,7 +1051,7 @@ static void initiate_l3_key_rotation(policy_key_binding_t *b, int sockfd,
     uint32_t session_id;
 
     fprintf(stderr,
-            "[PQC-HS-L3] Proactively initiating periodic key rotation for Policy %d...\n",
+            "[PQC-HS-L3] Starting handshake for a new session key (Policy %d).\n",
             b->policy_id);
 
     if (trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz) != TRF_PQC_OK ||
@@ -872,11 +1122,12 @@ static void initiate_l3_key_rotation(policy_key_binding_t *b, int sockfd,
                                         resp->data_len, ss) == TRF_PQC_OK) {
                     uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                     derive_traffic_key(ss, 32, derived_master);
-
-                    handle_handshake_success(b, derived_master, "Initiator");
-
-                    forwarder_pre_diversify_pqc_keys(profile_id);
-                    return;
+                    if (pqc_hs_stage_next_key(b, derived_master,
+                                              "Initiator") == 0 &&
+                        pqc_hs_initiator_commit_staged(
+                            b, sockfd, peeraddr, my_priv, peer_pub,
+                            session_id) == 0)
+                        return;
                 }
             }
             usleep(10000);
@@ -1005,11 +1256,35 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
 
                 if (local_state == PQC_HS_STATE_READY &&
                     peer_status.state == PQC_HS_STATE_READY) {
+                    uint8_t slot_fp[PQC_HS_KEY_FINGERPRINT_SZ];
+                    bool current_match = false;
+
                     if (pqc_hs_l3_key_fingerprint_locked(
                             b, local_fingerprint) == 0 &&
                         memcmp(local_fingerprint,
                                peer_status.key_fingerprint,
-                               sizeof(local_fingerprint)) == 0) {
+                               sizeof(local_fingerprint)) == 0)
+                        current_match = true;
+                    if (current_match) {
+                        if (b->key_slots_valid[KEY_SLOT_PREV] &&
+                            b->prev_discard_after_ms == 0)
+                            b->prev_discard_after_ms =
+                                get_time_ms_hs() + PQC_HS_PREV_KEY_GRACE_MS;
+                        pthread_mutex_unlock(&g_key_mutex);
+                        return;
+                    }
+                    if (pqc_hs_digest_key_locked(b, KEY_SLOT_NEXT, slot_fp) == 0 &&
+                        memcmp(slot_fp, peer_status.key_fingerprint,
+                               sizeof(slot_fp)) == 0)
+                    {
+                        /* Peer committed first. NEXT can decrypt its packets
+                         * while this side waits for the signed COMMIT. */
+                        pthread_mutex_unlock(&g_key_mutex);
+                        return;
+                    }
+                    if (pqc_hs_digest_key_locked(b, KEY_SLOT_PREV, slot_fp) == 0 &&
+                        memcmp(slot_fp, peer_status.key_fingerprint,
+                               sizeof(slot_fp)) == 0) {
                         pthread_mutex_unlock(&g_key_mutex);
                         return;
                     }
@@ -1025,6 +1300,20 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                     return;
                 }
 
+                /* Keep the in-use NE key. PQC only starts another handshake
+                 * and will replace RAM after the new key is derived. */
+                if (b->key_ready) {
+                    b->rekey_requested = true;
+                    b->handshake_give_up = false;
+                    b->rotation_give_up = false;
+                    b->rotation_start_time = 0;
+                    fprintf(stderr,
+                            "[PQC-HS-L3] Keepalive asked for a new handshake for Policy %d (%s); current NE key stays in RAM.\n",
+                            b->policy_id, recovery_reason);
+                    pthread_mutex_unlock(&g_key_mutex);
+                    return;
+                }
+
                 b->handshake_give_up = false;
                 b->handshake_start_time = get_time_ms_hs();
                 b->rotation_give_up = false;
@@ -1032,6 +1321,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 b->giveup_logged = false;
                 b->key_ready = false;
                 b->next_auto_retry_time = 0;
+                b->prev_discard_after_ms = 0;
                 b->keepalive_monitor_start_time = get_time_ms_hs();
                 if (b->is_initiator) {
                     b->send_poke = false;
@@ -1105,6 +1395,18 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                     }
 
                     b->peer_request_id = request_id;
+                    if (b->key_ready) {
+                        b->rekey_requested = true;
+                        b->handshake_give_up = false;
+                        b->rotation_give_up = false;
+                        b->rotation_start_time = 0;
+                        fprintf(stderr,
+                                "[PQC-HS-L3] Accepted authenticated responder request %016llx. Requesting a new session key for Policy %d without dropping the current NE key.\n",
+                                (unsigned long long)request_id, b->policy_id);
+                        pthread_mutex_unlock(&g_key_mutex);
+                        return;
+                    }
+
                     b->handshake_give_up = false;
                     b->handshake_start_time = get_time_ms_hs();
                     b->rotation_give_up = false;
@@ -1355,6 +1657,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         bool auto_retry_started = false;
         bool keepalive_timeout_recovery = false;
         bool flush_l3_queue = false;
+        bool discard_prev = false;
         uint8_t keepalive_state = PQC_HS_STATE_FAILED;
 
         if (next_dispatcher_check_time == 0 ||
@@ -1365,6 +1668,11 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         }
 
         pthread_mutex_lock(&g_key_mutex);
+        if (b->prev_discard_after_ms != 0 &&
+            loop_now >= b->prev_discard_after_ms) {
+            b->prev_discard_after_ms = 0;
+            discard_prev = true;
+        }
         if (b->keepalive_enabled && b->key_ready) {
             uint64_t monitor_from = b->last_keepalive_rx_time != 0
                 ? b->last_keepalive_rx_time
@@ -1373,21 +1681,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             if (monitor_from != 0 && loop_now >= monitor_from &&
                 loop_now - monitor_from >=
                     PQC_HS_KEEPALIVE_TIMEOUT_MS) {
-                b->key_ready = false;
-                b->handshake_give_up = false;
-                b->handshake_start_time = 0;
-                b->rotation_give_up = false;
-                b->rotation_start_time = 0;
-                b->giveup_logged = false;
-                b->local_request_id = 0;
-                b->local_keepalive_seq = 0;
-                b->send_poke = !b->is_initiator;
-                b->last_keepalive_rx_time = 0;
-                b->keepalive_monitor_start_time = loop_now;
-                b->next_auto_retry_time = 0;
-                pqc_hs_clear_cache_locked(b);
+                /* Keepalive is liveness only. A live NE key stays in RAM. */
+                b->last_keepalive_rx_time = loop_now;
                 keepalive_timeout_recovery = true;
-                flush_l3_queue = true;
             }
         }
 
@@ -1417,15 +1713,25 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         if (keepalive_enabled)
             keepalive_state = pqc_hs_l3_state_locked(b);
         handshake_give_up = b->handshake_give_up;
+        if (b->keepalive_send_now) {
+            b->keepalive_send_now = false;
+            next_l3_keepalive_time = loop_now;
+        }
         pthread_mutex_unlock(&g_key_mutex);
 
+        if (discard_prev) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Policy %d peer confirmed CURRENT; deleting PREV after %llu ms grace.\n",
+                    policy_id,
+                    (unsigned long long)PQC_HS_PREV_KEY_GRACE_MS);
+            fwd_crypto_discard_pqc_prev_key(policy_id);
+        }
         if (flush_l3_queue)
             pqc_flush_l3_rx_queue(b);
         if (keepalive_timeout_recovery) {
             fprintf(stderr,
-                    "[PQC-HS-L3] Policy %d missed %d keepalive intervals; starting independent recovery as %s.\n",
-                    policy_id, PQC_HS_KEEPALIVE_MISSED_LIMIT,
-                    b->is_initiator ? "Initiator" : "Responder");
+                    "[PQC-HS-L3] Policy %d missed %d keepalive intervals; current session key stays in NE RAM.\n",
+                    policy_id, PQC_HS_KEEPALIVE_MISSED_LIMIT);
         }
         if (auto_retry_started) {
             fprintf(stderr,
@@ -1436,12 +1742,18 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         }
 
         if (keepalive_enabled && next_l3_keepalive_time == 0) {
-            next_l3_keepalive_time =
-                loop_now + PQC_HS_KEEPALIVE_INTERVAL_MS;
+            /* Defer the first probe only while the session is not READY.
+             * After handshake, send immediately so the peer's miss clock
+             * does not expire in the same 15s slot as this first send. */
+            next_l3_keepalive_time = b->key_ready
+                ? loop_now
+                : loop_now + PQC_HS_KEEPALIVE_INTERVAL_MS;
             last_l3_keepalive_state = keepalive_state;
-        } else if (keepalive_enabled &&
-                   (keepalive_state != last_l3_keepalive_state ||
-                    loop_now >= next_l3_keepalive_time)) {
+        }
+        if (keepalive_enabled &&
+            next_l3_keepalive_time != 0 &&
+            (keepalive_state != last_l3_keepalive_state ||
+             loop_now >= next_l3_keepalive_time)) {
             int keepalive_rc = pqc_hs_send_l3_keepalive(
                 b, sockfd, &peeraddr, my_priv);
 
@@ -1572,7 +1884,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                            (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
                     uint64_t start_rx = get_time_ms_hs();
-                    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready && !b->thread_exit_sig) {
+                    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 &&
+                           !b->key_ready && !b->thread_exit_sig) {
                         uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                         pqc_rx_pkt_info_t info;
                         int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -1595,9 +1908,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         derive_traffic_key(ss, 32, derived_master);
 
                                         handle_handshake_success(b, derived_master, "Initiator");
-
                                         fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Policy %d!\n", policy_id);
-                                        forwarder_pre_diversify_pqc_keys(profile_id);
                                         break;
                                     }
                                 }
@@ -1668,51 +1979,55 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             }
         } else {
             if (is_initiator) {
-                uint64_t now = get_time_ms_hs();
-                if (b->last_sent_time > 0 && (now - b->last_sent_time < 10000) && (now - b->last_recv_time > 15000)) {
-                    fprintf(stderr, "[PQC-HS-L3] Self-healing triggered (Initiator): active TX but no RX. Resetting key for Policy %d.\n", policy_id);
-                    pthread_mutex_lock(&g_key_mutex);
-                    b->key_ready = false;
-                    b->last_sent_time = 0;
-                    b->last_recv_time = 0;
-                    pthread_mutex_unlock(&g_key_mutex);
-                } else if (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS) {
-                    if (!b->rotation_give_up) {
-                        if (b->rotation_start_time == 0) {
-                            b->rotation_start_time = now;
-                            sig_pqc_write_log(policy_id, b->key_id,
-                                              PQC_LOG_LEVEL_INFO,
-                                              PQC_LOG_STATUS_SUCCESS,
-                                              "Starting monthly session key rotation.");
-                        }
-                        if (now - b->rotation_start_time > 15000) {
-                            fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 15 seconds. Giving up on Policy %d.\n", policy_id);
-                            sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
-                            pthread_mutex_lock(&g_key_mutex);
-                            b->key_ready = false;
-                            b->handshake_give_up = true;
-                            b->rotation_start_time = 0;
-                            b->rotation_give_up = false;
-                            pthread_mutex_unlock(&g_key_mutex);
-                        } else {
-                            initiate_l3_key_rotation(b, sockfd, &peeraddr,
-                                                    my_priv, peer_pub,
-                                                    profile_id);
-                        }
+                bool need_rekey;
+
+                pthread_mutex_lock(&g_key_mutex);
+                need_rekey = b->rekey_requested;
+                pthread_mutex_unlock(&g_key_mutex);
+
+                if (need_rekey) {
+                    if (b->rotation_start_time == 0) {
+                        b->rotation_start_time = get_time_ms_hs();
+                        sig_pqc_write_log(policy_id, b->key_id,
+                                          PQC_LOG_LEVEL_INFO,
+                                          PQC_LOG_STATUS_SUCCESS,
+                                          "Starting handshake for a new session key.");
                     }
+                    initiate_l3_key_rotation(b, sockfd, &peeraddr,
+                                            my_priv, peer_pub,
+                                            profile_id);
+                    pthread_mutex_lock(&g_key_mutex);
+                    if (b->rekey_requested) {
+                        b->rotation_start_time = 0;
+                        sig_pqc_write_log(policy_id, b->key_id,
+                                          PQC_LOG_LEVEL_ERROR,
+                                          PQC_LOG_STATUS_ROTATION_FAILED,
+                                          "Session key handshake failed.");
+                    }
+                    pthread_mutex_unlock(&g_key_mutex);
                 }
                 usleep(500000);
             } else {
+                bool need_rekey;
                 uint64_t now = get_time_ms_hs();
-                if (!b->rotation_give_up &&
-                    (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS + 15000)) {
-                    fprintf(stderr, "[PQC-HS-L3] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
-                    sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed. No handshake request received from Peer.");
-                    pthread_mutex_lock(&g_key_mutex);
-                    b->key_ready = false;
-                    b->handshake_give_up = true;
-                    b->rotation_give_up = false;
-                    pthread_mutex_unlock(&g_key_mutex);
+
+                pthread_mutex_lock(&g_key_mutex);
+                need_rekey = b->rekey_requested;
+                if (need_rekey)
+                    b->send_poke = true;
+                pthread_mutex_unlock(&g_key_mutex);
+
+                if (need_rekey &&
+                    (next_l3_request_time == 0 || now >= next_l3_request_time)) {
+                    int request_rc = pqc_hs_send_l3_handshake_request(
+                        b, sockfd, &peeraddr, my_priv);
+
+                    next_l3_request_time = now + PQC_HS_REQUEST_RETRY_MS;
+                    if (request_rc == 0) {
+                        fprintf(stderr,
+                                "[PQC-HS-L3] Responder Policy %d requested a new session handshake from Initiator.\n",
+                                policy_id);
+                    }
                 }
 
                 uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
@@ -1723,10 +2038,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     if (pqc_hs_validate_message(rx_buf, rx_len, &msg) == 0 &&
                         msg->magic == PQC_HS_MAGIC &&
                         msg->msg_type == PQC_HS_MSG_HELLO) {
-                        fprintf(stderr, "[PQC-HS-L3] Responder received HELLO while ONLINE. Peer might have restarted! Re-handshaking for Policy %d...\n", policy_id);
+                        fprintf(stderr, "[PQC-HS-L3] Responder received HELLO while ONLINE. Completing handshake for a new session key on Policy %d.\n", policy_id);
                         pqc_hs_handle_l3_responder_hello(
                             b, sockfd, &peeraddr, rx_buf, rx_len,
                             &my_priv, &peer_pub);
+                    } else if (pqc_hs_validate_message(rx_buf, rx_len, &msg) == 0 &&
+                               msg->magic == PQC_HS_MAGIC &&
+                               msg->msg_type == PQC_HS_MSG_READY) {
+                        pqc_hs_handle_ready(b, sockfd, &peeraddr, msg,
+                                            my_priv, peer_pub);
                     }
                 }
                 usleep(10000);
@@ -1824,24 +2144,6 @@ int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]) {
 
 
 
-int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].policy_id == policy_id) {
-            if (g_policy_bindings[i].key_ready) {
-                memcpy(out_policy_key, g_policy_bindings[i].encrypt_key, PQC_TRAFFIC_KEY_SZ);
-                pthread_mutex_unlock(&g_key_mutex);
-                return 0;
-            } else {
-                pthread_mutex_unlock(&g_key_mutex);
-                return -1;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_key_mutex);
-    return -1;
-}
-
 void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const char *pub) {
     pthread_mutex_lock(&g_key_mutex);
     if (g_registry_count >= MAX_IDENTITY_REGISTRY) {
@@ -1933,7 +2235,6 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->peer_pub = NULL;
 
         // Initialize 3-slot metadata
-        b->last_rotation_time = get_time_ms_hs();
         b->last_sent_time = 0;
         b->last_recv_time = 0;
         b->handshake_start_time = 0;
@@ -1948,8 +2249,11 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->keepalive_monitor_start_time = 0;
         b->last_keepalive_rx_time = 0;
         b->next_auto_retry_time = 0;
+        b->prev_discard_after_ms = 0;
         b->send_poke = false;
         b->keepalive_enabled = false;
+        b->keepalive_send_now = false;
+        b->rekey_requested = false;
         b->thread_exit_sig = false;
         for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
             memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
@@ -2015,6 +2319,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                 b->thread_exit_sig = false;
                 pqc_hs_clear_cache_locked(b);
                 b->key_ready = false;
+                b->rekey_requested = false;
                 b->handshake_give_up = false;
                 b->handshake_start_time = 0;
                 b->rotation_give_up = false;
@@ -2024,6 +2329,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                 b->keepalive_monitor_start_time = 0;
                 b->last_keepalive_rx_time = 0;
                 b->next_auto_retry_time = 0;
+                b->prev_discard_after_ms = 0;
             }
         }
         b->policy_id = policy_id;
@@ -2046,6 +2352,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
             b->keepalive_monitor_start_time = get_time_ms_hs();
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->prev_discard_after_ms = 0;
             b->send_poke = role_mode != PQC_ROLE_INITIATOR;
         }
         strncpy(b->peer_ip, peer_ip ? peer_ip : "", sizeof(b->peer_ip) - 1);
@@ -2088,7 +2395,6 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
 
         int idx = b - g_policy_bindings;
         if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
-            g_policy_key_version[idx]++;
             g_policy_bindings_active[idx] = true;
         }
     }
@@ -2196,6 +2502,7 @@ void sig_pqc_finalize_reload(void) {
             b->keepalive_monitor_start_time = 0;
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->prev_discard_after_ms = 0;
             pqc_hs_clear_cache_locked(b);
         }
     }
@@ -2226,57 +2533,26 @@ void sig_pqc_record_recv(int policy_id) {
 
 int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]) {
     int idx = -1;
+
+    if (!keys || !key_ids || !key_slots_valid)
+        return -EINVAL;
+    pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == policy_id) {
             idx = i;
             break;
         }
     }
-    if (idx == -1) return -1;
-
-    // Lock-free check if the datapath's key version matches the control plane
-    if (g_datapath_key_version[idx] == g_policy_key_version[idx]) {
-        return 1; // 1 indicates keys are unchanged, skips update
+    if (idx == -1) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ENOENT;
     }
 
-    pthread_mutex_lock(&g_key_mutex);
     memcpy(keys, g_policy_bindings[idx].keys, KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
     memcpy(key_ids, g_policy_bindings[idx].key_ids, KEY_SLOT_COUNT);
     memcpy(key_slots_valid, g_policy_bindings[idx].key_slots_valid, KEY_SLOT_COUNT * sizeof(bool));
-    g_datapath_key_version[idx] = g_policy_key_version[idx];
     pthread_mutex_unlock(&g_key_mutex);
-    return 0; // 0 indicates keys were updated
-}
-
-void sig_pqc_promote_responder_key(int policy_id) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].policy_id == policy_id) {
-            if (!g_policy_bindings[i].key_slots_valid[KEY_SLOT_NEXT]) {
-                pthread_mutex_unlock(&g_key_mutex);
-                return;
-            }
-            // Promote key in control plane as well
-            memcpy(g_policy_bindings[i].keys[KEY_SLOT_PREV], g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
-            g_policy_bindings[i].key_ids[KEY_SLOT_PREV] = g_policy_bindings[i].key_ids[KEY_SLOT_CURRENT];
-            g_policy_bindings[i].key_slots_valid[KEY_SLOT_PREV] = g_policy_bindings[i].key_slots_valid[KEY_SLOT_CURRENT];
-
-            memcpy(g_policy_bindings[i].keys[KEY_SLOT_CURRENT], g_policy_bindings[i].keys[KEY_SLOT_NEXT], PQC_TRAFFIC_KEY_SZ);
-            g_policy_bindings[i].key_ids[KEY_SLOT_CURRENT] = g_policy_bindings[i].key_ids[KEY_SLOT_NEXT];
-            g_policy_bindings[i].key_slots_valid[KEY_SLOT_CURRENT] = true;
-
-            g_policy_bindings[i].key_slots_valid[KEY_SLOT_NEXT] = false;
-
-            // Keep legacy config in sync
-            memcpy(g_policy_bindings[i].encrypt_key, g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
-            memcpy(g_policy_bindings[i].decrypt_key, g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
-
-            fprintf(stderr, "[PQC-HS] Control plane key promoted (NEXT -> CURRENT) for Policy %d!\n", policy_id);
-            g_policy_key_version[i]++;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_key_mutex);
+    return 0;
 }
 
 void sig_pqc_discard_prev_key(int policy_id) {
@@ -2284,14 +2560,52 @@ void sig_pqc_discard_prev_key(int policy_id) {
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == policy_id) {
             if (g_policy_bindings[i].key_slots_valid[KEY_SLOT_PREV]) {
+                volatile uint8_t *p = g_policy_bindings[i].keys[KEY_SLOT_PREV];
+                int n = PQC_TRAFFIC_KEY_SZ;
+                while (n--)
+                    *p++ = 0;
+                g_policy_bindings[i].key_ids[KEY_SLOT_PREV] = 0;
                 g_policy_bindings[i].key_slots_valid[KEY_SLOT_PREV] = false;
-                g_policy_key_version[i]++;
-                fprintf(stderr, "[PQC-HS] Discarded PREV key for Policy %d!\n", policy_id);
+                fprintf(stderr, "[PQC-HS] Discarded PREV key for Policy %d.\n", policy_id);
             }
             break;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
+}
+
+int sig_pqc_request_new_session(int policy_id) {
+    int rc = -ENOENT;
+
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id != policy_id)
+            continue;
+        policy_key_binding_t *b = &g_policy_bindings[i];
+        if (!b->key_ready) {
+            fprintf(stderr,
+                    "[PQC-HS] Policy %d already handshaking; NE request ignored until current handshake finishes.\n",
+                    policy_id);
+            rc = -EAGAIN;
+            break;
+        }
+        if (b->rekey_requested) {
+            rc = 0;
+            break;
+        }
+        b->rekey_requested = true;
+        b->handshake_give_up = false;
+        b->rotation_give_up = false;
+        b->rotation_start_time = 0;
+        b->giveup_logged = false;
+        fprintf(stderr,
+                "[PQC-HS] NE requested a new session key for Policy %d. Current key stays in RAM until the new key is loaded.\n",
+                policy_id);
+        rc = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return rc;
 }
 
 void sig_pqc_trigger_retry(int policy_id) {
@@ -2308,6 +2622,8 @@ void sig_pqc_trigger_retry(int policy_id) {
             b->rotation_give_up = false;
             b->rotation_start_time = 0;
             b->key_ready = false;
+            b->prev_discard_after_ms = 0;
+            pqc_hs_wipe_slot_locked(b, KEY_SLOT_NEXT);
             profile_id = b->profile_id;
             if (b->is_tunnel) {
                 b->giveup_logged = false;
@@ -2349,6 +2665,8 @@ int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_ma
             b->rotation_give_up = false;
             b->rotation_start_time = 0;
             b->key_ready = false;
+            b->prev_discard_after_ms = 0;
+            pqc_hs_wipe_slot_locked(b, KEY_SLOT_NEXT);
             if (b->is_tunnel) {
                 b->giveup_logged = false;
                 b->keepalive_enabled = true;

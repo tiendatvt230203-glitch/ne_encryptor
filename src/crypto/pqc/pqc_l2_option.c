@@ -4,6 +4,7 @@
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/util/cpu_map.h"
+#include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
 #include "crypto_pqc_layer.h"
 #include "../../options/common/opt_no_frag_ops.h"
 
@@ -14,6 +15,13 @@
 #define MIN_ETH_PKT             (ETH_HEADER_SIZE + 8)
 #define likely(x)               __builtin_expect(!!(x), 1)
 #define unlikely(x)             __builtin_expect(!!(x), 0)
+
+static void l2_note_key_used(struct packet_crypto_ctx *ctx)
+{
+    if (likely(!ctx || !ctx->pqc_from_handshake))
+        return;
+    fwd_crypto_note_pqc_key_used(ctx);
+}
 
 /* ===================== L2 PQC ===================== */
 
@@ -423,6 +431,7 @@ static int l2_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start, (int)payload_len, &new_len) != 0)
         return -1;
+    l2_note_key_used(ctx);
     return enc_start + new_len;
 
 }
@@ -467,6 +476,7 @@ static int l2_do_encrypt_udp(struct packet_crypto_ctx *ctx, uint8_t *packet,
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start,
                                    (int)plain_len, &new_len) != 0)
         return -1;
+    l2_note_key_used(ctx);
     return enc_start + new_len;
 }
 
@@ -483,7 +493,7 @@ static int l2_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
     memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
-    if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_start,
+    if (crypto_pqc_decrypt_payload_resilient(ctx, nonce, packet + enc_start,
                                    (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;
     return l2_restore_plain_packet(packet, pkt_len, packet + enc_start, (size_t)dec_len);
@@ -511,7 +521,7 @@ static int l2_do_decrypt_udp(struct packet_crypto_ctx *ctx, uint8_t *packet,
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
     memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
-    if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_start,
+    if (crypto_pqc_decrypt_payload_resilient(ctx, nonce, packet + enc_start,
                                    (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;
     if (dec_len < (int)L2_UDP_SHIM_SIZE ||
@@ -563,6 +573,7 @@ static int l2_do_encrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_start,
                                    ARP_ETH_IPV4_PAYLOAD, &new_len) != 0)
         return -1;
+    l2_note_key_used(ctx);
     return enc_start + new_len;
 }
 
@@ -584,7 +595,7 @@ static int l2_do_decrypt_arp(struct packet_crypto_ctx *ctx, uint8_t *packet, siz
     if (crypto_pqc_sess_load(ctx, &pqc) != 0)
         return -1;
     memcpy(nonce, packet + et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN, (size_t)L2_NONCE_SIZE);
-    if (crypto_pqc_decrypt_payload(&pqc, nonce, packet + enc_start,
+    if (crypto_pqc_decrypt_payload_resilient(ctx, nonce, packet + enc_start,
                                    (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
         return -1;
     if (dec_len < ARP_ETH_IPV4_PAYLOAD)
@@ -625,6 +636,7 @@ static int l2_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
     if (crypto_pqc_encrypt_payload(&pqc, nonce, out_buf + enc_off,
                                    (int)plain_len, &new_len) != 0)
         return -1;
+    l2_note_key_used(ctx);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
 
@@ -661,6 +673,7 @@ static int l2_encrypt_fragment0_inplace(struct packet_crypto_ctx *ctx,
     if (crypto_pqc_encrypt_payload(&pqc, nonce, packet + enc_off,
                                    (int)plain_len, &new_len) != 0)
         return -1;
+    l2_note_key_used(ctx);
     *out_len = (uint32_t)(enc_off + new_len);
     return 0;
 

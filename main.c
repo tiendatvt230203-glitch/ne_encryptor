@@ -94,9 +94,10 @@ static void usage(const char *prog) {
             "  %s -di <wan_if>   # notify daemon: hard-detach WAN from bonding/profile\n"
             "  %s -ai <wan_if>   # notify daemon: hot-add WAN back into bonding/profile\n"
             "  %s -gs <name>     # print UP or DOWN for wan_if / bridge\n"
+            "  %s -tk <policy_id> # print remaining PQC key lifetime for policy\n"
             "  %s -check [ID]    # check database config consistency\n"
             "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_profile_id_token(const char *token, int *out_id) {

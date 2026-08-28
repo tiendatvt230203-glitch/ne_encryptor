@@ -30,6 +30,11 @@ struct packet_crypto_ctx {
     /* 1 = keys come from PQC handshake (diversify/clear on !key_ready).
      * 0 = static/master-derived keys (e.g. ARP default) — never HS-refresh. */
     bool pqc_from_handshake;
+    /* NE-owned lifetime state. It follows the stable DB policy context across
+     * hot reloads instead of being attached to a reusable 8-bit wire id. */
+    uint64_t pqc_key_in_use_ms;
+    uint8_t pqc_timed_key[AES_MAX_KEY_SIZE];
+    bool pqc_rekey_sent;
 };
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,

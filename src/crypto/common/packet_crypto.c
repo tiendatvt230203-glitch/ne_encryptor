@@ -32,37 +32,60 @@ static void fill_static_slots(const uint8_t master[AES_MAX_KEY_SIZE],
     memcpy(slots[KEY_SLOT_NEXT], hmac_out, AES_MAX_KEY_SIZE);
 }
 
+static void wipe_key_bytes(uint8_t *key, size_t len)
+{
+    volatile uint8_t *p = key;
+
+    while (len--)
+        *p++ = 0;
+}
+
 static void pqc_clear_ctx_keys(struct packet_crypto_ctx *ctx)
 {
     if (!ctx)
         return;
     if (ctx->pqc_from_handshake && ctx->profile_id > 0 && ctx->policy_id > 0)
         main_diag_ne_pqc_clear(ctx->profile_id, ctx->policy_id);
-    memset(ctx->keys, 0, sizeof(ctx->keys));
+    wipe_key_bytes(ctx->keys[KEY_SLOT_PREV], PQC_TRAFFIC_KEY_SZ);
+    wipe_key_bytes(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+    wipe_key_bytes(ctx->keys[KEY_SLOT_NEXT], PQC_TRAFFIC_KEY_SZ);
+}
+
+static int pqc_load_handshake_slots(struct packet_crypto_ctx *ctx)
+{
+    uint8_t slots[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
+    uint8_t key_ids[KEY_SLOT_COUNT];
+    bool valid[KEY_SLOT_COUNT];
+    uint8_t old_current[PQC_TRAFFIC_KEY_SZ];
+
+    memcpy(old_current, ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+    if (sig_pqc_get_keys(ctx->policy_id, slots, key_ids, valid) != 0)
+        return -1;
+
+    for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+        if (valid[slot])
+            memcpy(ctx->keys[slot], slots[slot], PQC_TRAFFIC_KEY_SZ);
+        else
+            wipe_key_bytes(ctx->keys[slot], PQC_TRAFFIC_KEY_SZ);
+    }
+    if (key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ) &&
+        memcmp(old_current, ctx->keys[KEY_SLOT_CURRENT],
+               PQC_TRAFFIC_KEY_SZ) != 0)
+        main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
+                                   ctx->keys[KEY_SLOT_CURRENT]);
+    return 0;
 }
 
 static void pqc_refresh_if_stale(struct packet_crypto_ctx *ctx)
 {
-    uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
-
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
 
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
+    if (pqc_load_handshake_slots(ctx) != 0) {
         if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
             pqc_clear_ctx_keys(ctx);
         return;
     }
-
-    if (key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ) &&
-        memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) == 0)
-        return;
-
-    memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
-    memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
-    memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
-    main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
-                               ctx->keys[KEY_SLOT_CURRENT]);
 }
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot)
@@ -79,20 +102,12 @@ void packet_crypto_update_keys(struct packet_crypto_ctx *ctx)
 
 void packet_crypto_refresh_pqc_keys(struct packet_crypto_ctx *ctx)
 {
-    uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
-
     if (!ctx || ctx->crypto_mode != CRYPTO_MODE_PQC || !ctx->pqc_from_handshake)
         return;
-    if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) != 0) {
+    if (pqc_load_handshake_slots(ctx) != 0) {
         if (!key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ))
             pqc_clear_ctx_keys(ctx);
-        return;
     }
-    memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
-    memcpy(ctx->keys[KEY_SLOT_PREV], new_key, PQC_TRAFFIC_KEY_SZ);
-    memcpy(ctx->keys[KEY_SLOT_NEXT], new_key, PQC_TRAFFIC_KEY_SZ);
-    main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
-                               ctx->keys[KEY_SLOT_CURRENT]);
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx, const uint8_t master_key[AES_MAX_KEY_SIZE],

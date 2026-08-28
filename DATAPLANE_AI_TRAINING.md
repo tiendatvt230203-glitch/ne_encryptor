@@ -2,7 +2,7 @@
 
 Mô tả **cách hệ thống đang chạy**: forward gói, gộp kênh WAN, mã hóa L2 PQC, chia đa core. Không gồm Postgres / schema / reload DB / vault (`src/db/*`).
 
-UDP cắt/rã ráp: **§16**, join mảnh **§16.8**, buffer giảm OOO sau join **§16.9**. Gộp kênh per-packet: **§7**, **§18**. Chặn chiều OUT (LAN→WAN) và IN (WAN→LAN): **§8.1–8.2**. Vì sao 2 WAN OOO còn 1 WAN ổn: **§17**. Lớp mã hóa: **§19**. AF_XDP / UMEM: **§20**. i40e + 5.15→6.8: **§20.0**. **1500 và 9000 cùng chạy**, mode **drv + `XDP_COPY`**: **§20.0a**.
+UDP cắt/rã ráp: **§16**, join mảnh **§16.8**, buffer giảm OOO sau join **§16.9**. Gộp kênh per-packet: **§7**, **§18**. Chặn chiều OUT (LAN→WAN) và IN (WAN→LAN): **§8.1–8.2**. Vì sao 2 WAN OOO còn 1 WAN ổn: **§17**. Lớp mã hóa: **§19**. Handshake PQC + lifetime key 30 ngày + CLI `-tk`: **§19.3**, **§19.6**. AF_XDP / UMEM: **§20**. i40e + 5.15→6.8: **§20.0**. **1500 và 9000 cùng chạy**, mode **drv + `XDP_COPY`**: **§20.0a**.
 
 **Bài đo 1 LAN + 1 WAN (2026-08-27):** UDP 10 stream ~100s → **8.38 Gbit/s**, loss **0.16%**, OOO **45 / 71.3M**. Cùng L2 PQC, cùng cắt UDP ×2; chỉ khác một path. Bài 2 WAN OOO lớn ở §7.7 đo **trước** buffer §16.9 (WRR không đổi).
 
@@ -39,7 +39,7 @@ Cách thiết kế hiện tại:
 | `inc/core/forwarder/forwarder.h` | `struct forwarder`, ring topology |
 | `src/core/forwarder/forwarder.c` | Spawn thread, RX/TX/crypto loop |
 | `src/core/forwarder/wan_scheduler.c` | Pool WAN, WRR per-packet, drain/join/failover gate |
-| `src/core/forwarder/crypto_runtime.c` | Ctx mã hóa per policy, sync key PQC, frag GC |
+| `src/core/forwarder/crypto_runtime.c` | Ctx mã hóa per policy, sync key PQC, frag GC, **đồng hồ lifetime 30 ngày** |
 | `src/core/dataplane/local_egress.c` | LAN→WAN: **cổng OUT** policy, pick WAN, encrypt/bypass/ARP |
 | `src/core/dataplane/wan_ingress.c` | WAN→LAN: decrypt, **cổng IN**, join UDP, reorder, FDB |
 | `src/db/config.c` | `config_select_crypto_policy` (OUT) + bảng đảo `config_policy_in_ok` (IN) |
@@ -59,7 +59,8 @@ Cách thiết kế hiện tại:
 | `src/crypto/common/crypto_option_router.c` | Dispatch encrypt/decrypt/split; TLS UDP epoch/seq/datagram_id |
 | `src/crypto/common/eth_parse.c` | Marker 0x104A/0x104B, policy_id, worker_idx, MSS clamp |
 | `src/crypto/pqc/pqc_l2_option.c` | L2 PQC; UDP 0x104B + shim; join `opt_table` |
-| `src/crypto/pqc/pqc_handshake.c` | Handshake + rotate key 1 tháng |
+| `src/crypto/pqc/pqc_handshake.c` | Handshake UDP `:7090` trên tunnel; nạp key RAM; **không** tự đếm 30 ngày |
+| `src/crypto/pqc/pqc_ipc.c` | Unix socket CLI: `-r` retry HS, `-tk <policy_id>` remaining lifetime |
 | `src/crypto/options/bypass.c` | No-op crypto ops |
 | `inc/crypto/eth_parse.h` | `NE_L2_FAKE_ETHERTYPE` 0x104A, `_UDP` 0x104B, ARP 0x1048 |
 | `inc/core/dataplane/dp_idle.h` | Wake ID encoding |
@@ -645,9 +646,9 @@ Overhead ~30B → TCP MSS clamp trước encrypt.
 
 `packet_crypto_ctx`: 3 slot PREV/CURRENT/NEXT. Data policy `pqc_from_handshake=true`. ARP key tĩnh, không HS-refresh.
 
-Handshake (`pqc_handshake.c`): **trao key** chỉ khi DB có `pqc_exchange_tunnels` → UDP `:7090` trên IP tunnel, `KEY_ROTATION_INTERVAL_MS` = **1 tháng**. Không tunnel thì **không** handshake. Đang chạy key A; hết 1 tháng mới thử HS. Có key B mới promote: A → PREV, B → CURRENT. **Mã hóa gói dataplane vẫn L2 PQC** (0x104A/0x104B) — HS chỉ giao key, không mã hóa payload IPv4.
+Handshake (`pqc_handshake.c`): **chỉ trao key**. DB phải có `pqc_exchange_tunnels` → bind UDP `:7090` trên IP tunnel. Rekey dùng HELLO/RESP để stage key vào NEXT, sau đó READY/COMMIT có chữ ký mới promote; CURRENT cũ vẫn phục vụ trong cửa sổ chuyển đổi. **NE** (`crypto_runtime.c`) sở hữu đồng hồ 30 ngày per DB policy. Clock start khi policy đó **encrypt thành công lần đầu** (`fwd_crypto_note_pqc_key_used` từ `pqc_l2_option.c`). PREV chỉ bị xóa sau khi keepalive xác nhận peer đã dùng CURRENT mới và hết grace 90 giây. Chi tiết: **§19.3**, **§19.6**. **Mã hóa dataplane vẫn L2 PQC** 0x104A/0x104B.
 
-Hot path: worker giữ snapshot ctx; `packet_crypto_update_keys` diversify qua `sig_pqc_diversify_key(profile_id, policy_id)`. Tránh `g_key_mutex` mỗi gói (crypto_runtime copy-on-generation).
+Hot path: worker giữ snapshot ctx. Các event handshake copy đủ PREV/CURRENT/NEXT từ PQC control-plane vào master ctx; worker nhận snapshot mới theo generation. Không lấy `g_key_mutex` mỗi gói.
 
 Không key / HS chưa ready → drop (không encrypt bằng key rác).
 
@@ -745,7 +746,10 @@ Sau khi per-packet: 1 connect phải thấy **cả 2 WAN TX**. Crypto vẫn 1 co
 | `CRYPTO_OPT_FRAG_MTU_DEFAULT` | 1500 | |
 | `OPT_FRAG_TABLE_SIZE` | 4096 | |
 | `OPT_FRAG_TIMEOUT_NS` | 200ms | |
-| `KEY_ROTATION_INTERVAL_MS` | 1 tháng | HS UDP 7090 trên VPN tunnel |
+| `NE_PQC_KEY_LIFETIME_MS` | 30 ngày | NE đếm sau lần **encrypt** đầu / policy; hết hạn → `sig_pqc_request_new_session` |
+| `PQC_HS_PORT` | 7090 | UDP handshake trên IP tunnel, không đi L2 0x88B5 |
+| `PQC_HS_KEEPALIVE_INTERVAL_MS` | 15 s | Probe liveness; **không** drop key, **không** start clock |
+| `PQC_HS_KEEPALIVE_MISSED_LIMIT` | 3 | Timeout keepalive = 45 s; chỉ log, key NE giữ nguyên |
 | `PACKET_CRYPTO_NONCE_BYTES` | 12 | |
 | `NE_L2_FAKE_ETHERTYPE` | 0x104A | TCP/ICMP/OSPF L2 PQC |
 | `NE_L2_FAKE_ETHERTYPE_UDP` | 0x104B | mọi UDP L2 PQC (cắt và không cắt) |
@@ -1853,7 +1857,7 @@ Lớp DB (`src/db/*`, `schema.sql`) vẫn parse action L3/L4 và method `aes-ctr
 | **A. Encrypt option** | `CRYPTO_OPT_L2_PQC` / `CRYPTO_OPT_BYPASS` | `encrypt_to_wan` hardcode L2 PQC. Bypass = không gọi option encrypt. Không có `options/l3*.c` / `l4*.c` |
 | **B. AES-GCM primitive** | `trf_encrypt_payload_gcm` / decrypt trong `traffic_crypto.c` | Live. Mọi payload L2 PQC (TCP/UDP/ICMP/OSPF/ARP) GCM 256 + tag 16B + nonce 12B. Khác `CRYPTO_MODE_GCM` trên policy |
 | **C. Policy struct + DB** | `ENCRYPT_L3/L4`, `CRYPTO_MODE_CTR/GCM`, `ne_parse_method`, `cp->aes_bits`, `cp->key[]` | Load DB parse rồi coerce L2+PQC. Core encrypt không đọc mode/key. Parser/schema không thuộc dataplane |
-| **D. Handshake VPN tunnel** | `pqc_handshake.c`: UDP `:7090` trên IP `pqc_exchange_tunnels` `[PQC-HS-L3]`. Không tunnel → không HS | HS chỉ trao key. Encrypt dataplane vẫn L2 PQC 0x104A/0x104B |
+| **D. Handshake VPN tunnel** | `pqc_handshake.c`: UDP `:7090` trên IP `pqc_exchange_tunnels` `[PQC-HS-L3]`. Không tunnel → không HS | HS chỉ trao key. Lifetime 30 ngày do **NE** đếm (§19.6). Encrypt dataplane vẫn L2 PQC 0x104A/0x104B |
 
 Tóm tắt live encrypt LAN→WAN:
 
@@ -1861,7 +1865,7 @@ Tóm tắt live encrypt LAN→WAN:
 cp->action == BYPASS  → CPU 0 push_to_wan, không AES, không option ops
 cp->action != BYPASS  → luôn CRYPTO_OPT_L2_PQC (kể cả DB ghi L3/L4)
                           AES-GCM qua crypto_pqc_encrypt_payload
-                          key = sig_pqc_diversify_key (handshake), không phải cp->key
+                          key slots = sig_pqc_get_keys (handshake), không phải cp->key
 ```
 
 ---
@@ -1893,10 +1897,10 @@ Ctx AES/PQC per policy (và ARP static).
 | Field | Ý nghĩa trên dataplane |
 |-------|------------------------|
 | `master_key[32]` | ARP: HMAC-SHA256 epoch 0 → 3 slot giống nhau. Encrypt policy không dùng master DB. `packet_crypto_init` chỉ ARP |
-| `keys[3][32]` | PREV/CURRENT/NEXT. PQC: 3 slot cùng traffic key diversify |
+| `keys[3][32]` | PREV/CURRENT/NEXT của ba generation quanh rekey; stage NEXT trước cutover |
 | `initialized` | 1 sau init/rebuild |
 | `crypto_mode` | Live ctx gán `CRYPTO_MODE_PQC`. Core không đọc CTR/GCM |
-| `policy_id` | `cp->db_id` cho `sig_pqc_diversify_key` |
+| `policy_id` | `cp->db_id` để lấy đúng binding PQC và lifetime per policy |
 | `wire_id` | `cp->id` 1..255 ghi byte 14 trên 0x104A |
 | `profile_id` | profile id |
 | `aes_bits` | ARP 256; policy ctx thường 0 vì không `packet_crypto_init` |
@@ -1906,7 +1910,7 @@ Hàm:
 
 - `packet_crypto_init(ctx, master, aes_bits)` — **chỉ ARP** (`arp_bridge.c`). Set mode PQC, `fill_static_slots` HMAC-SHA256(master, epoch=0).
 - `packet_crypto_get_key(ctx, slot)` — encrypt/decrypt đọc `KEY_SLOT_CURRENT`.
-- `packet_crypto_update_keys` / `packet_crypto_refresh_pqc_keys` — `sig_pqc_diversify_key(profile_id, policy_id, out)`. Fail + key zero → `pqc_clear_ctx_keys`. Chỉ khi `crypto_mode==PQC && pqc_from_handshake`.
+- `packet_crypto_update_keys` / `packet_crypto_refresh_pqc_keys` — copy đủ ba slot qua `sig_pqc_get_keys(policy_id, ...)`. Fail + CURRENT zero → `pqc_clear_ctx_keys`. Chỉ khi `crypto_mode==PQC && pqc_from_handshake`.
 
 #### `crypto_pqc_sess_t` (`src/crypto/pqc/include/crypto_pqc_layer.h`)
 
@@ -1948,6 +1952,9 @@ Match 5-tuple + action. Live action sau load: **chỉ** `BYPASS=0` hoặc `ENCRY
 | `policy_index_by_wire_id[256]` | byte 14 → index ctx |
 | `policy_profile_id_by_wire_id[256]` | wire → profile (reasm slot) |
 | `active_policies[]` | snapshot policy |
+| `packet_crypto_ctx.pqc_key_in_use_ms` | CLOCK_MONOTONIC ms lúc **encrypt lần đầu**; thuộc stable DB policy ctx, 0 = chưa start |
+| `packet_crypto_ctx.pqc_rekey_sent` | đã gọi `sig_pqc_request_new_session` cho lần hết hạn này; request bị từ chối tạm thời thì re-arm |
+| `packet_crypto_ctx.pqc_timed_key[32]` | bản sao CURRENT lúc clock start; CURRENT khác → reset clock |
 | `profile_flow_tables[MAX_PROFILES]` | **chỉ slot 0 dùng.** Live WAN pick **không** đọc table này. GC vẫn chạy `flow_table_gc_slice` trên worker 0 |
 
 `fwd_crypto_rebuild`: encrypt → ctx PQC + `pqc_from_handshake=1` + refresh key. Không `packet_crypto_init` cho policy.
@@ -1989,16 +1996,30 @@ Key dataplane **không** nằm `cp->key`. Nằm `policy_key_binding_t` (`pqc_han
 
 | Field chính | Việc |
 |-------------|------|
-| `encrypt_key` / `decrypt_key` / `keys[3]` | master sau ML-KEM; diversify per policy |
-| `key_ready` | 0 → ctx all-zero → L2 encrypt **fail** (đúng) |
+| `encrypt_key` / `decrypt_key` / `keys[3]` | master sau ML-KEM; diversify per policy. Slot PREV/CURRENT/NEXT |
+| `key_ready` | 0 → ctx all-zero → L2 encrypt **fail** (đúng). Monthly rekey **không** hạ flag này |
+| `rekey_requested` | NE hoặc keepalive fingerprint-mismatch xin HS **key mới** trong khi CURRENT vẫn dùng encrypt |
 | `is_tunnel` | bắt buộc 1: HS UDP 7090 trên VPN tunnel; không tunnel → không bind |
 | `wan_ifname`, `peer_ip` | tên interface tunnel + IP peer tunnel; `wan_ifname` để ioctl IP local khi DYNAMIC |
-| `role_mode` | DYNAMIC so IP trên tunnel |
+| `role_mode` | DYNAMIC so IP trên tunnel (IP nhỏ hơn = initiator) |
 | `hs_cache[]` | idempotent HELLO trên tunnel |
 
-`struct pqc_hs_msg`: magic `PQCH`, HELLO/RESP/KEEPALIVE/POKE. Payload KEM + ML-DSA. Chỉ đi UDP `:7090` trên IP tunnel.
+`struct pqc_hs_msg`: magic `PQCH`, HELLO/RESP/KEEPALIVE/POKE/READY/COMMIT. Payload KEM và mọi control cutover đều được ML-DSA xác thực. **Chỉ** đi UDP `:7090` trên IP `pqc_exchange_tunnels`. Không đi Ethernet 0x88B5/0x88B6. Không tunnel → `sig_pqc_load_and_bind_policy` **không** bind worker, log ERROR.
 
-Hàm bind: `sig_pqc_bind_policy`, `sig_pqc_diversify_key`, `sig_pqc_load_and_bind_policy` (DB). Không có `pqc_exchange_tunnels` → không handshake, log ERROR. Rotate `KEY_ROTATION_INTERVAL_MS` = 1 tháng, log per policy. Key ra vẫn dùng encrypt **L2 PQC** trên dataplane.
+Hàm bind/key: `sig_pqc_bind_policy`, `sig_pqc_get_keys`, `sig_pqc_load_and_bind_policy` (DB). `pqc_handshake_start_all_profiles` spawn worker per binding tunnel.
+
+**Phân vai cố ý (đừng gộp):**
+
+| Việc | Ai làm | Ai **không** làm |
+|------|--------|------------------|
+| ML-KEM HELLO/RESP, nạp master vào RAM | PQC worker | NE không gửi UDP 7090 |
+| Keepalive 15s, POKE khi responder cần initiator HELLO | PQC | NE không đọc keepalive |
+| Đếm 30 ngày, start clock, hết hạn | **NE** `crypto_runtime.c` | PQC không còn field/timer lifetime |
+| Drop key vì miss keepalive / “active TX no RX” | **Không ai** | PQC chỉ log miss; key NE giữ |
+| Xin HS key mới khi hết hạn | NE gọi `sig_pqc_request_new_session(policy_id)` | Không rotate cả profile |
+| Xóa key cũ | Keepalive xác nhận peer fingerprint=CURRENT, chờ grace 90s rồi wipe PREV cả NE/PQC | Không xóa vì một lần encrypt local |
+
+HS lần đầu vẫn nạp CURRENT sau HELLO/RESP. Khi **rekey**, responder và initiator stage master mới vào NEXT; initiator gửi READY sau khi NEXT đã vào dataplane, responder mới promote và gửi COMMIT, initiator nhận COMMIT mới promote. Trong cửa sổ này decrypt thử CURRENT → NEXT → PREV, nên responder chuyển trước vẫn không làm rớt traffic. Encrypt dataplane vẫn **L2 PQC**. Chi tiết đồng hồ / CLI: **§19.6**.
 
 `trf_kem_*`, `trf_dsa_*`, `trf_derive_session_keys`, `trf_calculate_hmac` — KEM/DSA/HMAC của handshake, không phải AES-CTR dataplane.
 
@@ -2040,9 +2061,193 @@ File `*.orig` (`forwarder.c`, `crypto_route`, `flow_table`) không compile. `inc
 
 ### 19.5 File crypto dataplane
 
-Mã hóa traffic: `pqc_l2_option.c`. Dispatch: `crypto_option_router.c`, `crypto_option_registry.c`. Wire: `eth_parse.c`. Key slot: `packet_crypto.c`. AEAD: `crypto_pqc_layer.h` → `trf_*_gcm`. Handshake: `pqc_handshake.c` (UDP :7090 trên tunnel). Dataplane: `local_egress.c`, `wan_ingress.c`, `arp_bridge.c`, `crypto_runtime.c`. Bypass registry: `bypass.c` + `opt_no_frag_ops.c`.
+Mã hóa traffic: `pqc_l2_option.c`. Dispatch: `crypto_option_router.c`, `crypto_option_registry.c`. Wire: `eth_parse.c`. Key slot: `packet_crypto.c`. AEAD: `crypto_pqc_layer.h` → `trf_*_gcm`. Handshake: `pqc_handshake.c` (UDP :7090 trên tunnel). Lifetime clock + `-tk`: `crypto_runtime.c`, `pqc_ipc.c`. Dataplane: `local_egress.c`, `wan_ingress.c`, `arp_bridge.c`. Bypass registry: `bypass.c` + `opt_no_frag_ops.c`.
 
 Không có `src/crypto/options/l3*.c`, `l4*.c`, `ctr*.c`.
+
+---
+
+### 19.6 Lifetime session key PQC — NE đếm, PQC chỉ trao key
+
+Mục này là nguồn sự thật cho **key usage clock**, **rekey 30 ngày**, và CLI **`network-encryptor -tk <policy_id>`**. Dataplane encrypt không đổi: vẫn L2 PQC 0x104A/0x104B, key từ handshake.
+
+#### 19.6.1 Rule đồng hồ
+
+Cùng interval **30 ngày** (`NE_PQC_KEY_LIFETIME_MS`) cho mọi policy PQC. Wall-clock hết hạn **khác nhau** vì mỗi policy start clock riêng.
+
+Clock **start** chỉ khi **cả ba** đúng:
+
+1. Session key đã nằm RAM NE (`policy_crypto_ctx[].keys[CURRENT]` nonzero, `pqc_from_handshake=1`).
+2. Policy đó **dùng key để encrypt** thành công (GCM xong, `l2_note_key_used` → `fwd_crypto_note_pqc_key_used`).
+3. `ctx->pqc_key_in_use_ms == 0` (chưa start cho key này).
+
+Clock **không** start / **không** reset vì:
+
+- Handshake HELLO/RESP xong, key nằm RAM chưa encrypt.
+- Keepalive TX/RX, miss 3 interval (45 s).
+- Decrypt WAN→LAN (chỉ encrypt path gọi `l2_note_key_used`).
+- CLI `-tk` (chỉ đọc).
+- `-r` retry HS (đó là recovery HS fail, khác monthly rekey).
+
+Đồng hồ nằm trực tiếp trong `packet_crypto_ctx` của **DB policy**. Hot reload chỉ reuse ctx nếu `db_id` trùng, rồi mới cập nhật `wire_id`; đổi/reuse wire không làm timer hoặc key chạy sang policy khác. Query CLI dùng `policy_id = cp->db_id` (cùng ID với `-r`).
+
+#### 19.6.2 Cấu trúc NE (`crypto_runtime.c`)
+
+Ba field trong từng `packet_crypto_ctx`:
+
+```
+ctx->pqc_key_in_use_ms    CLOCK_MONOTONIC ms lúc encrypt lần đầu bằng key timed
+ctx->pqc_rekey_sent       0/1 — đã xin HS cho lần hết hạn này chưa
+ctx->pqc_timed_key[32]    bản sao CURRENT lúc start clock
+```
+
+`ne_pqc_on_key_material(ctx)` (gọi khi HS publish slot / rebuild / sync):
+
+- CURRENT zero → xóa clock, `rekey_sent`, wipe `pqc_timed_key`.
+- CURRENT **trùng** `pqc_timed_key` → no-op (cùng key đang đếm).
+- CURRENT **khác** `pqc_timed_key` → **reset clock = 0** (key mới vừa nạp, chưa encrypt → chưa đếm). `rekey_sent=0`.
+
+Như vậy HS key mới **không** thừa kế thời gian còn lại của key cũ. 30 ngày tính từ lần encrypt đầu của **key mới**.
+
+#### 19.6.3 Start clock trên hot path encrypt
+
+`pqc_l2_option.c`: sau `crypto_pqc_encrypt_payload` thành công (TCP/ICMP/OSPF `l2_do_encrypt`, UDP full/split, ARP enc), gọi `l2_note_key_used(ctx)` → `fwd_crypto_note_pqc_key_used`.
+
+`fwd_crypto_note_pqc_key_used`:
+
+```
+nếu !pqc_from_handshake → return
+nếu snapshot ctx đã có pqc_key_in_use_ms != 0 → return
+lock policy_crypto_lock
+  tìm master bằng wire, nhưng bắt buộc master.policy_id == snapshot.policy_id
+  bắt buộc snapshot CURRENT == master CURRENT // chặn worker cũ sau rekey
+  copy CURRENT → master.pqc_timed_key
+  master.pqc_key_in_use_ms = monotonic_ms()
+  bump policy_crypto_generation
+unlock
+log "[NE-PQC] Policy %d session key is in RAM and in use; lifetime clock started."
+```
+
+Hàm start clock **không xóa PREV**. Xóa PREV thuộc protocol xác nhận peer tại §19.6.5–19.6.6.
+
+#### 19.6.4 Tick hết hạn — từng policy, không cả profile
+
+TX thread slot 0, khoảng mỗi 1024 vòng (`tx_maint_tick & 1023`), `dp_maint_tick` → `fwd_crypto_pqc_key_lifetime_tick`.
+
+```
+lock
+với mỗi active policy PQC handshake-ready:
+  started = ctx->pqc_key_in_use_ms
+  nếu started==0 hoặc (now - started) < 30 ngày → skip
+  nếu ctx->pqc_rekey_sent đã 1 → skip
+  ctx->pqc_rekey_sent = 1
+  queue policy_id (db_id)
+unlock
+với mỗi policy_id: sig_pqc_request_new_session(policy_id)
+nếu binding đang transient/not-ready → re-arm cờ cho cùng key generation
+```
+
+Log: `[NE-PQC] Policy %d session key lifetime expired; requesting PQC handshake for a new key.`
+
+`sig_pqc_request_new_session`:
+
+- Không tìm thấy binding / `rekey_requested` đã 1 → no-op.
+- `key_ready==false` (đang HS lần đầu / `-r`) → **bỏ qua**, log “already handshaking”; **không** hạ key đang dùng vì lúc này không có CURRENT usable.
+- Còn lại: `rekey_requested=true`, **giữ** `key_ready=true`, CURRENT không đụng. Log: current key stays in RAM until the new key is loaded.
+
+Khác `-r` / `sig_pqc_trigger_retry`: retry **hạ** `key_ready=false` → encrypt fail cho đến khi HS xong. Monthly rekey **không** đi path đó.
+
+#### 19.6.5 Rekey trong khi giữ key cũ
+
+Worker PQC, khi `key_ready && rekey_requested`:
+
+- **Initiator:** gửi HELLO, nhận RESP, stage key vào NEXT, gửi READY lặp lại đến khi nhận COMMIT hợp lệ.
+- **Responder:** `send_poke=true`, gửi POKE (signed request) để initiator HELLO; khi nhận HELLO xử như HS thường.
+
+Rekey cutover:
+
+```
+HELLO / RESP
+  cả hai: NEXT = master KEM mới; CURRENT cũ tiếp tục encrypt
+initiator: READY có chữ ký
+responder nhận READY:
+  PREV = CURRENT cũ; CURRENT = NEXT; gửi COMMIT có chữ ký
+initiator đã có NEXT nên decrypt được traffic CURRENT mới của responder
+initiator nhận COMMIT:
+  PREV = CURRENT cũ; CURRENT = NEXT
+```
+
+Decrypt thử `CURRENT → NEXT → PREV`. Vì vậy responder chuyển trước vẫn đọc được gói cũ từ initiator bằng PREV, còn initiator chưa nhận COMMIT vẫn đọc được gói mới bằng NEXT. Khi CURRENT đổi, lifetime reset về 0; lần encrypt đầu bằng key mới bắt đầu đủ 30 ngày mới.
+
+#### 19.6.6 Keepalive = liveness, không phải lifetime
+
+UDP keepalive 15 s, timeout 3 interval = 45 s. Payload có state + fingerprint CURRENT; receive chấp nhận CURRENT/NEXT/PREV trong cửa sổ cutover.
+
+- Miss timeout trên worker: **chỉ log** `[PQC-HS-L3] Policy %d missed 3 keepalive intervals; current session key stays in NE RAM.` Reset mốc monitor. **Không** `key_ready=false`, **không** `rekey_requested`, **không** đụng `pqc_key_in_use_ms`.
+- Fingerprint mismatch / peer FAILED khi **đã có** `key_ready`: set `rekey_requested` (xin HS mới), CURRENT giữ. Cùng path “giữ key NE” như monthly expire.
+- Fingerprint mismatch khi **chưa** `key_ready`: recovery HS như trước (`key_ready=false`) vì chưa có session để giữ.
+- Khi fingerprint peer trùng **CURRENT local**, hai phía đã active cùng key. Nếu PREV tồn tại, đặt deadline grace 90 giây; hết grace gọi `fwd_crypto_discard_pqc_prev_key` rồi `sig_pqc_discard_prev_key`.
+
+#### 19.6.7 CLI `-tk <policy_id>`
+
+Daemon **phải chạy**. Client không đọc RAM trực tiếp.
+
+```
+network-encryptor -tk <policy_id>
+```
+
+`main` → `sig_pqc_handle_ipc_cli` (trước `-gi`/`-id`). Unix socket `/var/run/test_network-encryptor.sock`. Client gửi `TIMEKEY <policy_id>\n`. Daemon `fwd_crypto_format_pqc_key_times(buf, n, policy_id)`.
+
+`policy_id` = `crypto_policy.db_id` (cùng `-r`). Thiếu argv / id ≤ 0 → usage / invalid, không query.
+
+Logic in:
+
+| Điều kiện | stdout |
+|-----------|--------|
+| Không tìm policy trên daemon | `POLICY-NOT-FOUND` |
+| `action==BYPASS`, hoặc `crypto_mode != PQC` | `NO-ENCRYPT` |
+| Policy PQC nhưng chưa có CURRENT / ctx chưa ready / không `pqc_from_handshake` | `no session key` |
+| Có CURRENT, `ctx->pqc_key_in_use_ms==0` | `unused (timer not started)` |
+| Đã quá 30 ngày (đang xin key mới) | `expired (requesting new key)` |
+| Còn hạn | `29 days 12 hours 42 minutes` (singular/plural tiếng Anh) |
+
+Không dump cả profile. Một lệnh = một policy.
+
+`-r <policy_id>` khác: `RETRY %d` → `sig_pqc_trigger_retry_with_info` (HS lại, `key_ready=false`). Không in lifetime.
+
+#### 19.6.8 Chuỗi sự kiện (một policy)
+
+```
+HS lần đầu HELLO/RESP
+  → CURRENT nạp RAM, key_ready=1, clock=0          "unused"
+  → gói LAN encrypt thành công
+  → clock = now                                    "-tk" ra remaining ~30 days
+  → 30 ngày sau, TX tick
+  → sig_pqc_request_new_session                    key cũ vẫn encrypt
+  → initiator HELLO / responder POKE
+  → RESP → cả hai stage NEXT=mới, CURRENT=cũ vẫn chạy
+  → READY → responder promote, gửi COMMIT
+  → initiator promote khi nhận COMMIT
+  → clock reset 0; encrypt đầu bằng key mới → clock start đủ 30 ngày
+  → keepalive hai phía xác nhận CURRENT mới
+  → grace 90 giây → wipe PREV
+```
+
+Policy 75 encrypt hôm nay, policy 80 encrypt tuần sau → hết hạn lệch đúng khoảng đó. Cùng rule 30 ngày, khác wall-clock.
+
+#### 19.6.9 File / symbol cần nhớ
+
+| Symbol | File |
+|--------|------|
+| `NE_PQC_KEY_LIFETIME_MS` | `crypto_runtime.c` |
+| `fwd_crypto_note_pqc_key_used` | `crypto_runtime.c`; caller `pqc_l2_option.c` |
+| `fwd_crypto_pqc_key_lifetime_tick` | `crypto_runtime.c`; caller `dp_maint_tick` (`forwarder.c` TX slot 0) |
+| `fwd_crypto_format_pqc_key_times` | `crypto_runtime.c` |
+| `sig_pqc_request_new_session` | `pqc_handshake.c` |
+| `sig_pqc_discard_prev_key` | `pqc_handshake.c` |
+| `pqc_hs_stage_next_key` / READY / COMMIT | `pqc_handshake.c` |
+| `rekey_requested` | `policy_key_binding_t` |
+| `TIMEKEY` / `-tk` | `pqc_ipc.c` + usage `main.c` |
 
 ---
 
